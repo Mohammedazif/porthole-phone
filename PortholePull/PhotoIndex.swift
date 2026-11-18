@@ -2,8 +2,9 @@ import Photos
 import UIKit
 
 struct IndexedPhoto {
-    let hash: UInt64
-    let aspect: Double
+    let luma: [UInt8]
+    let gridW: Int
+    let gridH: Int
     let localIdentifier: String
 }
 
@@ -36,12 +37,27 @@ final class PhotoIndex: ObservableObject {
         lock.lock()
         let items = photos
         lock.unlock()
-        let picked = PictureHash.pick(query: hash, queryAspect: aspect,
-                                       hashes: items.map(\.hash),
-                                       aspects: items.map(\.aspect))
-        guard let index = picked.index else { return (nil, picked.closest) }
-        let asset = PHAsset.fetchAssets(withLocalIdentifiers: [items[index].localIdentifier], options: nil).firstObject
-        return (asset, picked.closest)
+        var best = -1
+        var bestDistance = 65
+        var second = 65
+        for (index, photo) in items.enumerated() {
+            let rendered = PictureHash.dhashCrop(luma: photo.luma, width: photo.gridW,
+                                                 height: photo.gridH, aspect: aspect)
+            if rendered == 0 && hash != 0 { continue }
+            let distance = (hash ^ rendered).nonzeroBitCount
+            if distance < bestDistance {
+                second = bestDistance
+                bestDistance = distance
+                best = index
+            } else if distance < second {
+                second = distance
+            }
+        }
+        let unique = best >= 0 && bestDistance <= PictureHash.matchMax
+            && second >= bestDistance + PictureHash.matchGap
+        guard unique else { return (nil, bestDistance) }
+        let asset = PHAsset.fetchAssets(withLocalIdentifiers: [items[best].localIdentifier], options: nil).firstObject
+        return (asset, bestDistance)
     }
 
     private func index() {
@@ -72,7 +88,7 @@ final class PhotoIndex: ObservableObject {
             options.isNetworkAccessAllowed = false
             options.isSynchronous = false
             options.version = .current
-            let longSide: CGFloat = 96
+            let longSide: CGFloat = 64
             let size = rawAspect >= 1
                 ? CGSize(width: longSide, height: max(2, longSide / CGFloat(rawAspect)))
                 : CGSize(width: max(2, longSide * CGFloat(rawAspect)), height: longSide)
@@ -91,10 +107,9 @@ final class PhotoIndex: ObservableObject {
                 defer { group.leave() }
                 let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
                 guard !cancelled, let image else { return }
-                let hash = Self.hashImage(image)
-                guard hash != 0 else { return }
+                guard let sampled = Self.sample(image) else { return }
                 collect.lock()
-                found.append(IndexedPhoto(hash: hash, aspect: Self.displayAspect(rawAspect, image),
+                found.append(IndexedPhoto(luma: sampled.luma, gridW: sampled.width, gridH: sampled.height,
                                           localIdentifier: asset.localIdentifier))
                 done += 1
                 let count = done
@@ -119,17 +134,14 @@ final class PhotoIndex: ObservableObject {
         }
     }
 
-    private static func displayAspect(_ raw: Double, _ image: UIImage) -> Double {
-        switch image.imageOrientation {
-        case .left, .leftMirrored, .right, .rightMirrored:
-            return raw > 0 ? 1 / raw : raw
-        default:
-            return raw
-        }
+    private struct SampledPhoto {
+        var luma: [UInt8]
+        var width: Int
+        var height: Int
     }
 
-    /// Top row first, same as the PC's video plane. UIImage.draw turns the camera file upright.
-    private static func hashImage(_ image: UIImage) -> UInt64 {
+    /// Upright luma, top row first, same orientation the PC hashes from the mirror.
+    private static func sample(_ image: UIImage) -> SampledPhoto? {
         let width = max(2, Int(image.size.width.rounded()))
         let height = max(2, Int(image.size.height.rounded()))
         let format = UIGraphicsImageRendererFormat()
@@ -138,21 +150,25 @@ final class PhotoIndex: ObservableObject {
         let rendered = UIGraphicsImageRenderer(size: CGSize(width: width, height: height), format: format).image { _ in
             image.draw(in: CGRect(x: 0, y: 0, width: width, height: height))
         }
-        guard let cg = rendered.cgImage, cg.width >= 2, cg.height >= 2 else { return 0 }
+        guard let cg = rendered.cgImage, cg.width >= 2, cg.height >= 2 else { return nil }
         let w = cg.width
         let h = cg.height
         let rowBytes = w * 4
         guard let context = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
                                       bytesPerRow: rowBytes, space: CGColorSpaceCreateDeviceRGB(),
                                       bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
-              let data = context.data else { return 0 }
+              let data = context.data else { return nil }
         context.translateBy(x: 0, y: CGFloat(h))
         context.scaleBy(x: 1, y: -1)
         context.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
         let bytes = data.bindMemory(to: UInt8.self, capacity: rowBytes * h)
-        return PictureHash.dhash(width: w, height: h) { x, y in
-            let i = (y * w + x) * 4
-            return PictureHash.luma(r: bytes[i], g: bytes[i + 1], b: bytes[i + 2])
+        var luma = [UInt8](repeating: 0, count: w * h)
+        for y in 0..<h {
+            for x in 0..<w {
+                let i = (y * w + x) * 4
+                luma[y * w + x] = PictureHash.luma(r: bytes[i], g: bytes[i + 1], b: bytes[i + 2])
+            }
         }
+        return SampledPhoto(luma: luma, width: w, height: h)
     }
 }

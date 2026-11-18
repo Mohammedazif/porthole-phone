@@ -25,6 +25,30 @@ enum PictureHash {
         UInt8((Int(r) * 77 + Int(g) * 150 + Int(b) * 29) >> 8)
     }
 
+    /// dHash of the centre of a full photo, cropped to the shape on screen.
+    /// A library thumbnail is square; the camera file usually is not. Cropping
+    /// both to the same shape is what makes those two pictures comparable.
+    static func dhashCrop(luma: [UInt8], width: Int, height: Int, aspect: Double) -> UInt64 {
+        if width < 2 || height < 2 || aspect < 0.05 || luma.count < width * height { return 0 }
+        let photo = Double(width) / Double(height)
+        var cropX = 0
+        var cropY = 0
+        var cropW = width
+        var cropH = height
+        if photo > aspect {
+            cropW = max(2, Int((Double(height) * aspect).rounded()))
+            if cropW > width { cropW = width }
+            cropX = (width - cropW) / 2
+        } else if photo < aspect {
+            cropH = max(2, Int((Double(width) / aspect).rounded()))
+            if cropH > height { cropH = height }
+            cropY = (height - cropH) / 2
+        }
+        return dhash(width: cropW, height: cropH) { x, y in
+            luma[(cropY + y) * width + (cropX + x)]
+        }
+    }
+
     struct Pick {
         var index: Int?
         var closest = 65

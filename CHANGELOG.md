@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4
+
+Dragging a thumbnail, or a photo that fills the screen, asks for that camera file. Each library photo is compared in the shape it has on screen. A drag still does nothing until this app says Ready and Connected.
+
 ## 1.3
 
 A photo that fills the mirror was still refused. The comparison now follows the picture from the top, allows the small shape difference of a photo fitted on screen, and accepts a near match.
