@@ -87,6 +87,14 @@ final class PhotoIndex: ObservableObject {
             if pick >= 0 {
                 note += " \(items[pick].gridW)x\(items[pick].gridH)"
             }
+            // The photo closest by dHash, as the app sees it, for the PC to save beside its own copy.
+            let near = items[best]
+            let nearCells = PictureHash.thumb(luma: near.luma, width: near.gridW,
+                                              crop: PictureHash.crop(width: near.gridW, height: near.gridH,
+                                                                     aspect: aspect))
+            let nearScore = PictureHash.correlation(query, PictureHash.gradients(nearCells))
+            let debug = String(format: " near %dx%d %.3f ", near.gridW, near.gridH, nearScore)
+                + PictureHash.hex(nearCells)
             if pick >= 0, top >= PictureHash.gradientMin, top - runner >= PictureHash.gradientGap {
                 return Match(asset: fetch(items[pick]), closest: distances[pick], note: note)
             }
@@ -94,7 +102,7 @@ final class PhotoIndex: ObservableObject {
             if bestDistance <= PictureHash.matchMax, second >= bestDistance + PictureHash.matchGap {
                 return Match(asset: fetch(items[best]), closest: bestDistance, note: note)
             }
-            return Match(asset: nil, closest: bestDistance, note: note)
+            return Match(asset: nil, closest: bestDistance, note: note + debug)
         }
         // A PC before the thumb: a mirrored photo lands about 15 to 17 bits away, and the
         // next library photo is often only a few bits behind that.

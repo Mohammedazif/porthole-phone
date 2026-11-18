@@ -130,6 +130,19 @@ enum PictureHash {
         return ab / (aa * bb).squareRoot()
     }
 
+    /// Cells as two hex digits each, the same layout as the PC sends.
+    static func hex(_ cells: [Double]) -> String {
+        let digits = Array("0123456789abcdef")
+        var out = ""
+        out.reserveCapacity(cells.count * 2)
+        for value in cells {
+            let byte = Int(min(255, max(0, value.rounded())))
+            out.append(digits[byte >> 4])
+            out.append(digits[byte & 15])
+        }
+        return out
+    }
+
     /// The fourth field of PULL: thumbSide squared bytes as hex.
     static func parseThumb(_ hex: Substring) -> [Double]? {
         let n = thumbSide * thumbSide

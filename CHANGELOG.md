@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.8
+
+A refused drag sends back the app's small copy of its closest photo. The PC saves it beside its own copy, so a mismatch between the two can be seen.
+
 ## 1.7
 
 Each library photo is indexed whole. A photo whose stored shape is sideways was cropped to its centre, so its detail never lined up with the picture on screen. A refused drag also reports the size the app compared, for the PC log.
