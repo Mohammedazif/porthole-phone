@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5
+
+The closest camera photo is sent when it is near the picture on screen. A second photo that is only a little further away no longer blocks it.
+
 ## 1.4
 
 Dragging a thumbnail, or a photo that fills the screen, asks for that camera file. Each library photo is compared in the shape it has on screen. A drag still does nothing until this app says Ready and Connected.

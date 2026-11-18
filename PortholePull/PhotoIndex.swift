@@ -53,8 +53,10 @@ final class PhotoIndex: ObservableObject {
                 second = distance
             }
         }
-        let unique = best >= 0 && bestDistance <= PictureHash.matchMax
-            && second >= bestDistance + PictureHash.matchGap
+        // A mirrored photo lands about 15 to 17 bits away after the thumbnail and
+        // the video. The next library photo is often only a few bits behind that,
+        // so a wide gap refused the picture that was actually on screen.
+        let unique = best >= 0 && bestDistance <= PictureHash.matchMax && bestDistance < second
         guard unique else { return (nil, bestDistance) }
         let asset = PHAsset.fetchAssets(withLocalIdentifiers: [items[best].localIdentifier], options: nil).firstObject
         return (asset, bestDistance)
