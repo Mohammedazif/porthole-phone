@@ -144,7 +144,12 @@ final class PullClient: ObservableObject {
             if connection?.currentPath?.unsatisfiedReason == .localNetworkDenied || isDenied(error) {
                 show("Local Network is off. Settings → Privacy & Security → Local Network → turn on Porthole.")
             } else {
+                // A refused connect (Porthole restarting) waits for a network change that
+                // never comes. Drop it and try again on the backoff instead.
+                greeted = false
                 show("Waiting for the PC. \(explain(error))")
+                connection?.cancel()
+                scheduleReconnect()
             }
         case .failed(let error):
             greeted = false

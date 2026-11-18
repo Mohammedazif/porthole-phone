@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.10
+
+The app reconnects by itself after Porthole on the PC restarts. A connect that was refused while the PC was down used to wait until the app was opened again.
+
 ## 1.9
 
 Photos are indexed the right way up. Every photo had been stored upside down, so the picture on screen never matched its camera file and earlier near matches were other photos with a similar sky.
