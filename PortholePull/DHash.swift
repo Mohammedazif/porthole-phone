@@ -1,9 +1,9 @@
 import Foundation
 
 enum PictureHash {
-    static let matchMax = 12
+    static let matchMax = 20
     static let matchGap = 6
-    static let aspectTol = 0.08
+    static let aspectTol = 0.18
 
     static func dhash(width: Int, height: Int, lumaAt: (Int, Int) -> UInt8) -> UInt64 {
         if width < 2 || height < 2 { return 0 }

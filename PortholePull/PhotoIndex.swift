@@ -65,16 +65,20 @@ final class PhotoIndex: ObservableObject {
             let asset = assets.object(at: n)
             guard asset.pixelWidth >= 2, asset.pixelHeight >= 2 else { continue }
             group.enter()
+            let rawAspect = Double(asset.pixelWidth) / Double(asset.pixelHeight)
             let options = PHImageRequestOptions()
             options.deliveryMode = .highQualityFormat
             options.resizeMode = .exact
             options.isNetworkAccessAllowed = false
             options.isSynchronous = false
             options.version = .current
+            let longSide: CGFloat = 96
+            let size = rawAspect >= 1
+                ? CGSize(width: longSide, height: max(2, longSide / CGFloat(rawAspect)))
+                : CGSize(width: max(2, longSide * CGFloat(rawAspect)), height: longSide)
             let once = NSLock()
             var finished = false
-            manager.requestImage(for: asset, targetSize: CGSize(width: 96, height: 96),
-                                 contentMode: .aspectFit, options: options) { image, info in
+            manager.requestImage(for: asset, targetSize: size, contentMode: .aspectFill, options: options) { image, info in
                 let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
                 if degraded { return }
                 once.lock()
@@ -86,9 +90,11 @@ final class PhotoIndex: ObservableObject {
                 once.unlock()
                 defer { group.leave() }
                 let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
-                guard !cancelled, let image, let sample = Self.sample(image) else { return }
+                guard !cancelled, let image else { return }
+                let hash = Self.hashImage(image)
+                guard hash != 0 else { return }
                 collect.lock()
-                found.append(IndexedPhoto(hash: sample.hash, aspect: sample.aspect,
+                found.append(IndexedPhoto(hash: hash, aspect: Self.displayAspect(rawAspect, image),
                                           localIdentifier: asset.localIdentifier))
                 done += 1
                 let count = done
@@ -113,62 +119,40 @@ final class PhotoIndex: ObservableObject {
         }
     }
 
-    /// Hash of the photo as it is shown, without the empty margin of a fitted thumbnail.
-    private static func sample(_ image: UIImage) -> (hash: UInt64, aspect: Double)? {
-        let scale = image.scale > 0 ? image.scale : 1
-        let width = max(2, Int((image.size.width * scale).rounded()))
-        let height = max(2, Int((image.size.height * scale).rounded()))
+    private static func displayAspect(_ raw: Double, _ image: UIImage) -> Double {
+        switch image.imageOrientation {
+        case .left, .leftMirrored, .right, .rightMirrored:
+            return raw > 0 ? 1 / raw : raw
+        default:
+            return raw
+        }
+    }
+
+    /// Top row first, same as the PC's video plane. UIImage.draw turns the camera file upright.
+    private static func hashImage(_ image: UIImage) -> UInt64 {
+        let width = max(2, Int(image.size.width.rounded()))
+        let height = max(2, Int(image.size.height.rounded()))
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
-        format.opaque = false
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: width, height: height), format: format)
-        let drawn = renderer.image { _ in
+        format.opaque = true
+        let rendered = UIGraphicsImageRenderer(size: CGSize(width: width, height: height), format: format).image { _ in
             image.draw(in: CGRect(x: 0, y: 0, width: width, height: height))
         }
-        guard let cg = drawn.cgImage, cg.width >= 2, cg.height >= 2 else { return nil }
-        let rowBytes = cg.width * 4
-        let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
-        guard let context = CGContext(data: nil, width: cg.width, height: cg.height, bitsPerComponent: 8,
+        guard let cg = rendered.cgImage, cg.width >= 2, cg.height >= 2 else { return 0 }
+        let w = cg.width
+        let h = cg.height
+        let rowBytes = w * 4
+        guard let context = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
                                       bytesPerRow: rowBytes, space: CGColorSpaceCreateDeviceRGB(),
-                                      bitmapInfo: bitmapInfo),
-              let data = context.data else { return nil }
-        context.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
-        let bytes = data.bindMemory(to: UInt8.self, capacity: rowBytes * cg.height)
-        let box = interior(bytes: bytes, width: cg.width, height: cg.height)
-        guard box.w >= 2, box.h >= 2 else { return nil }
-        let hash = PictureHash.dhash(width: box.w, height: box.h) { x, y in
-            let i = ((box.y + y) * cg.width + (box.x + x)) * 4
+                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
+              let data = context.data else { return 0 }
+        context.translateBy(x: 0, y: CGFloat(h))
+        context.scaleBy(x: 1, y: -1)
+        context.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let bytes = data.bindMemory(to: UInt8.self, capacity: rowBytes * h)
+        return PictureHash.dhash(width: w, height: h) { x, y in
+            let i = (y * w + x) * 4
             return PictureHash.luma(r: bytes[i], g: bytes[i + 1], b: bytes[i + 2])
         }
-        guard hash != 0 else { return nil }
-        return (hash, Double(box.w) / Double(box.h))
-    }
-
-    private static func margin(_ bytes: UnsafePointer<UInt8>, _ i: Int) -> Bool {
-        let alpha = Int(bytes[i + 3])
-        if alpha < 16 { return true }
-        let r = Int(bytes[i]), g = Int(bytes[i + 1]), b = Int(bytes[i + 2])
-        let y = (r * 77 + g * 150 + b * 29) >> 8
-        if max(r, g, b) - min(r, g, b) > 12 { return false }
-        return y <= 32 || y >= 248
-    }
-
-    private static func interior(bytes: UnsafePointer<UInt8>, width: Int, height: Int) -> (x: Int, y: Int, w: Int, h: Int) {
-        func rowEmpty(_ y: Int) -> Bool {
-            var ink = 0
-            for x in 0..<width where !margin(bytes, (y * width + x) * 4) { ink += 1 }
-            return ink * 200 <= width
-        }
-        func columnEmpty(_ x: Int) -> Bool {
-            var ink = 0
-            for y in 0..<height where !margin(bytes, (y * width + x) * 4) { ink += 1 }
-            return ink * 200 <= height
-        }
-        var top = 0, bottom = height - 1, left = 0, right = width - 1
-        while top < bottom, rowEmpty(top) { top += 1 }
-        while bottom > top, rowEmpty(bottom) { bottom -= 1 }
-        while left < right, columnEmpty(left) { left += 1 }
-        while right > left, columnEmpty(right) { right -= 1 }
-        return (left, top, right - left + 1, bottom - top + 1)
     }
 }

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3
+
+A photo that fills the mirror was still refused. The comparison now follows the picture from the top, allows the small shape difference of a photo fitted on screen, and accepts a near match.
+
 ## 1.2
 
 The link stays up after you leave this app and open Photos, which is the screen the PC is mirroring. The address and code are remembered. Photos are indexed as they appear on screen, including ones stored sideways in the camera roll.

@@ -234,7 +234,7 @@ final class PullClient: ObservableObject {
         }
         let found = index.match(hash: hash, aspect: aspect)
         guard index.ready, let asset = found.asset else {
-            send("MISS\n")
+            send(found.closest < 65 ? "MISS \(found.closest)\n" : "MISS\n")
             let closest = found.closest
             DispatchQueue.main.async {
                 if !index.ready {
