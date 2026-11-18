@@ -83,7 +83,10 @@ final class PhotoIndex: ObservableObject {
                     runner = score
                 }
             }
-            let note = String(format: "%.3f %.3f", max(top, -1), max(runner, -1))
+            var note = String(format: "%.3f %.3f", max(top, -1), max(runner, -1))
+            if pick >= 0 {
+                note += " \(items[pick].gridW)x\(items[pick].gridH)"
+            }
             if pick >= 0, top >= PictureHash.gradientMin, top - runner >= PictureHash.gradientGap {
                 return Match(asset: fetch(items[pick]), closest: distances[pick], note: note)
             }
@@ -125,20 +128,19 @@ final class PhotoIndex: ObservableObject {
             let asset = assets.object(at: n)
             guard asset.pixelWidth >= 2, asset.pixelHeight >= 2 else { continue }
             group.enter()
-            let rawAspect = Double(asset.pixelWidth) / Double(asset.pixelHeight)
             let options = PHImageRequestOptions()
             options.deliveryMode = .highQualityFormat
             options.resizeMode = .exact
             options.isNetworkAccessAllowed = false
             options.isSynchronous = false
             options.version = .current
+            // Fit, never fill: a box shaped from pixelWidth and pixelHeight can be the
+            // other way up from the photo, and filling it cut away part of the picture.
             let longSide: CGFloat = 64
-            let size = rawAspect >= 1
-                ? CGSize(width: longSide, height: max(2, longSide / CGFloat(rawAspect)))
-                : CGSize(width: max(2, longSide * CGFloat(rawAspect)), height: longSide)
+            let size = CGSize(width: longSide, height: longSide)
             let once = NSLock()
             var finished = false
-            manager.requestImage(for: asset, targetSize: size, contentMode: .aspectFill, options: options) { image, info in
+            manager.requestImage(for: asset, targetSize: size, contentMode: .aspectFit, options: options) { image, info in
                 let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
                 if degraded { return }
                 once.lock()

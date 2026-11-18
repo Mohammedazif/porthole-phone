@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.7
+
+Each library photo is indexed whole. A photo whose stored shape is sideways was cropped to its centre, so its detail never lined up with the picture on screen. A refused drag also reports the size the app compared, for the PC log.
+
 ## 1.6
 
 Photos from a burst are told apart. The PC sends a small copy of the picture with each drag, and the app picks the library photo whose detail follows it, not only the one with the closest outline. Two shots that still look the same send nothing. This needs the Porthole PC build from the same day; an older PC is matched as in 1.5.
