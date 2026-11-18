@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.9
+
+Photos are indexed the right way up. Every photo had been stored upside down, so the picture on screen never matched its camera file and earlier near matches were other photos with a similar sky.
+
 ## 1.8
 
 A refused drag sends back the app's small copy of its closest photo. The PC saves it beside its own copy, so a mismatch between the two can be seen.

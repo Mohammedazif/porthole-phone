@@ -212,8 +212,8 @@ final class PhotoIndex: ObservableObject {
                                       bytesPerRow: rowBytes, space: CGColorSpaceCreateDeviceRGB(),
                                       bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
               let data = context.data else { return nil }
-        context.translateBy(x: 0, y: CGFloat(h))
-        context.scaleBy(x: 1, y: -1)
+        // A bitmap context already keeps the image's top row first in memory. The flip
+        // that used to be here stored every photo upside down, so none ever matched.
         context.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
         let bytes = data.bindMemory(to: UInt8.self, capacity: rowBytes * h)
         var luma = [UInt8](repeating: 0, count: w * h)
