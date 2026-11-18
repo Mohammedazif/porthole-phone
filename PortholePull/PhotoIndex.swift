@@ -33,10 +33,18 @@ final class PhotoIndex: ObservableObject {
         }
     }
 
-    func match(hash: UInt64, aspect: Double) -> (asset: PHAsset?, closest: Int) {
+    struct Match {
+        var asset: PHAsset?
+        var closest = 65
+        /// Best and runner-up gradient scores, for the PC log.
+        var note = ""
+    }
+
+    func match(hash: UInt64, aspect: Double, thumb: [Double]?) -> Match {
         lock.lock()
         let items = photos
         lock.unlock()
+        var distances = [Int](repeating: 65, count: items.count)
         var best = -1
         var bestDistance = 65
         var second = 65
@@ -45,6 +53,7 @@ final class PhotoIndex: ObservableObject {
                                                  height: photo.gridH, aspect: aspect)
             if rendered == 0 && hash != 0 { continue }
             let distance = (hash ^ rendered).nonzeroBitCount
+            distances[index] = distance
             if distance < bestDistance {
                 second = bestDistance
                 bestDistance = distance
@@ -53,13 +62,46 @@ final class PhotoIndex: ObservableObject {
                 second = distance
             }
         }
-        // A mirrored photo lands about 15 to 17 bits away after the thumbnail and
-        // the video. The next library photo is often only a few bits behind that,
-        // so a wide gap refused the picture that was actually on screen.
-        let unique = best >= 0 && bestDistance <= PictureHash.matchMax && bestDistance < second
-        guard unique else { return (nil, bestDistance) }
-        let asset = PHAsset.fetchAssets(withLocalIdentifiers: [items[best].localIdentifier], options: nil).firstObject
-        return (asset, bestDistance)
+        guard best >= 0 else { return Match() }
+        if let thumb, thumb.count == PictureHash.thumbSide * PictureHash.thumbSide {
+            // The dHash only shortlists. Among close photos, the one whose gradients
+            // follow the picture on screen wins, and only by a clear margin.
+            let query = PictureHash.gradients(thumb)
+            var pick = -1
+            var top = -2.0
+            var runner = -2.0
+            for index in items.indices where distances[index] <= PictureHash.candidateBits {
+                let photo = items[index]
+                let crop = PictureHash.crop(width: photo.gridW, height: photo.gridH, aspect: aspect)
+                let cells = PictureHash.thumb(luma: photo.luma, width: photo.gridW, crop: crop)
+                let score = PictureHash.correlation(query, PictureHash.gradients(cells))
+                if score > top {
+                    runner = top
+                    top = score
+                    pick = index
+                } else if score > runner {
+                    runner = score
+                }
+            }
+            let note = String(format: "%.3f %.3f", max(top, -1), max(runner, -1))
+            if pick >= 0, top >= PictureHash.gradientMin, top - runner >= PictureHash.gradientGap {
+                return Match(asset: fetch(items[pick]), closest: distances[pick], note: note)
+            }
+            // A picture the gradients cannot place is still sent when its dHash stands well apart.
+            if bestDistance <= PictureHash.matchMax, second >= bestDistance + PictureHash.matchGap {
+                return Match(asset: fetch(items[best]), closest: bestDistance, note: note)
+            }
+            return Match(asset: nil, closest: bestDistance, note: note)
+        }
+        // A PC before the thumb: a mirrored photo lands about 15 to 17 bits away, and the
+        // next library photo is often only a few bits behind that.
+        let unique = bestDistance <= PictureHash.matchMax && bestDistance < second
+        guard unique else { return Match(asset: nil, closest: bestDistance) }
+        return Match(asset: fetch(items[best]), closest: bestDistance)
+    }
+
+    private func fetch(_ photo: IndexedPhoto) -> PHAsset? {
+        PHAsset.fetchAssets(withLocalIdentifiers: [photo.localIdentifier], options: nil).firstObject
     }
 
     private func index() {

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.6
+
+Photos from a burst are told apart. The PC sends a small copy of the picture with each drag, and the app picks the library photo whose detail follows it, not only the one with the closest outline. Two shots that still look the same send nothing. This needs the Porthole PC build from the same day; an older PC is matched as in 1.5.
+
 ## 1.5
 
 The closest camera photo is sent when it is near the picture on screen. A second photo that is only a little further away no longer blocks it.

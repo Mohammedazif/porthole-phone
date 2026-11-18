@@ -5,6 +5,13 @@ enum PictureHash {
     static let matchGap = 6
     static let aspectTol = 0.18
 
+    /// Burst shots share a dHash. The PC also sends a 32 x 32 picture; its gradients
+    /// separate them (same shot near 0.98, the next frame of a burst near 0.6).
+    static let thumbSide = 32
+    static let candidateBits = 28
+    static let gradientMin = 0.75
+    static let gradientGap = 0.10
+
     static func dhash(width: Int, height: Int, lumaAt: (Int, Int) -> UInt8) -> UInt64 {
         if width < 2 || height < 2 { return 0 }
         var hash: UInt64 = 0
@@ -30,23 +37,122 @@ enum PictureHash {
     /// both to the same shape is what makes those two pictures comparable.
     static func dhashCrop(luma: [UInt8], width: Int, height: Int, aspect: Double) -> UInt64 {
         if width < 2 || height < 2 || aspect < 0.05 || luma.count < width * height { return 0 }
+        let c = crop(width: width, height: height, aspect: aspect)
+        return dhash(width: c.w, height: c.h) { x, y in
+            luma[(c.y + y) * width + (c.x + x)]
+        }
+    }
+
+    struct Crop {
+        var x: Int
+        var y: Int
+        var w: Int
+        var h: Int
+    }
+
+    /// The centre of a full photo cut to the shape it has on screen.
+    static func crop(width: Int, height: Int, aspect: Double) -> Crop {
+        var c = Crop(x: 0, y: 0, w: width, h: height)
+        if width < 2 || height < 2 || aspect < 0.05 { return c }
         let photo = Double(width) / Double(height)
-        var cropX = 0
-        var cropY = 0
-        var cropW = width
-        var cropH = height
         if photo > aspect {
-            cropW = max(2, Int((Double(height) * aspect).rounded()))
-            if cropW > width { cropW = width }
-            cropX = (width - cropW) / 2
+            c.w = min(width, max(2, Int((Double(height) * aspect).rounded())))
+            c.x = (width - c.w) / 2
         } else if photo < aspect {
-            cropH = max(2, Int((Double(width) / aspect).rounded()))
-            if cropH > height { cropH = height }
-            cropY = (height - cropH) / 2
+            c.h = min(height, max(2, Int((Double(width) / aspect).rounded())))
+            c.y = (height - c.h) / 2
         }
-        return dhash(width: cropW, height: cropH) { x, y in
-            luma[(cropY + y) * width + (cropX + x)]
+        return c
+    }
+
+    /// Box average into thumbSide x thumbSide cells. Cell bounds are the PC's:
+    /// rows [r*h/n, max(that+1, (r+1)*h/n)), and the same for columns.
+    static func thumb(luma: [UInt8], width: Int, crop c: Crop) -> [Double] {
+        let n = thumbSide
+        var out = [Double](repeating: 0, count: n * n)
+        if c.w < 1 || c.h < 1 || luma.count < (c.y + c.h - 1) * width + c.x + c.w { return out }
+        for r in 0..<n {
+            let y0 = r * c.h / n
+            var y1 = (r + 1) * c.h / n
+            if y1 <= y0 { y1 = y0 + 1 }
+            for col in 0..<n {
+                let x0 = col * c.w / n
+                var x1 = (col + 1) * c.w / n
+                if x1 <= x0 { x1 = x0 + 1 }
+                var sum = 0
+                for y in y0..<y1 {
+                    let row = (c.y + y) * width + c.x
+                    for x in x0..<x1 {
+                        sum += Int(luma[row + x])
+                    }
+                }
+                out[r * n + col] = Double(sum) / Double((y1 - y0) * (x1 - x0))
+            }
         }
+        return out
+    }
+
+    /// Horizontal then vertical neighbour differences of a thumb.
+    static func gradients(_ t: [Double]) -> [Double] {
+        let n = thumbSide
+        var g = [Double]()
+        if t.count != n * n { return g }
+        g.reserveCapacity(2 * n * (n - 1))
+        for r in 0..<n {
+            for c in 0..<(n - 1) {
+                g.append(t[r * n + c + 1] - t[r * n + c])
+            }
+        }
+        for r in 0..<(n - 1) {
+            for c in 0..<n {
+                g.append(t[(r + 1) * n + c] - t[r * n + c])
+            }
+        }
+        return g
+    }
+
+    /// Normalised correlation, so the video's brightness and contrast do not matter.
+    static func correlation(_ a: [Double], _ b: [Double]) -> Double {
+        if a.isEmpty || a.count != b.count { return 0 }
+        let ma = a.reduce(0, +) / Double(a.count)
+        let mb = b.reduce(0, +) / Double(b.count)
+        var ab = 0.0
+        var aa = 0.0
+        var bb = 0.0
+        for i in a.indices {
+            let x = a[i] - ma
+            let y = b[i] - mb
+            ab += x * y
+            aa += x * x
+            bb += y * y
+        }
+        if aa <= 0 || bb <= 0 { return 0 }
+        return ab / (aa * bb).squareRoot()
+    }
+
+    /// The fourth field of PULL: thumbSide squared bytes as hex.
+    static func parseThumb(_ hex: Substring) -> [Double]? {
+        let n = thumbSide * thumbSide
+        let bytes = Array(hex.utf8)
+        if bytes.count != n * 2 { return nil }
+        var out = [Double]()
+        out.reserveCapacity(n)
+        var high: UInt8 = 0
+        for (i, ch) in bytes.enumerated() {
+            let v: UInt8
+            switch ch {
+            case 48...57: v = ch - 48
+            case 97...102: v = ch - 87
+            case 65...70: v = ch - 55
+            default: return nil
+            }
+            if i % 2 == 0 {
+                high = v
+            } else {
+                out.append(Double(high * 16 + v))
+            }
+        }
+        return out
     }
 
     struct Pick {

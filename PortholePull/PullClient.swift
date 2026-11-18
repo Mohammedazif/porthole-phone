@@ -224,7 +224,8 @@ final class PullClient: ObservableObject {
         }
         guard greeted, line.hasPrefix("PULL ") else { return }
         let parts = line.split(separator: " ")
-        guard parts.count == 3, let hash = UInt64(parts[1], radix: 16), let aspect = Double(parts[2]) else {
+        guard parts.count == 3 || parts.count == 4, let hash = UInt64(parts[1], radix: 16),
+              let aspect = Double(parts[2]) else {
             send("MISS\n")
             return
         }
@@ -232,9 +233,14 @@ final class PullClient: ObservableObject {
             send("MISS\n")
             return
         }
-        let found = index.match(hash: hash, aspect: aspect)
+        let thumb = parts.count == 4 ? PictureHash.parseThumb(parts[3]) : nil
+        let found = index.match(hash: hash, aspect: aspect, thumb: thumb)
         guard index.ready, let asset = found.asset else {
-            send(found.closest < 65 ? "MISS \(found.closest)\n" : "MISS\n")
+            if found.closest < 65 {
+                send(found.note.isEmpty ? "MISS \(found.closest)\n" : "MISS \(found.closest) \(found.note)\n")
+            } else {
+                send("MISS\n")
+            }
             let closest = found.closest
             DispatchQueue.main.async {
                 if !index.ready {
