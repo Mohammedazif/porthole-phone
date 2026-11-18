@@ -1,6 +1,8 @@
+import AVFoundation
 import Foundation
 import Network
 import Photos
+import UIKit
 
 final class PullClient: ObservableObject {
     @Published var status = "Opening"
@@ -12,6 +14,9 @@ final class PullClient: ObservableObject {
     private var announcer: NWListener?
     private var buffer = Data()
     private var greeted = false
+    private var reconnectAttempt = 0
+    private var reconnectWork: DispatchWorkItem?
+    private let stay = SilentKeepAlive()
     private weak var index: PhotoIndex?
 
     func bind(index: PhotoIndex) {
@@ -20,6 +25,8 @@ final class PullClient: ObservableObject {
 
     /// Bonjour is what makes iOS show Local Network. A plain TCP connect often does not.
     func prepare() {
+        loadSaved()
+        stay.start()
         guard browser == nil else { return }
         let parameters = NWParameters.tcp
         let browser = NWBrowser(for: .bonjour(type: "_porthole._tcp", domain: nil), using: parameters)
@@ -40,12 +47,21 @@ final class PullClient: ObservableObject {
         } catch {
             show("Could not ask for Local Network")
         }
-        show("Allow Local Network when iOS asks. It is also under Settings → Privacy & Security → Local Network.")
+        if normalized() != nil {
+            connect()
+        } else {
+            show("Allow Local Network when iOS asks. It is also under Settings → Privacy & Security → Local Network.")
+        }
     }
 
     func cameForward() {
+        stay.start()
         guard !greeted, normalized() != nil else { return }
         connect()
+    }
+
+    func enteredBackground() {
+        stay.start()
     }
 
     func connect() {
@@ -55,15 +71,20 @@ final class PullClient: ObservableObject {
         }
         address = fields.host
         code = fields.token
+        UserDefaults.standard.set(fields.host, forKey: "porthole.host")
+        UserDefaults.standard.set(fields.token, forKey: "porthole.code")
+        stay.start()
+        reconnectWork?.cancel()
         connection?.cancel()
         buffer.removeAll()
         greeted = false
         let link = NWConnection(host: NWEndpoint.Host(fields.host), port: 47731, using: .tcp)
         connection = link
         let token = fields.token
-        link.stateUpdateHandler = { [weak self] state in
+        link.stateUpdateHandler = { [weak self, weak link] state in
             DispatchQueue.main.async {
-                self?.noteLink(state, token: token)
+                guard let self, let link, self.connection === link else { return }
+                self.noteLink(state, token: token)
             }
         }
         link.start(queue: queue)
@@ -115,6 +136,7 @@ final class PullClient: ObservableObject {
     private func noteLink(_ state: NWConnection.State, token: String) {
         switch state {
         case .ready:
+            reconnectAttempt = 0
             show("Connected")
             send("HELLO \(token)\n")
             receive()
@@ -127,6 +149,7 @@ final class PullClient: ObservableObject {
         case .failed(let error):
             greeted = false
             show("Not connected. \(explain(error))")
+            scheduleReconnect()
         case .cancelled:
             break
         default:
@@ -164,8 +187,9 @@ final class PullClient: ObservableObject {
     }
 
     private func receive() {
-        connection?.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, complete, error in
-            guard let self else { return }
+        guard let link = connection else { return }
+        link.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self, weak link] data, _, complete, error in
+            guard let self, let link, self.connection === link else { return }
             if let data, !data.isEmpty {
                 self.buffer.append(data)
                 self.drain()
@@ -174,7 +198,8 @@ final class PullClient: ObservableObject {
                 let hadHello = self.greeted
                 self.greeted = false
                 DispatchQueue.main.async {
-                    self.show(hadHello ? "Disconnected" : "The PC closed the connection. Check the code in F1 help.")
+                    self.show(hadHello ? "Disconnected. Reconnecting." : "The PC closed the connection. Check the code in F1 help.")
+                    self.scheduleReconnect()
                 }
                 return
             }
@@ -194,7 +219,7 @@ final class PullClient: ObservableObject {
     private func handle(_ line: String) {
         if line == "OK" {
             greeted = true
-            DispatchQueue.main.async { self.status = "Connected. Leave this app open." }
+            DispatchQueue.main.async { self.status = "Connected. You can open Photos." }
             return
         }
         guard greeted, line.hasPrefix("PULL ") else { return }
@@ -207,10 +232,18 @@ final class PullClient: ObservableObject {
             send("MISS\n")
             return
         }
-        guard index.ready, let asset = index.match(hash: hash, aspect: aspect) else {
+        let found = index.match(hash: hash, aspect: aspect)
+        guard index.ready, let asset = found.asset else {
             send("MISS\n")
+            let closest = found.closest
             DispatchQueue.main.async {
-                self.status = index.ready ? "No single photo matched the window" : "Load photos, then drag the picture again"
+                if !index.ready {
+                    self.status = "Load photos, then drag the picture again"
+                } else if closest < 65 {
+                    self.status = "No single photo matched (closest \(closest) bits)"
+                } else {
+                    self.status = "No single photo matched the window"
+                }
             }
             return
         }
@@ -261,5 +294,70 @@ final class PullClient: ObservableObject {
         }
         if out.isEmpty || out.hasPrefix(".") || !dotted { return nil }
         return out
+    }
+
+    private func loadSaved() {
+        let defaults = UserDefaults.standard
+        if address.isEmpty, let host = defaults.string(forKey: "porthole.host") {
+            address = host
+        }
+        if code.isEmpty, let token = defaults.string(forKey: "porthole.code") {
+            code = token
+        }
+        guard normalized() == nil, let pasted = UIPasteboard.general.string else { return }
+        let savedAddress = address
+        let savedCode = code
+        address = pasted
+        code = ""
+        if normalized() == nil {
+            address = savedAddress
+            code = savedCode
+        }
+    }
+
+    private func scheduleReconnect() {
+        guard normalized() != nil else { return }
+        reconnectWork?.cancel()
+        let delay = min(2 << min(reconnectAttempt, 3), 15)
+        reconnectAttempt += 1
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.greeted else { return }
+            self.connect()
+        }
+        reconnectWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(delay), execute: work)
+    }
+}
+
+/// Silent playback so iOS keeps this process alive after the user opens Photos.
+private final class SilentKeepAlive {
+    private let engine = AVAudioEngine()
+    private let player = AVAudioPlayerNode()
+    private var attached = false
+
+    func start() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playback, options: [.mixWithOthers])
+            try session.setActive(true)
+            guard let format = AVAudioFormat(standardFormatWithSampleRate: 8000, channels: 1) else { return }
+            if !attached {
+                engine.attach(player)
+                engine.connect(player, to: engine.mainMixerNode, format: format)
+                attached = true
+            }
+            engine.mainMixerNode.outputVolume = 0
+            if !engine.isRunning {
+                try engine.start()
+            }
+            guard !player.isPlaying else { return }
+            let frames: AVAudioFrameCount = 8000
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return }
+            buffer.frameLength = frames
+            player.scheduleBuffer(buffer, at: nil, options: .loops)
+            player.play()
+        } catch {
+            return
+        }
     }
 }

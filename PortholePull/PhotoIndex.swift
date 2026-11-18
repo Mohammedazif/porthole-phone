@@ -13,11 +13,15 @@ final class PhotoIndex: ObservableObject {
     private let lock = NSLock()
     private var photos: [IndexedPhoto] = []
     private var manager: PHCachingImageManager?
+    private var indexing = false
 
     func requestAccessAndIndex() {
+        if indexing || ready { return }
+        indexing = true
         PHPhotoLibrary.requestAuthorization(for: .readWrite) { [weak self] access in
             DispatchQueue.main.async {
                 guard access == .authorized || access == .limited else {
+                    self?.indexing = false
                     self?.status = "Allow photo access in Settings"
                     self?.ready = false
                     return
@@ -28,14 +32,16 @@ final class PhotoIndex: ObservableObject {
         }
     }
 
-    func match(hash: UInt64, aspect: Double) -> PHAsset? {
+    func match(hash: UInt64, aspect: Double) -> (asset: PHAsset?, closest: Int) {
         lock.lock()
         let items = photos
         lock.unlock()
-        guard let index = PictureHash.pick(query: hash, queryAspect: aspect,
-                                            hashes: items.map(\.hash),
-                                            aspects: items.map(\.aspect)) else { return nil }
-        return PHAsset.fetchAssets(withLocalIdentifiers: [items[index].localIdentifier], options: nil).firstObject
+        let picked = PictureHash.pick(query: hash, queryAspect: aspect,
+                                       hashes: items.map(\.hash),
+                                       aspects: items.map(\.aspect))
+        guard let index = picked.index else { return (nil, picked.closest) }
+        let asset = PHAsset.fetchAssets(withLocalIdentifiers: [items[index].localIdentifier], options: nil).firstObject
+        return (asset, picked.closest)
     }
 
     private func index() {
@@ -59,20 +65,18 @@ final class PhotoIndex: ObservableObject {
             let asset = assets.object(at: n)
             guard asset.pixelWidth >= 2, asset.pixelHeight >= 2 else { continue }
             group.enter()
-            let aspect = Double(asset.pixelWidth) / Double(asset.pixelHeight)
             let options = PHImageRequestOptions()
-            options.deliveryMode = .fastFormat
+            options.deliveryMode = .highQualityFormat
             options.resizeMode = .exact
             options.isNetworkAccessAllowed = false
             options.isSynchronous = false
-            let longSide: CGFloat = 96
-            let size = aspect >= 1
-                ? CGSize(width: longSide, height: longSide / CGFloat(aspect))
-                : CGSize(width: longSide * CGFloat(aspect), height: longSide)
+            options.version = .current
             let once = NSLock()
             var finished = false
-            manager.requestImage(for: asset, targetSize: size, contentMode: .aspectFill, options: options) {
-                image, info in
+            manager.requestImage(for: asset, targetSize: CGSize(width: 96, height: 96),
+                                 contentMode: .aspectFit, options: options) { image, info in
+                let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+                if degraded { return }
                 once.lock()
                 if finished {
                     once.unlock()
@@ -82,10 +86,9 @@ final class PhotoIndex: ObservableObject {
                 once.unlock()
                 defer { group.leave() }
                 let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
-                guard !cancelled, let cg = image?.cgImage else { return }
-                let hash = Self.hash(image: cg)
+                guard !cancelled, let image, let sample = Self.sample(image) else { return }
                 collect.lock()
-                found.append(IndexedPhoto(hash: hash, aspect: aspect,
+                found.append(IndexedPhoto(hash: sample.hash, aspect: sample.aspect,
                                           localIdentifier: asset.localIdentifier))
                 done += 1
                 let count = done
@@ -110,20 +113,62 @@ final class PhotoIndex: ObservableObject {
         }
     }
 
-    private static func hash(image: CGImage) -> UInt64 {
-        let width = image.width
-        let height = image.height
-        guard width >= 2, height >= 2 else { return 0 }
-        let rowBytes = width * 4
-        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+    /// Hash of the photo as it is shown, without the empty margin of a fitted thumbnail.
+    private static func sample(_ image: UIImage) -> (hash: UInt64, aspect: Double)? {
+        let scale = image.scale > 0 ? image.scale : 1
+        let width = max(2, Int((image.size.width * scale).rounded()))
+        let height = max(2, Int((image.size.height * scale).rounded()))
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = false
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: width, height: height), format: format)
+        let drawn = renderer.image { _ in
+            image.draw(in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        guard let cg = drawn.cgImage, cg.width >= 2, cg.height >= 2 else { return nil }
+        let rowBytes = cg.width * 4
+        let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+        guard let context = CGContext(data: nil, width: cg.width, height: cg.height, bitsPerComponent: 8,
                                       bytesPerRow: rowBytes, space: CGColorSpaceCreateDeviceRGB(),
-                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
-              let data = context.data else { return 0 }
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-        let bytes = data.bindMemory(to: UInt8.self, capacity: rowBytes * height)
-        return PictureHash.dhash(width: width, height: height) { x, y in
-            let i = (y * width + x) * 4
+                                      bitmapInfo: bitmapInfo),
+              let data = context.data else { return nil }
+        context.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
+        let bytes = data.bindMemory(to: UInt8.self, capacity: rowBytes * cg.height)
+        let box = interior(bytes: bytes, width: cg.width, height: cg.height)
+        guard box.w >= 2, box.h >= 2 else { return nil }
+        let hash = PictureHash.dhash(width: box.w, height: box.h) { x, y in
+            let i = ((box.y + y) * cg.width + (box.x + x)) * 4
             return PictureHash.luma(r: bytes[i], g: bytes[i + 1], b: bytes[i + 2])
         }
+        guard hash != 0 else { return nil }
+        return (hash, Double(box.w) / Double(box.h))
+    }
+
+    private static func margin(_ bytes: UnsafePointer<UInt8>, _ i: Int) -> Bool {
+        let alpha = Int(bytes[i + 3])
+        if alpha < 16 { return true }
+        let r = Int(bytes[i]), g = Int(bytes[i + 1]), b = Int(bytes[i + 2])
+        let y = (r * 77 + g * 150 + b * 29) >> 8
+        if max(r, g, b) - min(r, g, b) > 12 { return false }
+        return y <= 32 || y >= 248
+    }
+
+    private static func interior(bytes: UnsafePointer<UInt8>, width: Int, height: Int) -> (x: Int, y: Int, w: Int, h: Int) {
+        func rowEmpty(_ y: Int) -> Bool {
+            var ink = 0
+            for x in 0..<width where !margin(bytes, (y * width + x) * 4) { ink += 1 }
+            return ink * 200 <= width
+        }
+        func columnEmpty(_ x: Int) -> Bool {
+            var ink = 0
+            for y in 0..<height where !margin(bytes, (y * width + x) * 4) { ink += 1 }
+            return ink * 200 <= height
+        }
+        var top = 0, bottom = height - 1, left = 0, right = width - 1
+        while top < bottom, rowEmpty(top) { top += 1 }
+        while bottom > top, rowEmpty(bottom) { bottom -= 1 }
+        while left < right, columnEmpty(left) { left += 1 }
+        while right > left, columnEmpty(right) { right -= 1 }
+        return (left, top, right - left + 1, bottom - top + 1)
     }
 }

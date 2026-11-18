@@ -33,14 +33,19 @@ struct ContentView: View {
                     }
                 }
                 Section {
-                    Text("Leave this app open. On the PC, drag a fullscreen photo off the Porthole window. The original file follows the cursor when one photo matches.")
+                    Text("Open this once, wait until it says Ready and Connected, then open the photo. Drag that picture off the Porthole window. The original file follows the cursor.")
                 }
             }
             .navigationTitle("Porthole")
         }
-        .onAppear { client.prepare() }
+        .onAppear {
+            client.bind(index: index)
+            client.prepare()
+            index.requestAccessAndIndex()
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { client.cameForward() }
+            if phase == .background { client.enteredBackground() }
         }
     }
 }

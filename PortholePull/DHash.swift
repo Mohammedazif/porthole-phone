@@ -1,7 +1,7 @@
 import Foundation
 
 enum PictureHash {
-    static let matchMax = 10
+    static let matchMax = 12
     static let matchGap = 6
     static let aspectTol = 0.08
 
@@ -25,14 +25,19 @@ enum PictureHash {
         UInt8((Int(r) * 77 + Int(g) * 150 + Int(b) * 29) >> 8)
     }
 
-    static func pick(query: UInt64, queryAspect: Double, hashes: [UInt64], aspects: [Double]) -> Int? {
+    struct Pick {
+        var index: Int?
+        var closest = 65
+    }
+
+    static func pick(query: UInt64, queryAspect: Double, hashes: [UInt64], aspects: [Double]) -> Pick {
         var best = -1
         var bestDistance = 65
         var second = 65
         for index in hashes.indices {
-            if queryAspect > 0, index < aspects.count, aspects[index] > 0 {
-                let diff = abs(aspects[index] - queryAspect) / queryAspect
-                if diff > aspectTol { continue }
+            if queryAspect > 0, index < aspects.count, aspects[index] > 0,
+               !aspectMatches(aspects[index], queryAspect) {
+                continue
             }
             let distance = (query ^ hashes[index]).nonzeroBitCount
             if distance < bestDistance {
@@ -43,9 +48,16 @@ enum PictureHash {
                 second = distance
             }
         }
-        if best < 0 || bestDistance > matchMax { return nil }
-        if second < bestDistance + matchGap { return nil }
-        return best
+        guard best >= 0 else { return Pick() }
+        let unique = bestDistance <= matchMax && second >= bestDistance + matchGap
+        return Pick(index: unique ? best : nil, closest: bestDistance)
+    }
+
+    /// The camera file's stored shape can be the other way up from the screen.
+    private static func aspectMatches(_ stored: Double, _ query: Double) -> Bool {
+        if abs(stored - query) / query <= aspectTol { return true }
+        let turned = 1 / query
+        return abs(stored - turned) / turned <= aspectTol
     }
 
     private static func at(_ numer: Int, _ denom: Int, _ limit: Int) -> Int {
