@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var index = PhotoIndex()
     @StateObject private var client = PullClient()
 
@@ -8,14 +9,14 @@ struct ContentView: View {
         NavigationStack {
             Form {
                 Section("This PC") {
-                    TextField("Address, such as 192.168.1.20", text: $client.address)
+                    TextField("Address from F1 help", text: $client.address)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.numbersAndPunctuation)
-                    TextField("Code from Porthole help", text: $client.code)
+                    TextField("Code from F1 help", text: $client.code)
                         .textInputAutocapitalization(.characters)
                         .autocorrectionDisabled()
-                    Text("Port 47731. The code is on the PC in F1 help.")
+                    Text("You can paste the whole F1 line into the address. Port 47731.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -30,13 +31,16 @@ struct ContentView: View {
                         client.bind(index: index)
                         client.connect()
                     }
-                    .disabled(!index.ready)
                 }
                 Section {
                     Text("Leave this app open. On the PC, drag a fullscreen photo off the Porthole window. The original file follows the cursor when one photo matches.")
                 }
             }
             .navigationTitle("Porthole")
+        }
+        .onAppear { client.prepare() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { client.cameForward() }
         }
     }
 }

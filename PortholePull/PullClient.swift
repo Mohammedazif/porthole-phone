@@ -3,11 +3,13 @@ import Network
 import Photos
 
 final class PullClient: ObservableObject {
-    @Published var status = "Not connected"
+    @Published var status = "Opening"
     @Published var address = ""
     @Published var code = ""
     private let queue = DispatchQueue(label: "porthole.pull")
     private var connection: NWConnection?
+    private var browser: NWBrowser?
+    private var announcer: NWListener?
     private var buffer = Data()
     private var greeted = false
     private weak var index: PhotoIndex?
@@ -16,36 +18,144 @@ final class PullClient: ObservableObject {
         self.index = index
     }
 
+    /// Bonjour is what makes iOS show Local Network. A plain TCP connect often does not.
+    func prepare() {
+        guard browser == nil else { return }
+        let parameters = NWParameters.tcp
+        let browser = NWBrowser(for: .bonjour(type: "_porthole._tcp", domain: nil), using: parameters)
+        browser.stateUpdateHandler = { [weak self] state in
+            DispatchQueue.main.async { self?.noteBrowse(state) }
+        }
+        browser.start(queue: queue)
+        self.browser = browser
+        do {
+            let listener = try NWListener(using: .tcp)
+            listener.service = NWListener.Service(name: "Porthole", type: "_porthole._tcp")
+            listener.newConnectionHandler = { $0.cancel() }
+            listener.stateUpdateHandler = { [weak self] state in
+                DispatchQueue.main.async { self?.noteAnnounce(state) }
+            }
+            listener.start(queue: queue)
+            announcer = listener
+        } catch {
+            show("Could not ask for Local Network")
+        }
+        show("Allow Local Network when iOS asks. It is also under Settings → Privacy & Security → Local Network.")
+    }
+
+    func cameForward() {
+        guard !greeted, normalized() != nil else { return }
+        connect()
+    }
+
     func connect() {
-        let host = address.trimmingCharacters(in: .whitespaces)
-        let token = code.trimmingCharacters(in: .whitespaces).uppercased()
-        guard !host.isEmpty, token.count == 8 else {
-            status = "Enter the PC address and the 8-character code"
+        guard let fields = normalized() else {
+            show("Enter the address and code from F1 help")
             return
         }
+        address = fields.host
+        code = fields.token
         connection?.cancel()
         buffer.removeAll()
         greeted = false
-        let link = NWConnection(host: NWEndpoint.Host(host), port: 47731, using: .tcp)
+        let link = NWConnection(host: NWEndpoint.Host(fields.host), port: 47731, using: .tcp)
         connection = link
+        let token = fields.token
         link.stateUpdateHandler = { [weak self] state in
             DispatchQueue.main.async {
-                switch state {
-                case .ready:
-                    self?.status = "Connected"
-                    self?.send("HELLO \(token)\n")
-                    self?.receive()
-                case .failed, .cancelled:
-                    self?.status = "Disconnected"
-                case .waiting:
-                    self?.status = "Waiting for the PC. Allow Local Network if iOS asks."
-                default:
-                    break
-                }
+                self?.noteLink(state, token: token)
             }
         }
         link.start(queue: queue)
-        status = "Connecting"
+        show("Connecting to \(fields.host)")
+    }
+
+    private func normalized() -> (host: String, token: String)? {
+        var raw = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        var token = code.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        let parts = raw.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        if parts.count >= 2 {
+            raw = parts[0]
+            let extra = parts[1].uppercased()
+            if token.count != 8, extra.count == 8, extra.allSatisfy(\.isHexDigit) {
+                token = extra
+            }
+        }
+        if let colon = raw.lastIndex(of: ":"), raw.firstIndex(of: ":") == colon {
+            let suffix = raw[raw.index(after: colon)...]
+            if !suffix.isEmpty, suffix.allSatisfy(\.isNumber) {
+                raw = String(raw[..<colon])
+            }
+        }
+        guard !raw.isEmpty, token.count == 8, token.allSatisfy(\.isHexDigit) else { return nil }
+        return (raw, token)
+    }
+
+    private func noteBrowse(_ state: NWBrowser.State) {
+        if case .waiting(let error) = state, isDenied(error) {
+            show("Local Network is off. Settings → Privacy & Security → Local Network → turn on Porthole.")
+        }
+    }
+
+    private func noteAnnounce(_ state: NWListener.State) {
+        switch state {
+        case .ready:
+            if !greeted, connection == nil {
+                show("Local Network is on. Enter the F1 address and code, then Connect.")
+            }
+        case .waiting(let error), .failed(let error):
+            if isDenied(error) {
+                show("Local Network is off. Settings → Privacy & Security → Local Network → turn on Porthole.")
+            }
+        default:
+            break
+        }
+    }
+
+    private func noteLink(_ state: NWConnection.State, token: String) {
+        switch state {
+        case .ready:
+            show("Connected")
+            send("HELLO \(token)\n")
+            receive()
+        case .waiting(let error):
+            if connection?.currentPath?.unsatisfiedReason == .localNetworkDenied || isDenied(error) {
+                show("Local Network is off. Settings → Privacy & Security → Local Network → turn on Porthole.")
+            } else {
+                show("Waiting for the PC. \(explain(error))")
+            }
+        case .failed(let error):
+            greeted = false
+            show("Not connected. \(explain(error))")
+        case .cancelled:
+            break
+        default:
+            break
+        }
+    }
+
+    private func isDenied(_ error: NWError) -> Bool {
+        if case .dns(let code) = error, code == -65570 { return true }
+        return false
+    }
+
+    private func explain(_ error: NWError) -> String {
+        if case .posix(let code) = error {
+            switch code {
+            case .ECONNREFUSED:
+                return "Nothing is answering on port 47731. Start Porthole on the PC."
+            case .EHOSTUNREACH, .ENETUNREACH, .EHOSTDOWN, .ENETDOWN, .ETIMEDOUT:
+                return "Use the address from F1 help. The phone and the PC must be on the same Wi-Fi."
+            default:
+                break
+            }
+        }
+        return String(describing: error)
+    }
+
+    private func show(_ text: String) {
+        if greeted, text != "Connected. Leave this app open." { return }
+        status = text
     }
 
     private func send(_ text: String) {
@@ -61,7 +171,11 @@ final class PullClient: ObservableObject {
                 self.drain()
             }
             if error != nil || complete {
-                DispatchQueue.main.async { self.status = "Disconnected" }
+                let hadHello = self.greeted
+                self.greeted = false
+                DispatchQueue.main.async {
+                    self.show(hadHello ? "Disconnected" : "The PC closed the connection. Check the code in F1 help.")
+                }
                 return
             }
             self.receive()
@@ -89,9 +203,15 @@ final class PullClient: ObservableObject {
             send("MISS\n")
             return
         }
-        guard let index, index.ready, let asset = index.match(hash: hash, aspect: aspect) else {
+        guard let index else {
             send("MISS\n")
-            DispatchQueue.main.async { self.status = "No single photo matched the window" }
+            return
+        }
+        guard index.ready, let asset = index.match(hash: hash, aspect: aspect) else {
+            send("MISS\n")
+            DispatchQueue.main.async {
+                self.status = index.ready ? "No single photo matched the window" : "Load photos, then drag the picture again"
+            }
             return
         }
         export(asset)
