@@ -1,0 +1,64 @@
+name: iPhone app
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  ipa:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - name: Pick the newest Xcode
+        run: |
+          set -euo pipefail
+          xcode=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -vi beta | sort -V | tail -1 || true)
+          if [ -z "${xcode}" ]; then
+            xcode=/Applications/Xcode.app
+          fi
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+      # Unsigned: Sideloadly or AltStore signs it with the Apple ID of whoever installs it.
+      - name: Build
+        run: |
+          xcodebuild -project PortholePull.xcodeproj -scheme PortholePull -configuration Release \
+            -sdk iphoneos -destination "generic/platform=iOS" -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            VALIDATE_PRODUCT=NO build
+      - name: Package
+        run: |
+          app="build/Build/Products/Release-iphoneos/Porthole.app"
+          test -d "$app"
+          ver=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Info.plist")
+          ipa="porthole-${ver}.ipa"
+          mkdir -p Payload
+          cp -R "$app" Payload/
+          zip -qry "$ipa" Payload
+          echo "IPA=$ipa" >> "$GITHUB_ENV"
+      # On a release, not as an artifact: the account's artifact storage also holds the other installers.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        # Tried a few times, since a refused call would otherwise throw away the whole build.
+        run: |
+          retry() { for wait in 15 45 0; do "$@" && return 0; [ "$wait" -gt 0 ] && sleep "$wait"; done; return 1; }
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            ver="${GITHUB_REF_NAME#v}"
+            gh release upload "$GITHUB_REF_NAME" "$IPA" --clobber 2>/dev/null \
+              || retry gh release create "$GITHUB_REF_NAME" "$IPA" --title "Porthole phone ${ver}" --notes-file CHANGELOG.md \
+              || gh release upload "$GITHUB_REF_NAME" "$IPA" --clobber
+            retry gh release edit "$GITHUB_REF_NAME" --title "Porthole phone ${ver}" --notes-file CHANGELOG.md
+          else
+            # A build started by hand replaces the one before, so there is only ever one.
+            gh release delete ios-latest --cleanup-tag --yes 2>/dev/null || true
+            retry gh release create ios-latest "$IPA" --target "$GITHUB_SHA" --prerelease \
+              --title "iPhone build $(date -u +%Y-%m-%d)" \
+              --notes "The latest build started by hand, from ${GITHUB_SHA:0:7}. Install $IPA with Sideloadly or AltStore."
+          fi
