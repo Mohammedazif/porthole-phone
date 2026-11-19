@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.13
+
+Porthole has an icon: solid purple with the porthole ring. The PC looks for that colour in the Share sheet, so a Ctrl+drag on the PC can tap Share and then Porthole in Photos by itself, and Photos sends the exact originals of everything selected, even items scrolled off screen. The Share sheet closes sooner after sending.
+
 ## 2.12
 
 Grid thumbnails are found far more often. The sharper confirmation also tries the picture zoomed in by 2% and 4%: the PC's thumbnail could sit a pixel or two inside the real one, and that small zoom alone cost the right photo most of its lead, so it was refused. Best with the PC build from the same day, which cuts the whole thumbnail and paints out Select mode's checkmark.

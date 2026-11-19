@@ -277,7 +277,7 @@ final class ShareViewController: UIViewController {
         stop()
         say("Sent \(count) item\(count == 1 ? "" : "s"). On the PC, hold Ctrl and drag out of the Porthole window.",
             progress: 1)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
             self.extensionContext?.completeRequest(returningItems: nil, completionHandler: nil)
         }
     }
