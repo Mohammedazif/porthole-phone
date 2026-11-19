@@ -1,3 +1,4 @@
+import AVFoundation
 import Photos
 import UIKit
 
@@ -8,11 +9,21 @@ struct IndexedPhoto {
     let localIdentifier: String
 }
 
+/// Small frames from across one video. Kept in a file, so each video is read once.
+struct VideoEntry {
+    let localIdentifier: String
+    let modified: Double
+    let aspect: Double
+    let frames: [[UInt8]]
+}
+
 final class PhotoIndex: ObservableObject {
     @Published var status = "Photos not loaded"
     @Published var ready = false
     private let lock = NSLock()
     private var photos: [IndexedPhoto] = []
+    private var videos: [VideoEntry] = []
+    private let videoQueue = DispatchQueue(label: "porthole.videos", qos: .utility)
     private var manager: PHCachingImageManager?
     private var indexing = false
 
@@ -38,9 +49,62 @@ final class PhotoIndex: ObservableObject {
         var closest = 65
         /// Best and runner-up gradient scores, for the PC log.
         var note = ""
+        /// Best and runner-up video scores, for the PC log.
+        var video = ""
+        /// The closest photo's thumb, which the PC saves beside its own. Always last.
+        var debug = ""
     }
 
+    /// Photos first; a picture no photo matches is then compared with video frames.
     func match(hash: UInt64, aspect: Double, thumb: [Double]?) -> Match {
+        var found = matchPhotos(hash: hash, aspect: aspect, thumb: thumb)
+        guard found.asset == nil, let thumb, thumb.count == PictureHash.thumbSide * PictureHash.thumbSide else {
+            return found
+        }
+        let video = matchVideos(aspect: aspect, thumb: thumb)
+        if let asset = video.asset {
+            return Match(asset: asset, closest: found.closest, note: video.note)
+        }
+        found.video = video.note
+        return found
+    }
+
+    private func matchVideos(aspect: Double, thumb: [Double]) -> (asset: PHAsset?, note: String) {
+        lock.lock()
+        let entries = videos
+        lock.unlock()
+        if entries.isEmpty || aspect <= 0 { return (nil, "") }
+        let side = PictureHash.videoSide
+        let query = PictureHash.gradients(PictureHash.shrink(thumb, to: side), side: side)
+        // The best frame stands for its video, so neighbouring frames of one video
+        // never compete with each other for the margin.
+        var pick = -1
+        var top = -2.0
+        var runner = -2.0
+        for (index, entry) in entries.enumerated() {
+            if entry.aspect > 0, abs(entry.aspect - aspect) / aspect > 0.12 { continue }
+            var best = -2.0
+            for frame in entry.frames {
+                let score = PictureHash.correlation(query, PictureHash.gradients(frame.map(Double.init), side: side))
+                if score > best { best = score }
+            }
+            if best > top {
+                runner = top
+                top = best
+                pick = index
+            } else if best > runner {
+                runner = best
+            }
+        }
+        let note = String(format: "video %.3f %.3f", max(top, -1), max(runner, -1))
+        guard pick >= 0, top >= PictureHash.videoMin, top - runner >= PictureHash.videoGap else {
+            return (nil, note)
+        }
+        let asset = PHAsset.fetchAssets(withLocalIdentifiers: [entries[pick].localIdentifier], options: nil).firstObject
+        return (asset, note)
+    }
+
+    private func matchPhotos(hash: UInt64, aspect: Double, thumb: [Double]?) -> Match {
         lock.lock()
         let items = photos
         lock.unlock()
@@ -102,7 +166,7 @@ final class PhotoIndex: ObservableObject {
             if bestDistance <= PictureHash.matchMax, second >= bestDistance + PictureHash.matchGap {
                 return Match(asset: fetch(items[best]), closest: bestDistance, note: note)
             }
-            return Match(asset: nil, closest: bestDistance, note: note + debug)
+            return Match(asset: nil, closest: bestDistance, note: note, debug: debug)
         }
         // A PC before the thumb: a mirrored photo lands about 15 to 17 bits away, and the
         // next library photo is often only a few bits behind that.
@@ -189,7 +253,158 @@ final class PhotoIndex: ObservableObject {
             self.lock.unlock()
             self.ready = true
             self.status = "Ready, \(finished.count) photos"
+            self.indexVideos(photoCount: finished.count)
         }
+    }
+
+    /// Reads frames from each video in the background, newest first. A video already in
+    /// the cache file with the same modification date is not read again.
+    private func indexVideos(photoCount: Int) {
+        let fetch = PHFetchOptions()
+        fetch.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue)
+        fetch.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        let assets = PHAsset.fetchAssets(with: fetch)
+        let total = assets.count
+        if total == 0 { return }
+        videoQueue.async {
+            var cache = Self.loadVideoCache()
+            var visited = Set<String>()
+            var built: [VideoEntry] = []
+            var unsaved = 0
+            for n in 0..<total {
+                let asset = assets.object(at: n)
+                let id = asset.localIdentifier
+                let modified = asset.modificationDate?.timeIntervalSince1970 ?? 0
+                visited.insert(id)
+                if let old = cache[id], old.modified == modified {
+                    built.append(old)
+                } else if let entry = autoreleasepool(invoking: { Self.sampleVideo(asset, modified: modified) }) {
+                    cache[id] = entry
+                    built.append(entry)
+                    unsaved += 1
+                }
+                if (n + 1) % 10 == 0 || n + 1 == total {
+                    self.lock.lock()
+                    self.videos = built
+                    self.lock.unlock()
+                    let done = n + 1
+                    DispatchQueue.main.async {
+                        self.status = "Ready, \(photoCount) photos, videos \(done)/\(total)"
+                    }
+                }
+                if unsaved >= 20 {
+                    Self.saveVideoCache(Array(cache.values))
+                    unsaved = 0
+                }
+            }
+            cache = cache.filter { visited.contains($0.key) }
+            Self.saveVideoCache(Array(cache.values))
+            let count = built.count
+            DispatchQueue.main.async {
+                self.status = "Ready, \(photoCount) photos, \(count) videos"
+            }
+        }
+    }
+
+    /// Frames spread over the video, read near key frames so each one is quick.
+    /// A video stored only in iCloud is skipped; its preview frame is still a photo entry.
+    private static func sampleVideo(_ asset: PHAsset, modified: Double) -> VideoEntry? {
+        let options = PHVideoRequestOptions()
+        options.isNetworkAccessAllowed = false
+        options.deliveryMode = .automatic
+        options.version = .current
+        let done = DispatchSemaphore(value: 0)
+        var loaded: AVAsset?
+        PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { result, _, _ in
+            loaded = result
+            done.signal()
+        }
+        done.wait()
+        guard let video = loaded else { return nil }
+        let duration = max(0.1, asset.duration)
+        let step = max(1.0, duration / Double(PictureHash.videoFramesMax))
+        let generator = AVAssetImageGenerator(asset: video)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 64, height: 64)
+        let tolerance = CMTime(seconds: min(step / 2, 1.0), preferredTimescale: 600)
+        generator.requestedTimeToleranceBefore = tolerance
+        generator.requestedTimeToleranceAfter = tolerance
+        var frames: [[UInt8]] = []
+        var aspect = 0.0
+        var time = 0.0
+        while time < duration && frames.count < PictureHash.videoFramesMax {
+            let at = CMTime(seconds: time, preferredTimescale: 600)
+            if let image = try? generator.copyCGImage(at: at, actualTime: nil),
+               let sampled = sample(UIImage(cgImage: image)) {
+                aspect = Double(sampled.width) / Double(sampled.height)
+                let whole = PictureHash.Crop(x: 0, y: 0, w: sampled.width, h: sampled.height)
+                let cells = PictureHash.thumb(luma: sampled.luma, width: sampled.width, crop: whole,
+                                              side: PictureHash.videoSide)
+                frames.append(cells.map { UInt8(min(255, max(0, $0.rounded()))) })
+            }
+            time += step
+        }
+        if frames.isEmpty { return nil }
+        return VideoEntry(localIdentifier: asset.localIdentifier, modified: modified, aspect: aspect, frames: frames)
+    }
+
+    private static var videoCacheURL: URL? {
+        try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                     appropriateFor: nil, create: true)
+            .appendingPathComponent("video-frames-v1.bin")
+    }
+
+    private static func saveVideoCache(_ entries: [VideoEntry]) {
+        guard let url = videoCacheURL else { return }
+        var data = Data("PVF1".utf8)
+        func put<T>(_ value: T) {
+            withUnsafeBytes(of: value) { data.append(contentsOf: $0) }
+        }
+        put(UInt32(entries.count))
+        for entry in entries {
+            let id = Array(entry.localIdentifier.utf8)
+            put(UInt16(id.count))
+            data.append(contentsOf: id)
+            put(entry.modified)
+            put(entry.aspect)
+            put(UInt16(entry.frames.count))
+            for frame in entry.frames {
+                data.append(contentsOf: frame)
+            }
+        }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    private static func loadVideoCache() -> [String: VideoEntry] {
+        guard let url = videoCacheURL, let data = try? Data(contentsOf: url), data.count >= 8,
+              Data(data.prefix(4)) == Data("PVF1".utf8) else { return [:] }
+        let bytes = [UInt8](data)
+        var at = 4
+        func take(_ count: Int) -> [UInt8]? {
+            guard count >= 0, at + count <= bytes.count else { return nil }
+            defer { at += count }
+            return Array(bytes[at..<(at + count)])
+        }
+        func number<T>(_: T.Type) -> T? {
+            guard let raw = take(MemoryLayout<T>.size) else { return nil }
+            return raw.withUnsafeBytes { $0.load(as: T.self) }
+        }
+        let cells = PictureHash.videoSide * PictureHash.videoSide
+        var out: [String: VideoEntry] = [:]
+        guard let count = number(UInt32.self) else { return [:] }
+        for _ in 0..<count {
+            guard let idLength = number(UInt16.self), let idBytes = take(Int(idLength)),
+                  let id = String(bytes: idBytes, encoding: .utf8),
+                  let modified = number(Double.self), let aspect = number(Double.self),
+                  let frameCount = number(UInt16.self) else { break }
+            var frames: [[UInt8]] = []
+            for _ in 0..<frameCount {
+                guard let frame = take(cells) else { return out }
+                frames.append(frame)
+            }
+            out[id] = VideoEntry(localIdentifier: id, modified: modified, aspect: aspect, frames: frames)
+        }
+        return out
     }
 
     private struct SampledPhoto {

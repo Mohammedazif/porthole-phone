@@ -242,7 +242,10 @@ final class PullClient: ObservableObject {
         let found = index.match(hash: hash, aspect: aspect, thumb: thumb)
         guard index.ready, let asset = found.asset else {
             if found.closest < 65 {
-                send(found.note.isEmpty ? "MISS \(found.closest)\n" : "MISS \(found.closest) \(found.note)\n")
+                // The debug thumb stays last: the PC reads the final field as hex.
+                let parts = ["MISS \(found.closest)", found.note, found.video,
+                             found.debug.trimmingCharacters(in: .whitespaces)]
+                send(parts.filter { !$0.isEmpty }.joined(separator: " ") + "\n")
             } else {
                 send("MISS\n")
             }

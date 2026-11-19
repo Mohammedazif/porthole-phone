@@ -12,6 +12,13 @@ enum PictureHash {
     static let gradientMin = 0.75
     static let gradientGap = 0.10
 
+    /// Videos keep up to videoFramesMax frames from across their length, each as
+    /// videoSide x videoSide cells, so a video matches while it plays.
+    static let videoSide = 16
+    static let videoFramesMax = 24
+    static let videoMin = 0.55
+    static let videoGap = 0.15
+
     static func dhash(width: Int, height: Int, lumaAt: (Int, Int) -> UInt8) -> UInt64 {
         if width < 2 || height < 2 { return 0 }
         var hash: UInt64 = 0
@@ -67,8 +74,8 @@ enum PictureHash {
 
     /// Box average into thumbSide x thumbSide cells. Cell bounds are the PC's:
     /// rows [r*h/n, max(that+1, (r+1)*h/n)), and the same for columns.
-    static func thumb(luma: [UInt8], width: Int, crop c: Crop) -> [Double] {
-        let n = thumbSide
+    static func thumb(luma: [UInt8], width: Int, crop c: Crop, side: Int = thumbSide) -> [Double] {
+        let n = side
         var out = [Double](repeating: 0, count: n * n)
         if c.w < 1 || c.h < 1 || luma.count < (c.y + c.h - 1) * width + c.x + c.w { return out }
         for r in 0..<n {
@@ -93,8 +100,8 @@ enum PictureHash {
     }
 
     /// Horizontal then vertical neighbour differences of a thumb.
-    static func gradients(_ t: [Double]) -> [Double] {
-        let n = thumbSide
+    static func gradients(_ t: [Double], side: Int = thumbSide) -> [Double] {
+        let n = side
         var g = [Double]()
         if t.count != n * n { return g }
         g.reserveCapacity(2 * n * (n - 1))
@@ -128,6 +135,26 @@ enum PictureHash {
         }
         if aa <= 0 || bb <= 0 { return 0 }
         return ab / (aa * bb).squareRoot()
+    }
+
+    /// A thumbSide thumb averaged down to side x side cells.
+    static func shrink(_ t: [Double], to side: Int) -> [Double] {
+        let n = thumbSide
+        if t.count != n * n || side < 1 || n % side != 0 { return [] }
+        let k = n / side
+        var out = [Double](repeating: 0, count: side * side)
+        for r in 0..<side {
+            for c in 0..<side {
+                var sum = 0.0
+                for y in 0..<k {
+                    for x in 0..<k {
+                        sum += t[(r * k + y) * n + c * k + x]
+                    }
+                }
+                out[r * side + c] = sum / Double(k * k)
+            }
+        }
+        return out
     }
 
     /// Cells as two hex digits each, the same layout as the PC sends.

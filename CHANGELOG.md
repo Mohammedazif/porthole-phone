@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.13
+
+A video can be dragged at any point while it plays. After the photos, the app reads up to 24 small frames from across each video stored on the phone, newest first, and keeps them in a file so each video is read only once. The status line shows how many videos are done; a video not yet read still matches near its start.
+
 ## 1.12
 
 Videos can be dragged off the mirror too. They are matched by their preview frame, so drag a video near its start, and the original movie file is sent. Every file is streamed from disk, so a large video does not need to fit in memory. Screenshots already worked here; the PC no longer mistakes them for the live phone screen.
