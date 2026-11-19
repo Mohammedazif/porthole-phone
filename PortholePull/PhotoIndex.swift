@@ -23,6 +23,9 @@ final class PhotoIndex: ObservableObject {
     private let lock = NSLock()
     private var photos: [IndexedPhoto] = []
     private var videos: [VideoEntry] = []
+    /// Videos in the library, and those skipped because they are only in iCloud.
+    private var videoTotal = 0
+    private var videoSkipped = 0
     private let videoQueue = DispatchQueue(label: "porthole.videos", qos: .utility)
     private var manager: PHCachingImageManager?
     private var indexing = false
@@ -72,8 +75,11 @@ final class PhotoIndex: ObservableObject {
     private func matchVideos(aspect: Double, thumb: [Double]) -> (asset: PHAsset?, note: String) {
         lock.lock()
         let entries = videos
+        let total = videoTotal
+        let skipped = videoSkipped
         lock.unlock()
-        if entries.isEmpty || aspect <= 0 { return (nil, "") }
+        let progress = "read \(entries.count)/\(total) icloud \(skipped)"
+        if entries.isEmpty || aspect <= 0 { return (nil, "video none " + progress) }
         let side = PictureHash.videoSide
         let query = PictureHash.gradients(PictureHash.shrink(thumb, to: side), side: side)
         // The best frame stands for its video, so neighbouring frames of one video
@@ -96,7 +102,7 @@ final class PhotoIndex: ObservableObject {
                 runner = best
             }
         }
-        let note = String(format: "video %.3f %.3f", max(top, -1), max(runner, -1))
+        let note = String(format: "video %.3f %.3f ", max(top, -1), max(runner, -1)) + progress
         guard pick >= 0, top >= PictureHash.videoMin, top - runner >= PictureHash.videoGap else {
             return (nil, note)
         }
@@ -266,6 +272,10 @@ final class PhotoIndex: ObservableObject {
         let assets = PHAsset.fetchAssets(with: fetch)
         let total = assets.count
         if total == 0 { return }
+        lock.lock()
+        videoTotal = total
+        videoSkipped = 0
+        lock.unlock()
         videoQueue.async {
             var cache = Self.loadVideoCache()
             var visited = Set<String>()
@@ -282,6 +292,10 @@ final class PhotoIndex: ObservableObject {
                     cache[id] = entry
                     built.append(entry)
                     unsaved += 1
+                } else {
+                    self.lock.lock()
+                    self.videoSkipped += 1
+                    self.lock.unlock()
                 }
                 if (n + 1) % 10 == 0 || n + 1 == total {
                     self.lock.lock()

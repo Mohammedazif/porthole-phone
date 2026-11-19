@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.15
+
+A refused drag tells the PC how many videos have been read so far, and how many were skipped because they are only in iCloud. A video the app could not read only matches near its start.
+
 ## 1.14
 
 A playing video is accepted at a lower score when it still leads every other video by a clear margin. Frames are only 24 per video, so the right video can score well below a photo; two close videos are still refused.
