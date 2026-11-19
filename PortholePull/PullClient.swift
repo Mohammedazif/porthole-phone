@@ -263,8 +263,9 @@ final class PullClient: ObservableObject {
 
     private func export(_ asset: PHAsset) {
         let resources = PHAssetResource.assetResources(for: asset)
-        guard let resource = resources.first(where: { $0.type == .photo })
-                ?? resources.first(where: { $0.type == .fullSizePhoto }) else {
+        let wanted: [PHAssetResourceType] = asset.mediaType == .video
+            ? [.video, .fullSizeVideo] : [.photo, .fullSizePhoto]
+        guard let resource = wanted.lazy.compactMap({ type in resources.first(where: { $0.type == type }) }).first else {
             send("MISS\n")
             return
         }
@@ -272,22 +273,55 @@ final class PullClient: ObservableObject {
             send("MISS\n")
             return
         }
-        var body = Data()
+        // Written to a file first: the PC needs the size before the bytes, and a video
+        // can be far larger than what fits in memory.
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString + "-" + name)
         let options = PHAssetResourceRequestOptions()
         options.isNetworkAccessAllowed = true
-        PHAssetResourceManager.default().requestData(for: resource, options: options) { chunk in
-            body.append(chunk)
-        } completionHandler: { [weak self] error in
+        let kind = asset.mediaType == .video ? "video" : "photo"
+        DispatchQueue.main.async { self.status = "Reading that \(kind)" }
+        PHAssetResourceManager.default().writeData(for: resource, toFile: file, options: options) { [weak self] error in
             guard let self else { return }
-            if error != nil || body.isEmpty || body.count > 200 * 1024 * 1024 {
+            if error != nil {
+                try? FileManager.default.removeItem(at: file)
                 self.send("MISS\n")
-                DispatchQueue.main.async { self.status = "Could not read that photo" }
+                DispatchQueue.main.async { self.status = "Could not read that \(kind)" }
                 return
             }
-            self.send("FILE \(body.count) \(name)\n")
-            self.connection?.send(content: body, completion: .contentProcessed { _ in })
-            DispatchQueue.main.async { self.status = "Sent \(name)" }
+            self.stream(file, name: name)
         }
+    }
+
+    /// FILE line, then the file in 1 MB pieces, each sent after the previous one is taken.
+    private func stream(_ file: URL, name: String) {
+        let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?.int64Value ?? 0
+        guard size > 0, let handle = try? FileHandle(forReadingFrom: file), let link = connection else {
+            try? FileManager.default.removeItem(at: file)
+            send("MISS\n")
+            return
+        }
+        func finish(_ text: String) {
+            try? handle.close()
+            try? FileManager.default.removeItem(at: file)
+            DispatchQueue.main.async { self.status = text }
+        }
+        func next() {
+            let chunk = handle.readData(ofLength: 1 << 20)
+            if chunk.isEmpty {
+                finish("Sent \(name)")
+                return
+            }
+            link.send(content: chunk, completion: .contentProcessed { error in
+                if error != nil {
+                    finish("Sending \(name) stopped")
+                    return
+                }
+                next()
+            })
+        }
+        send("FILE \(size) \(name)\n")
+        next()
     }
 
     private func safeName(_ raw: String) -> String? {

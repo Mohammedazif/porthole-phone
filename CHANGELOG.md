@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.12
+
+Videos can be dragged off the mirror too. They are matched by their preview frame, so drag a video near its start, and the original movie file is sent. Every file is streamed from disk, so a large video does not need to fit in memory. Screenshots already worked here; the PC no longer mistakes them for the live phone screen.
+
 ## 1.11
 
 The app stays connected in the background after the audio route changes, such as when mirroring starts or Porthole on the PC restarts. iOS stopped the silent audio that keeps the app running, and suspended it a few seconds later.

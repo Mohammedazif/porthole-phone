@@ -116,7 +116,11 @@ final class PhotoIndex: ObservableObject {
     }
 
     private func index() {
-        let assets = PHAsset.fetchAssets(with: .image, options: nil)
+        // Videos are indexed by their preview frame, so a video matches near its start.
+        let fetch = PHFetchOptions()
+        fetch.predicate = NSPredicate(format: "mediaType == %d || mediaType == %d",
+                                      PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue)
+        let assets = PHAsset.fetchAssets(with: fetch)
         let total = assets.count
         if total == 0 {
             DispatchQueue.main.async {
