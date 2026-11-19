@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.1
+
+Less lag while sharing the screen. Porthole on the PC now answers each frame, and the app skips a frame instead of queueing it while two are still unanswered, so a slow moment on Wi-Fi drops frames rather than building up delay. The stream is 5 Mbit/s instead of 8. Needs the PC build from the same day.
+
 ## 2.0
 
 Share screen. A broadcast extension sends what the iPhone actually shows to Porthole over Wi-Fi, so Photos keeps its bars and share sheets, alerts and the info panel appear on the PC. Start it with the Share screen button in this app, or from Control Center (long-press Screen Recording, choose Porthole). Keep Screen Mirroring off while sharing, and keep the photo link connected: Porthole only accepts the screen from the phone it knows. Picture only for now; sound stays on the phone. The Xcode project is now generated from project.yml.

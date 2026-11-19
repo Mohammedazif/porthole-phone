@@ -13,7 +13,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var browser: NWBrowser?
     private var link: NWConnection?
     private var ready = false
-    private var inFlight = 0
+    /// Frames sent that the PC has not yet answered with its one-byte 'A'.
+    private var unacked = 0
     private var needKey = true
     private var session: VTCompressionSession?
     private var sessionWidth = 0
@@ -21,9 +22,10 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var lastFrame = CMTime.invalid
     private var stopped = false
 
-    /// About 30 frames a second, and never more than this many frames waiting on Wi-Fi.
+    /// About 30 frames a second. A frame is skipped, not queued, while this many are
+    /// still unanswered, so a slow moment on Wi-Fi drops frames instead of adding lag.
     private let minInterval = 1.0 / 31.0
-    private let maxInFlight = 3
+    private let maxUnacked = 2
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
         queue.async { self.browse() }
@@ -77,7 +79,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
                 self.lock.lock()
                 self.ready = true
                 self.needKey = true
-                self.inFlight = 0
+                self.unacked = 0
                 self.lock.unlock()
                 self.watch(connection)
             case .failed, .cancelled:
@@ -92,10 +94,15 @@ final class SampleHandler: RPBroadcastSampleHandler {
         connection.start(queue: queue)
     }
 
-    /// Porthole never sends anything; a finished receive means it closed.
+    /// Porthole answers every frame with one byte; a finished receive means it closed.
     private func watch(_ connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 64) { [weak self] _, _, complete, error in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 64) { [weak self] data, _, complete, error in
             guard let self else { return }
+            if let data, !data.isEmpty {
+                self.lock.lock()
+                self.unacked = max(0, self.unacked - data.count)
+                self.lock.unlock()
+            }
             if complete || error != nil {
                 connection.cancel()
                 self.dropLink()
@@ -124,12 +131,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
         guard type == .video, let image = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         lock.lock()
-        let go = ready && inFlight < maxInFlight
+        let go = ready && unacked < maxUnacked
             && (!lastFrame.isValid || CMTimeGetSeconds(CMTimeSubtract(time, lastFrame)) >= minInterval)
         let key = needKey
         if go {
             lastFrame = time
             needKey = false
+            unacked += 1 /* counted now: the encoder is asynchronous */
         }
         lock.unlock()
         guard go else { return }
@@ -139,13 +147,20 @@ final class SampleHandler: RPBroadcastSampleHandler {
         if session == nil || width != sessionWidth || height != sessionHeight {
             makeSession(width: width, height: height)
         }
-        guard let session else { return }
+        guard let session else {
+            unsent()
+            return
+        }
         let properties: CFDictionary? = key
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame as String: true] as CFDictionary : nil
         VTCompressionSessionEncodeFrame(session, imageBuffer: image, presentationTimeStamp: time,
                                         duration: .invalid, frameProperties: properties,
                                         infoFlagsOut: nil) { [weak self] status, _, sample in
-            guard let self, status == noErr, let sample, let encoded = Self.annexB(sample) else { return }
+            guard let self else { return }
+            guard status == noErr, let sample, let encoded = Self.annexB(sample) else {
+                self.unsent() /* dropped by the encoder: nothing for the PC to answer */
+                return
+            }
             self.send(encoded.0, keyframe: encoded.1)
         }
     }
@@ -167,7 +182,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
                              value: kVTProfileLevel_H264_High_AutoLevel)
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_AverageBitRate,
-                             value: NSNumber(value: 8_000_000))
+                             value: NSNumber(value: 5_000_000))
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: 30))
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
                              value: NSNumber(value: 2))
@@ -187,18 +202,23 @@ final class SampleHandler: RPBroadcastSampleHandler {
         frame.append(keyframe ? 2 : 1)
         frame.append(bytes)
         queue.async {
-            guard let link = self.link else { return }
-            self.lock.lock()
-            self.inFlight += 1
-            self.lock.unlock()
+            guard let link = self.link else {
+                self.unsent()
+                return
+            }
             link.send(content: frame, completion: .contentProcessed { [weak self] error in
-                guard let self else { return }
+                guard let self, error != nil else { return }
                 self.lock.lock()
-                self.inFlight = max(0, self.inFlight - 1)
-                if error != nil { self.needKey = true }
+                self.needKey = true
                 self.lock.unlock()
             })
         }
+    }
+
+    private func unsent() {
+        lock.lock()
+        unacked = max(0, unacked - 1)
+        lock.unlock()
     }
 
     /// Length-prefixed NAL units to start codes, with SPS and PPS before a keyframe.
