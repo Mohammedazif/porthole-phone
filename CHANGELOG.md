@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.14
+
+Drags answer quickly again. 2.11's off-centre cuts scored thousands of photos seven times each on one core, so a drag waited 6 to 8 seconds. Now each photo is scored at the centre and where its quick hash sat, only the closest 40 at every cut, and the work runs on all of the phone's cores. The sharper copies for the closer look are read at the same time instead of one after another, and the video scan runs on all cores too. Each answer carries its timings for the PC's log.
+
 ## 2.13
 
 Porthole has an icon: solid purple with the porthole ring. The PC looks for that colour in the Share sheet, so a Ctrl+drag on the PC can tap Share and then Porthole in Photos by itself, and Photos sends the exact originals of everything selected, even items scrolled off screen. The Share sheet closes sooner after sending.
