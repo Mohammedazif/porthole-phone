@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.14
+
+A playing video is accepted at a lower score when it still leads every other video by a clear margin. Frames are only 24 per video, so the right video can score well below a photo; two close videos are still refused.
+
 ## 1.13
 
 A video can be dragged at any point while it plays. After the photos, the app reads up to 24 small frames from across each video stored on the phone, newest first, and keeps them in a file so each video is read only once. The status line shows how many videos are done; a video not yet read still matches near its start.

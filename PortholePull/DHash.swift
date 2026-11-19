@@ -16,7 +16,8 @@ enum PictureHash {
     /// videoSide x videoSide cells, so a video matches while it plays.
     static let videoSide = 16
     static let videoFramesMax = 24
-    static let videoMin = 0.55
+    /// A video drag at 0.455 led every other video by 0.18; wrong videos scored 0.24 to 0.32.
+    static let videoMin = 0.42
     static let videoGap = 0.15
 
     static func dhash(width: Int, height: Int, lumaAt: (Int, Int) -> UInt8) -> UInt64 {
