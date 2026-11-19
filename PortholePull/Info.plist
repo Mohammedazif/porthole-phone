@@ -25,9 +25,10 @@
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_porthole._tcp</string>
+		<string>_porthole-screen._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Porthole sends the original photo to your PC on this Wi-Fi.</string>
+	<string>Porthole sends the original photo and this iPhone's screen to your PC on this Wi-Fi.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Porthole matches the photo on the PC window and sends that original file.</string>
 	<key>UIBackgroundModes</key>

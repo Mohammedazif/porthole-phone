@@ -1,4 +1,17 @@
+import ReplayKit
 import SwiftUI
+
+/// The system broadcast button, set to this app's extension so one tap starts it.
+struct BroadcastButton: UIViewRepresentable {
+    func makeUIView(context: Context) -> RPSystemBroadcastPickerView {
+        let picker = RPSystemBroadcastPickerView(frame: CGRect(x: 0, y: 0, width: 44, height: 44))
+        picker.preferredExtension = "local.porthole.pull.broadcast"
+        picker.showsMicrophoneButton = false
+        return picker
+    }
+
+    func updateUIView(_ uiView: RPSystemBroadcastPickerView, context: Context) {}
+}
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
@@ -8,6 +21,16 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section("Screen") {
+                    HStack(spacing: 12) {
+                        BroadcastButton()
+                            .frame(width: 44, height: 44)
+                        Text("Share screen")
+                    }
+                    Text("Sends what this iPhone shows to Porthole over Wi-Fi, Photos bars and pop-ups included. Turn Screen Mirroring off while sharing, and keep this app connected below.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
                 Section("This PC") {
                     TextField("Address from F1 help", text: $client.address)
                         .textInputAutocapitalization(.never)

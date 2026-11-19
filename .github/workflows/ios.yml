@@ -24,6 +24,10 @@ jobs:
           fi
           sudo xcode-select -s "$xcode"
           xcodebuild -version
+      - name: Generate the Xcode project
+        run: |
+          brew install xcodegen
+          xcodegen generate
       # Unsigned: Sideloadly or AltStore signs it with the Apple ID of whoever installs it.
       - name: Build
         run: |

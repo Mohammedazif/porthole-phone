@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0
+
+Share screen. A broadcast extension sends what the iPhone actually shows to Porthole over Wi-Fi, so Photos keeps its bars and share sheets, alerts and the info panel appear on the PC. Start it with the Share screen button in this app, or from Control Center (long-press Screen Recording, choose Porthole). Keep Screen Mirroring off while sharing, and keep the photo link connected: Porthole only accepts the screen from the phone it knows. Picture only for now; sound stays on the phone. The Xcode project is now generated from project.yml.
+
 ## 1.15
 
 A refused drag tells the PC how many videos have been read so far, and how many were skipped because they are only in iCloud. A video the app could not read only matches near its start.

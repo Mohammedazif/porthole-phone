@@ -1,0 +1,41 @@
+# The Xcode project is generated from this file (brew install xcodegen; xcodegen generate).
+name: PortholePull
+options:
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  base:
+    MARKETING_VERSION: "2.0"
+    CURRENT_PROJECT_VERSION: "20"
+    SWIFT_VERSION: "5.0"
+    TARGETED_DEVICE_FAMILY: "1"
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGN_IDENTITY: ""
+    GENERATE_INFOPLIST_FILE: "NO"
+targets:
+  PortholePull:
+    type: application
+    platform: iOS
+    sources:
+      - PortholePull
+    settings:
+      base:
+        PRODUCT_NAME: Porthole
+        PRODUCT_BUNDLE_IDENTIFIER: local.porthole.pull
+        INFOPLIST_FILE: PortholePull/Info.plist
+    dependencies:
+      - target: PortholeBroadcast
+        embed: true
+    scheme: {}
+  PortholeBroadcast:
+    type: app-extension
+    platform: iOS
+    sources:
+      - PortholeBroadcast
+    settings:
+      base:
+        PRODUCT_NAME: PortholeBroadcast
+        PRODUCT_BUNDLE_IDENTIFIER: local.porthole.pull.broadcast
+        INFOPLIST_FILE: PortholeBroadcast/Info.plist
+        APPLICATION_EXTENSION_API_ONLY: "YES"
