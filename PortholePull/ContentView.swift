@@ -1,4 +1,5 @@
 import ReplayKit
+import PhotosUI
 import SwiftUI
 import UIKit
 
@@ -40,6 +41,7 @@ struct ContentView: View {
     @StateObject private var index = PhotoIndex()
     @StateObject private var client = PullClient()
     @StateObject private var broadcast = BroadcastTrigger()
+    @State private var choosingOriginal = false
 
     var body: some View {
         NavigationStack {
@@ -49,10 +51,12 @@ struct ContentView: View {
                         client.pauseKeepAlive()
                         DispatchQueue.main.async { broadcast.press() }
                     }
-                    BroadcastPicker(trigger: broadcast)
-                        .frame(width: 44, height: 44)
-                        .opacity(0.02)
-                        .allowsHitTesting(false)
+                    .background {
+                        BroadcastPicker(trigger: broadcast)
+                            .frame(width: 44, height: 44)
+                            .opacity(0.02)
+                            .allowsHitTesting(false)
+                    }
                     Text("Sends what this iPhone shows to Porthole over Wi-Fi, Photos bars and pop-ups included. Screen Mirroring can stay off. Keep this app connected below.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -71,8 +75,33 @@ struct ContentView: View {
                 }
                 Section("Library") {
                     Text(index.status)
-                    Button("Load photos") { index.requestAccessAndIndex() }
-                        .disabled(index.ready && index.status.hasPrefix("Ready"))
+                    Button(index.ready ? "Refresh library" : "Load photos") {
+                        index.requestAccessAndIndex(refresh: true)
+                    }
+                }
+                Section("Original file") {
+                    Button("Choose original") { choosingOriginal = true }
+                    if client.chosenOriginal.isEmpty {
+                        Text("If a photo or video will not drag, choose it here. Then drag the original-file card out of the Porthole window on your PC. It sends exactly the original you chose, including from iCloud.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        VStack(spacing: 12) {
+                            Image(systemName: "doc")
+                                .font(.largeTitle)
+                            Text(client.chosenOriginal)
+                                .font(.headline)
+                            Text("On your PC, hold and drag this card onto the desktop or a folder.")
+                                .font(.footnote)
+                        }
+                        .multilineTextAlignment(.center)
+                        .padding()
+                        .frame(maxWidth: .infinity, minHeight: 160)
+                        .foregroundStyle(Color.black)
+                        .background(Color.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        Button("Cancel selection", role: .cancel) { client.clearChosenOriginal() }
+                    }
                 }
                 Section("Link") {
                     Text(client.status)
@@ -93,8 +122,44 @@ struct ContentView: View {
             index.requestAccessAndIndex()
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { client.cameForward() }
+            if phase == .active {
+                client.cameForward()
+                index.refreshIfNeeded()
+            }
             if phase == .background { client.enteredBackground() }
+        }
+        .sheet(isPresented: $choosingOriginal) {
+            OriginalPicker { identifier in
+                choosingOriginal = false
+                if let identifier { client.chooseOriginal(identifier) }
+            }
+        }
+    }
+}
+
+/// The system picker gives the exact Photos identifier, without guessing from a
+/// playback frame. The file is still exported through PhotoKit as original bytes.
+struct OriginalPicker: UIViewControllerRepresentable {
+    let onChoose: (String?) -> Void
+
+    func makeUIViewController(context: Context) -> PHPickerViewController {
+        var config = PHPickerConfiguration(photoLibrary: .shared())
+        config.filter = .any(of: [.images, .videos])
+        config.selectionLimit = 1
+        config.preferredAssetRepresentationMode = .current
+        let picker = PHPickerViewController(configuration: config)
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ controller: PHPickerViewController, context: Context) {}
+    func makeCoordinator() -> Coordinator { Coordinator(onChoose: onChoose) }
+
+    final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+        let onChoose: (String?) -> Void
+        init(onChoose: @escaping (String?) -> Void) { self.onChoose = onChoose }
+        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+            onChoose(results.first?.assetIdentifier)
         }
     }
 }

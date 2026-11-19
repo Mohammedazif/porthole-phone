@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.5
+
+More photos and videos drag across. Needs the PC build from the same day, which also sends the picture at 64 x 64.
+
+- Copies of one picture, such as a duplicate or a saved copy, no longer block each other. The largest file, the camera original, is sent.
+- A near-perfect match is sent even when another photo is fairly close (0.962 against 0.894 used to be refused).
+- Close calls, such as two shots of a burst, are decided on a sharper copy of each candidate.
+- Photos' bars and a paused video's controls drawn over the picture count less.
+- A video paused between the frames the app stored is found by decoding real frames around the closest moments of the best candidate videos.
+- Choose original picks the exact item when nothing else can tell. The library is read again shortly after it changes.
+
 ## 2.4
 
 Share screen stays tappable with Screen Mirroring off. iOS disables that system button while the app is playing the silence that keeps the photo link alive, and mirroring had been the thing that stopped the silence. The silence now plays only after you leave the app.

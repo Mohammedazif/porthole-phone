@@ -7,6 +7,7 @@ struct IndexedPhoto {
     let gridW: Int
     let gridH: Int
     let localIdentifier: String
+    let modified: Double
 }
 
 /// Small frames from across one video. Kept in a file, so each video is read once.
@@ -17,7 +18,7 @@ struct VideoEntry {
     let frames: [[UInt8]]
 }
 
-final class PhotoIndex: ObservableObject {
+final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     @Published var status = "Photos not loaded"
     @Published var ready = false
     private let lock = NSLock()
@@ -29,10 +30,42 @@ final class PhotoIndex: ObservableObject {
     private let videoQueue = DispatchQueue(label: "porthole.videos", qos: .utility)
     private var manager: PHCachingImageManager?
     private var indexing = false
+    private var observing = false
+    private var refreshPending = false
+    private var lastRefresh = Date.distantPast
+    private var videoGeneration = 0
 
-    func requestAccessAndIndex() {
-        if indexing || ready { return }
+    deinit {
+        if observing { PHPhotoLibrary.shared().unregisterChangeObserver(self) }
+    }
+
+    /// Reuse unchanged thumbnails; retry items that were unavailable in iCloud.
+    func refreshIfNeeded() {
+        if Date().timeIntervalSince(lastRefresh) >= 30 {
+            requestAccessAndIndex(refresh: true)
+        }
+    }
+
+    /// iCloud sync can change the library many times a minute. Index once it settles.
+    private var changeWork: DispatchWorkItem?
+
+    func photoLibraryDidChange(_ changeInstance: PHChange) {
+        DispatchQueue.main.async {
+            self.changeWork?.cancel()
+            let work = DispatchWorkItem { [weak self] in self?.requestAccessAndIndex(refresh: true) }
+            self.changeWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
+        }
+    }
+
+    func requestAccessAndIndex(refresh: Bool = false) {
+        if indexing {
+            refreshPending = refreshPending || refresh
+            return
+        }
+        if ready && !refresh { return }
         indexing = true
+        lastRefresh = Date()
         PHPhotoLibrary.requestAuthorization(for: .readWrite) { [weak self] access in
             DispatchQueue.main.async {
                 guard access == .authorized || access == .limited else {
@@ -41,8 +74,13 @@ final class PhotoIndex: ObservableObject {
                     self?.ready = false
                     return
                 }
-                self?.status = "Indexing photos"
-                self?.index()
+                guard let self else { return }
+                if !self.observing {
+                    PHPhotoLibrary.shared().register(self)
+                    self.observing = true
+                }
+                self.status = "Updating library"
+                self.index()
             }
         }
     }
@@ -50,7 +88,7 @@ final class PhotoIndex: ObservableObject {
     struct Match {
         var asset: PHAsset?
         var closest = 65
-        /// Best and runner-up gradient scores, for the PC log.
+        /// Best and runner-up scores, for the PC log.
         var note = ""
         /// Best and runner-up video scores, for the PC log.
         var video = ""
@@ -58,59 +96,64 @@ final class PhotoIndex: ObservableObject {
         var debug = ""
     }
 
+    /// One library item being compared with the picture on screen.
+    private struct Candidate {
+        let id: String
+        var score: Double
+        /// The item's own pattern, to tell copies of one picture from different pictures.
+        var pattern: PictureHash.Pattern
+    }
+
     /// Photos first; a picture no photo matches is then compared with video frames.
-    func match(hash: UInt64, aspect: Double, thumb: [Double]?) -> Match {
-        var found = matchPhotos(hash: hash, aspect: aspect, thumb: thumb)
+    /// detail is the PC's 64-cell copy of the picture, from PCs since phone 2.5.
+    func match(hash: UInt64, aspect: Double, thumb: [Double]?, detail: [Double]? = nil,
+               progress: ((String) -> Void)? = nil) -> Match {
+        var found = matchPhotos(hash: hash, aspect: aspect, thumb: thumb, detail: detail)
         guard found.asset == nil, let thumb, thumb.count == PictureHash.thumbSide * PictureHash.thumbSide else {
             return found
         }
-        let video = matchVideos(aspect: aspect, thumb: thumb)
+        let video = matchVideos(aspect: aspect, thumb: thumb, detail: detail, progress: progress)
         if let asset = video.asset {
-            return Match(asset: asset, closest: found.closest, note: video.note)
+            return Match(asset: asset, closest: found.closest, note: found.note, video: video.note)
         }
         found.video = video.note
         return found
     }
 
-    private func matchVideos(aspect: Double, thumb: [Double]) -> (asset: PHAsset?, note: String) {
-        lock.lock()
-        let entries = videos
-        let total = videoTotal
-        let skipped = videoSkipped
-        lock.unlock()
-        let progress = "read \(entries.count)/\(total) icloud \(skipped)"
-        if entries.isEmpty || aspect <= 0 { return (nil, "video none " + progress) }
-        let side = PictureHash.videoSide
-        let query = PictureHash.gradients(PictureHash.shrink(thumb, to: side), side: side)
-        // The best frame stands for its video, so neighbouring frames of one video
-        // never compete with each other for the margin.
-        var pick = -1
-        var top = -2.0
-        var runner = -2.0
-        for (index, entry) in entries.enumerated() {
-            if entry.aspect > 0, abs(entry.aspect - aspect) / aspect > 0.12 { continue }
-            var best = -2.0
-            for frame in entry.frames {
-                let score = PictureHash.correlation(query, PictureHash.gradients(frame.map(Double.init), side: side))
-                if score > best { best = score }
+    /// The winner, if it leads every different picture by enough. Candidates that are
+    /// copies of the winner do not count against it; among those copies the largest
+    /// file wins, since that is the camera original rather than a saved copy.
+    private static func decide(_ ranked: [Candidate], min: Double) -> (id: String?, note: String) {
+        guard let top = ranked.first else { return (nil, "none") }
+        var runner = -1.0
+        var copies = [top.id]
+        for other in ranked.dropFirst() {
+            if PictureHash.similarity(top.pattern, other.pattern) >= PictureHash.copyMin {
+                if top.score - other.score < PictureHash.requiredGap(top.score) { copies.append(other.id) }
+                continue
             }
-            if best > top {
-                runner = top
-                top = best
-                pick = index
-            } else if best > runner {
-                runner = best
-            }
+            runner = other.score
+            break
         }
-        let note = String(format: "video %.3f %.3f ", max(top, -1), max(runner, -1)) + progress
-        guard pick >= 0, top >= PictureHash.videoMin, top - runner >= PictureHash.videoGap else {
+        var note = String(format: "%.3f %.3f", top.score, max(runner, -1))
+        if copies.count > 1 { note += " copies \(copies.count)" }
+        guard top.score >= min, top.score - runner >= PictureHash.requiredGap(top.score) else {
             return (nil, note)
         }
-        let asset = PHAsset.fetchAssets(withLocalIdentifiers: [entries[pick].localIdentifier], options: nil).firstObject
-        return (asset, note)
+        guard copies.count > 1 else { return (top.id, note) }
+        let assets = PHAsset.fetchAssets(withLocalIdentifiers: copies, options: nil)
+        var best: PHAsset?
+        assets.enumerateObjects { asset, _, _ in
+            guard let current = best else { best = asset; return }
+            let size = asset.pixelWidth * asset.pixelHeight
+            let bestSize = current.pixelWidth * current.pixelHeight
+            let older = (asset.creationDate ?? .distantFuture) < (current.creationDate ?? .distantFuture)
+            if size > bestSize || (size == bestSize && older) { best = asset }
+        }
+        return (best?.localIdentifier ?? top.id, note)
     }
 
-    private func matchPhotos(hash: UInt64, aspect: Double, thumb: [Double]?) -> Match {
+    private func matchPhotos(hash: UInt64, aspect: Double, thumb: [Double]?, detail: [Double]?) -> Match {
         lock.lock()
         let items = photos
         lock.unlock()
@@ -133,52 +176,244 @@ final class PhotoIndex: ObservableObject {
             }
         }
         guard best >= 0 else { return Match() }
-        if let thumb, thumb.count == PictureHash.thumbSide * PictureHash.thumbSide {
-            // The dHash only shortlists. Among close photos, the one whose gradients
-            // follow the picture on screen wins, and only by a clear margin.
-            let query = PictureHash.gradients(thumb)
-            var pick = -1
-            var top = -2.0
-            var runner = -2.0
-            for index in items.indices where distances[index] <= PictureHash.candidateBits {
-                let photo = items[index]
-                let crop = PictureHash.crop(width: photo.gridW, height: photo.gridH, aspect: aspect)
-                let cells = PictureHash.thumb(luma: photo.luma, width: photo.gridW, crop: crop)
-                let score = PictureHash.correlation(query, PictureHash.gradients(cells))
-                if score > top {
-                    runner = top
-                    top = score
-                    pick = index
-                } else if score > runner {
-                    runner = score
-                }
-            }
-            var note = String(format: "%.3f %.3f", max(top, -1), max(runner, -1))
-            if pick >= 0 {
-                note += " \(items[pick].gridW)x\(items[pick].gridH)"
-            }
-            // The photo closest by dHash, as the app sees it, for the PC to save beside its own copy.
-            let near = items[best]
-            let nearCells = PictureHash.thumb(luma: near.luma, width: near.gridW,
-                                              crop: PictureHash.crop(width: near.gridW, height: near.gridH,
-                                                                     aspect: aspect))
-            let nearScore = PictureHash.correlation(query, PictureHash.gradients(nearCells))
-            let debug = String(format: " near %dx%d %.3f ", near.gridW, near.gridH, nearScore)
-                + PictureHash.hex(nearCells)
-            if pick >= 0, top >= PictureHash.gradientMin, top - runner >= PictureHash.gradientGap {
-                return Match(asset: fetch(items[pick]), closest: distances[pick], note: note)
-            }
-            // A picture the gradients cannot place is still sent when its dHash stands well apart.
-            if bestDistance <= PictureHash.matchMax, second >= bestDistance + PictureHash.matchGap {
-                return Match(asset: fetch(items[best]), closest: bestDistance, note: note)
-            }
-            return Match(asset: nil, closest: bestDistance, note: note, debug: debug)
+        guard let thumb, thumb.count == PictureHash.thumbSide * PictureHash.thumbSide else {
+            // A PC before the thumb: a mirrored photo lands about 15 to 17 bits away, and the
+            // next library photo is often only a few bits behind that.
+            let unique = bestDistance <= PictureHash.matchMax && bestDistance < second
+            guard unique else { return Match(asset: nil, closest: bestDistance) }
+            return Match(asset: fetch(items[best]), closest: bestDistance)
         }
-        // A PC before the thumb: a mirrored photo lands about 15 to 17 bits away, and the
-        // next library photo is often only a few bits behind that.
-        let unique = bestDistance <= PictureHash.matchMax && bestDistance < second
-        guard unique else { return Match(asset: nil, closest: bestDistance) }
-        return Match(asset: fetch(items[best]), closest: bestDistance)
+
+        // The dHash only shortlists: everything close, and at least the 400 closest, since
+        // a dark picture or one under Photos' bars can land far from its own dHash.
+        let side = PictureHash.thumbSide
+        let query = PictureHash.pattern(thumb, side: side)
+        var order = items.indices.filter { distances[$0] < 65 }
+        order.sort { distances[$0] < distances[$1] }
+        let limit = max(400, order.prefix { distances[$0] <= PictureHash.candidateBits }.count)
+        var ranked: [Candidate] = []
+        var rankedIndex: [String: Int] = [:]
+        for index in order.prefix(limit) {
+            let photo = items[index]
+            let crop = PictureHash.crop(width: photo.gridW, height: photo.gridH, aspect: aspect)
+            let cells = PictureHash.thumb(luma: photo.luma, width: photo.gridW, crop: crop)
+            let pattern = PictureHash.pattern(cells, side: side)
+            ranked.append(Candidate(id: photo.localIdentifier, score: PictureHash.similarity(query, pattern),
+                                    pattern: pattern))
+            rankedIndex[photo.localIdentifier] = index
+        }
+        ranked.sort { $0.score > $1.score }
+
+        // The photo closest by dHash, as the app sees it, for the PC to save beside its own copy.
+        let near = items[ranked.first.flatMap { rankedIndex[$0.id] } ?? best]
+        let nearCells = PictureHash.thumb(luma: near.luma, width: near.gridW,
+                                          crop: PictureHash.crop(width: near.gridW, height: near.gridH,
+                                                                 aspect: aspect))
+        let debug = String(format: " near %dx%d ", near.gridW, near.gridH) + PictureHash.hex(nearCells)
+
+        let first = Self.decide(ranked, min: PictureHash.gradientMin)
+        var note = first.note
+        if let id = first.id, let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject {
+            return Match(asset: asset, closest: distances[rankedIndex[id] ?? best], note: note)
+        }
+
+        // Close, but not clear: look again at the few closest in more detail. This is what
+        // separates two shots of a burst, or a photo from its edited twin.
+        if let top = ranked.first, top.score >= 0.5 {
+            let close = ranked.prefix(8).filter { $0.score >= top.score - 0.15 }
+            let detailSide = detail != nil ? PictureHash.detailSide : side
+            let detailQuery = PictureHash.pattern(detail ?? thumb, side: detailSide)
+            var refined: [Candidate] = []
+            for candidate in close {
+                guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [candidate.id], options: nil).firstObject
+                else { continue }
+                let cells: [Double]
+                if let sampled = Self.render(asset, longSide: 320) {
+                    let crop = PictureHash.crop(width: sampled.width, height: sampled.height, aspect: aspect)
+                    cells = PictureHash.thumb(luma: sampled.luma, width: sampled.width, crop: crop, side: detailSide)
+                } else if let index = rankedIndex[candidate.id] {
+                    let photo = items[index]
+                    let crop = PictureHash.crop(width: photo.gridW, height: photo.gridH, aspect: aspect)
+                    cells = PictureHash.thumb(luma: photo.luma, width: photo.gridW, crop: crop, side: detailSide)
+                } else {
+                    continue
+                }
+                let pattern = PictureHash.pattern(cells, side: detailSide)
+                refined.append(Candidate(id: candidate.id, score: PictureHash.similarity(detailQuery, pattern),
+                                         pattern: pattern))
+            }
+            refined.sort { $0.score > $1.score }
+            let minimum = detail != nil ? PictureHash.detailMin : PictureHash.gradientMin
+            let closer = Self.decide(refined, min: minimum)
+            note += " detail " + closer.note
+            if let id = closer.id, let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject {
+                return Match(asset: asset, closest: distances[rankedIndex[id] ?? best], note: note)
+            }
+        }
+        // A picture the gradients cannot place is still sent when its dHash stands well apart.
+        if bestDistance <= PictureHash.matchMax, second >= bestDistance + PictureHash.matchGap,
+           let top = ranked.first, top.id == items[best].localIdentifier, top.score >= 0.5 {
+            return Match(asset: fetch(items[best]), closest: bestDistance, note: note)
+        }
+        return Match(asset: nil, closest: bestDistance, note: note, debug: debug)
+    }
+
+    private func matchVideos(aspect: Double, thumb: [Double], detail: [Double]?,
+                             progress: ((String) -> Void)?) -> (asset: PHAsset?, note: String) {
+        lock.lock()
+        let entries = videos
+        let total = videoTotal
+        let skipped = videoSkipped
+        lock.unlock()
+        let read = "read \(entries.count)/\(total) icloud \(skipped)"
+        let side = PictureHash.videoSide
+        guard !entries.isEmpty, aspect > 0,
+              let query = PictureHash.FrameQuery(cells: PictureHash.shrink(thumb, to: side), side: side) else {
+            return (nil, "video none " + read)
+        }
+        // Coarse: every stored frame of every video of this shape. The best frame stands
+        // for its video, so neighbouring frames of one video never compete with each other.
+        struct Coarse {
+            let index: Int
+            let grad: Double
+            let rank: Double
+            let anchors: [Int]
+        }
+        var coarse: [Coarse] = []
+        for (index, entry) in entries.enumerated() {
+            if entry.aspect > 0, abs(entry.aspect - aspect) / aspect > 0.12 { continue }
+            var bestGrad = -2.0
+            var scored: [(frame: Int, rank: Double)] = []
+            scored.reserveCapacity(entry.frames.count)
+            for (frameIndex, frame) in entry.frames.enumerated() {
+                let s = query.score(frame)
+                bestGrad = max(bestGrad, s.grad)
+                // Low-detail layout moves slowly; gradients pin the moment. Both rank.
+                scored.append((frameIndex, 0.6 * s.grad + 0.4 * s.luma))
+            }
+            scored.sort { $0.rank > $1.rank }
+            guard let lead = scored.first else { continue }
+            coarse.append(Coarse(index: index, grad: bestGrad, rank: lead.rank,
+                                 anchors: scored.prefix(2).map(\.frame)))
+        }
+        guard !coarse.isEmpty else { return (nil, "video none " + read) }
+        let byGrad = coarse.sorted { $0.grad > $1.grad }
+        let top = byGrad[0].grad
+        let runner = byGrad.count > 1 ? byGrad[1].grad : -1
+        var note = String(format: "video %.3f %.3f ", top, runner) + read
+        if top >= PictureHash.videoMin, top - runner >= PictureHash.videoGap,
+           let asset = PHAsset.fetchAssets(withLocalIdentifiers: [entries[byGrad[0].index].localIdentifier],
+                                           options: nil).firstObject {
+            return (asset, note)
+        }
+
+        // Twenty-four coarse frames can miss the exact moment, above all when the camera
+        // moves. Decode real frames around the closest moments of a short list.
+        var seen = Set<Int>()
+        var shortlist: [Coarse] = []
+        for c in coarse.sorted(by: { $0.rank > $1.rank }).prefix(10) + byGrad.prefix(4) where !seen.contains(c.index) {
+            seen.insert(c.index)
+            shortlist.append(c)
+        }
+        let detailSide = detail != nil ? PictureHash.detailSide : PictureHash.thumbSide
+        let detailQuery = PictureHash.pattern(detail ?? thumb, side: detailSide)
+        let deadline = Date().addingTimeInterval(20)
+        var refined: [Candidate] = []
+        var tried = 0
+        for (n, candidate) in shortlist.enumerated() {
+            if Date() > deadline { break }
+            progress?("Checking videos closely \(n + 1)/\(shortlist.count)")
+            let entry = entries[candidate.index]
+            guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [entry.localIdentifier], options: nil).firstObject,
+                  let video = Self.loadVideo(asset) else { continue }
+            let times = PictureHash.refinementTimes(duration: asset.duration, frames: entry.frames.count,
+                                                    anchors: candidate.anchors)
+            tried += 1
+            guard let found = Self.bestFrame(in: video, times: times, aspect: aspect, query: detailQuery,
+                                             side: detailSide, deadline: deadline) else { continue }
+            refined.append(Candidate(id: entry.localIdentifier, score: found.score, pattern: found.pattern))
+        }
+        refined.sort { $0.score > $1.score }
+        let minimum = detail != nil ? PictureHash.detailMin : PictureHash.gradientMin
+        let verdict = Self.decide(refined, min: minimum)
+        note += " refined " + verdict.note + " tried \(tried)"
+        if let id = verdict.id {
+            return (PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject, note)
+        }
+        return (nil, note)
+    }
+
+    private static func loadVideo(_ asset: PHAsset) -> AVAsset? {
+        let options = PHVideoRequestOptions()
+        options.isNetworkAccessAllowed = false // never download unrelated candidates
+        options.deliveryMode = .automatic
+        options.version = .current
+        let done = DispatchSemaphore(value: 0)
+        var loaded: AVAsset?
+        PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { result, _, _ in
+            loaded = result
+            done.signal()
+        }
+        _ = done.wait(timeout: .now() + 10)
+        return loaded
+    }
+
+    /// The frame among these times that best matches the picture on screen.
+    private static func bestFrame(in video: AVAsset, times: [Double], aspect: Double, query: PictureHash.Pattern,
+                                  side: Int, deadline: Date) -> (score: Double, pattern: PictureHash.Pattern)? {
+        guard !times.isEmpty else { return nil }
+        let generator = AVAssetImageGenerator(asset: video)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 256, height: 256)
+        let tolerance = CMTime(value: 1, timescale: 60)
+        generator.requestedTimeToleranceBefore = tolerance
+        generator.requestedTimeToleranceAfter = tolerance
+        let lock = NSLock()
+        var best: (score: Double, pattern: PictureHash.Pattern)?
+        var remaining = times.count
+        let done = DispatchSemaphore(value: 0)
+        let values = times.map { NSValue(time: CMTime(seconds: $0, preferredTimescale: 600)) }
+        generator.generateCGImagesAsynchronously(forTimes: values) { _, image, _, result, _ in
+            if result == .succeeded, let image, let sampled = Self.sample(UIImage(cgImage: image)) {
+                let crop = PictureHash.crop(width: sampled.width, height: sampled.height, aspect: aspect)
+                let cells = PictureHash.thumb(luma: sampled.luma, width: sampled.width, crop: crop, side: side)
+                let pattern = PictureHash.pattern(cells, side: side)
+                let score = PictureHash.similarity(query, pattern)
+                lock.lock()
+                if best == nil || score > best!.score { best = (score: score, pattern: pattern) }
+                lock.unlock()
+            }
+            lock.lock()
+            remaining -= 1
+            let finished = remaining == 0
+            lock.unlock()
+            if finished { done.signal() }
+        }
+        let wait = max(1.0, deadline.timeIntervalSinceNow)
+        if done.wait(timeout: .now() + wait) == .timedOut {
+            generator.cancelAllCGImageGeneration()
+            _ = done.wait(timeout: .now() + 2)
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        return best
+    }
+
+    /// A sharper copy than the index keeps, for comparing a few close candidates.
+    private static func render(_ asset: PHAsset, longSide: CGFloat) -> SampledPhoto? {
+        let options = PHImageRequestOptions()
+        options.isSynchronous = true
+        options.deliveryMode = .highQualityFormat
+        options.resizeMode = .exact
+        options.isNetworkAccessAllowed = false
+        options.version = .current
+        var image: UIImage?
+        PHImageManager.default().requestImage(for: asset, targetSize: CGSize(width: longSide, height: longSide),
+                                              contentMode: .aspectFit, options: options) { result, _ in
+            image = result
+        }
+        guard let image else { return nil }
+        return sample(image)
     }
 
     private func fetch(_ photo: IndexedPhoto) -> PHAsset? {
@@ -192,11 +427,16 @@ final class PhotoIndex: ObservableObject {
                                       PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue)
         let assets = PHAsset.fetchAssets(with: fetch)
         let total = assets.count
+        lock.lock()
+        let previous = Dictionary(photos.map { ($0.localIdentifier, $0) }, uniquingKeysWith: { _, new in new })
+        videoGeneration += 1 // stop an older video scan before starting another
+        lock.unlock()
         if total == 0 {
             DispatchQueue.main.async {
                 self.photos = []
                 self.ready = true
                 self.status = "No photos in the library"
+                self.finishIndex()
             }
             return
         }
@@ -209,6 +449,13 @@ final class PhotoIndex: ObservableObject {
         for n in 0..<total {
             let asset = assets.object(at: n)
             guard asset.pixelWidth >= 2, asset.pixelHeight >= 2 else { continue }
+            let modified = asset.modificationDate?.timeIntervalSince1970 ?? 0
+            if let old = previous[asset.localIdentifier], old.modified == modified {
+                collect.lock()
+                found.append(old)
+                collect.unlock()
+                continue
+            }
             group.enter()
             let options = PHImageRequestOptions()
             options.deliveryMode = .highQualityFormat
@@ -238,7 +485,7 @@ final class PhotoIndex: ObservableObject {
                 guard let sampled = Self.sample(image) else { return }
                 collect.lock()
                 found.append(IndexedPhoto(luma: sampled.luma, gridW: sampled.width, gridH: sampled.height,
-                                          localIdentifier: asset.localIdentifier))
+                                          localIdentifier: asset.localIdentifier, modified: modified))
                 done += 1
                 let count = done
                 collect.unlock()
@@ -260,6 +507,15 @@ final class PhotoIndex: ObservableObject {
             self.ready = true
             self.status = "Ready, \(finished.count) photos"
             self.indexVideos(photoCount: finished.count)
+            self.finishIndex()
+        }
+    }
+
+    private func finishIndex() {
+        indexing = false
+        if refreshPending {
+            refreshPending = false
+            requestAccessAndIndex(refresh: true)
         }
     }
 
@@ -275,6 +531,7 @@ final class PhotoIndex: ObservableObject {
         lock.lock()
         videoTotal = total
         videoSkipped = 0
+        let generation = videoGeneration
         lock.unlock()
         videoQueue.async {
             var cache = Self.loadVideoCache()
@@ -282,6 +539,10 @@ final class PhotoIndex: ObservableObject {
             var built: [VideoEntry] = []
             var unsaved = 0
             for n in 0..<total {
+                self.lock.lock()
+                let current = self.videoGeneration == generation
+                self.lock.unlock()
+                if !current { return }
                 let asset = assets.object(at: n)
                 let id = asset.localIdentifier
                 let modified = asset.modificationDate?.timeIntervalSince1970 ?? 0

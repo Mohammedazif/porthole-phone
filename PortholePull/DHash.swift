@@ -20,6 +20,142 @@ enum PictureHash {
     static let videoMin = 0.42
     static let videoGap = 0.15
 
+    /// The PC also sends the picture at detailSide cells a side. It is compared only
+    /// between the few closest candidates: two shots of a burst, two moments of a video.
+    static let detailSide = 64
+    /// After the closer look: a 64-cell copy of the picture on screen scores well above this.
+    static let detailMin = 0.6
+    /// Two library items whose own pictures agree this well are copies of one picture,
+    /// such as a duplicate or a saved copy. Either is the picture; neither blocks the other.
+    static let copyMin = 0.97
+
+    /// How far the winner must lead the next different picture. A near-perfect score
+    /// needs less: 0.962 against 0.894 was the right photo and used to be refused.
+    static func requiredGap(_ top: Double) -> Double {
+        if top >= 0.92 { return 0.04 }
+        if top >= 0.85 { return 0.07 }
+        return gradientGap
+    }
+
+    /// Gradients of a picture three ways: whole, without a margin on every side, and
+    /// without the top and bottom bands. Photos draws its bars and a paused video its
+    /// controls over those edges, so the best of the three is the fair comparison.
+    struct Pattern {
+        var parts: [[Double]]
+    }
+
+    static func pattern(_ cells: [Double], side n: Int) -> Pattern {
+        guard n >= 8, cells.count == n * n else { return Pattern(parts: []) }
+        let margin = n / 8
+        let band = n / 5
+        return Pattern(parts: [
+            gradients(cells, side: n),
+            region(cells, side: n, top: margin, bottom: margin, left: margin, right: margin),
+            region(cells, side: n, top: band, bottom: band + n / 16, left: 0, right: 0),
+        ])
+    }
+
+    static func similarity(_ a: Pattern, _ b: Pattern) -> Double {
+        guard !a.parts.isEmpty, a.parts.count == b.parts.count else { return -1 }
+        var best = -1.0
+        for i in a.parts.indices {
+            best = max(best, correlation(a.parts[i], b.parts[i]))
+        }
+        return best
+    }
+
+    /// Gradients of the cells left after cutting the given rows and columns away.
+    static func region(_ cells: [Double], side n: Int, top: Int, bottom: Int, left: Int, right: Int) -> [Double] {
+        let w = n - left - right
+        let h = n - top - bottom
+        guard w >= 2, h >= 2, cells.count == n * n else { return [] }
+        var part = [Double]()
+        part.reserveCapacity(w * h)
+        for y in top..<(n - bottom) {
+            part.append(contentsOf: cells[(y * n + left)..<(y * n + left + w)])
+        }
+        return gradients(part, width: w, height: h)
+    }
+
+    /// Times to decode around the coarse frames that came closest, covering the gap to
+    /// the neighbouring coarse frames. Bounded, so a long movie stays quick.
+    static func refinementTimes(duration: Double, frames: Int, anchors: [Int]) -> [Double] {
+        guard duration.isFinite, duration > 0, frames > 0, !anchors.isEmpty else { return [] }
+        let step = max(1.0, duration / Double(videoFramesMax))
+        let radius = step / 2 + 0.6
+        var ticks = Set<Int>()
+        for anchor in anchors.prefix(2) where anchor >= 0 && anchor < frames {
+            let center = Double(anchor) * step
+            let lower = max(0, center - radius)
+            let upper = min(duration - 0.05, center + radius)
+            guard upper >= lower else { continue }
+            let intervals = min(10, max(1, Int(ceil((upper - lower) / 0.25))))
+            for index in 0...intervals {
+                ticks.insert(Int(((lower + (upper - lower) * Double(index) / Double(intervals)) * 600).rounded()))
+            }
+        }
+        return ticks.sorted().map { Double($0) / 600 }.filter { $0 >= 0 && $0 < duration }
+    }
+
+    /// A query against many small video frames, without building arrays per frame.
+    /// Both halves are zero-mean and unit length, so a dot product is the correlation.
+    struct FrameQuery {
+        let side: Int
+        private let grad: [Double]
+        private let luma: [Double]
+
+        init?(cells: [Double], side: Int) {
+            guard side >= 2, cells.count == side * side else { return nil }
+            guard let g = FrameQuery.unit(PictureHash.gradients(cells, side: side)),
+                  let l = FrameQuery.unit(cells) else { return nil }
+            self.side = side
+            grad = g
+            luma = l
+        }
+
+        private static func unit(_ v: [Double]) -> [Double]? {
+            guard !v.isEmpty else { return nil }
+            let mean = v.reduce(0, +) / Double(v.count)
+            let centered = v.map { $0 - mean }
+            let norm = centered.reduce(0) { $0 + $1 * $1 }.squareRoot()
+            guard norm > 0 else { return nil }
+            return centered.map { $0 / norm }
+        }
+
+        /// Gradient and plain-picture correlation with one frame of side x side bytes.
+        func score(_ frame: [UInt8]) -> (grad: Double, luma: Double) {
+            let n = side
+            guard frame.count == n * n else { return (-1, -1) }
+            return frame.withUnsafeBufferPointer { p in
+                var s = 0.0, ss = 0.0, dot = 0.0
+                var i = 0
+                for r in 0..<n {
+                    let row = r * n
+                    for c in 0..<(n - 1) {
+                        let v = Double(p[row + c + 1]) - Double(p[row + c])
+                        s += v; ss += v * v; dot += grad[i] * v; i += 1
+                    }
+                }
+                for r in 0..<(n - 1) {
+                    for c in 0..<n {
+                        let v = Double(p[(r + 1) * n + c]) - Double(p[r * n + c])
+                        s += v; ss += v * v; dot += grad[i] * v; i += 1
+                    }
+                }
+                let spread = ss - s * s / Double(i)
+                let g = spread > 0 ? dot / spread.squareRoot() : 0
+                var ls = 0.0, lss = 0.0, ldot = 0.0
+                for k in 0..<(n * n) {
+                    let v = Double(p[k])
+                    ls += v; lss += v * v; ldot += luma[k] * v
+                }
+                let lspread = lss - ls * ls / Double(n * n)
+                let l = lspread > 0 ? ldot / lspread.squareRoot() : 0
+                return (g, l)
+            }
+        }
+    }
+
     static func dhash(width: Int, height: Int, lumaAt: (Int, Int) -> UInt8) -> UInt64 {
         if width < 2 || height < 2 { return 0 }
         var hash: UInt64 = 0
@@ -102,18 +238,21 @@ enum PictureHash {
 
     /// Horizontal then vertical neighbour differences of a thumb.
     static func gradients(_ t: [Double], side: Int = thumbSide) -> [Double] {
-        let n = side
+        gradients(t, width: side, height: side)
+    }
+
+    static func gradients(_ t: [Double], width w: Int, height h: Int) -> [Double] {
         var g = [Double]()
-        if t.count != n * n { return g }
-        g.reserveCapacity(2 * n * (n - 1))
-        for r in 0..<n {
-            for c in 0..<(n - 1) {
-                g.append(t[r * n + c + 1] - t[r * n + c])
+        if w < 2 || h < 2 || t.count != w * h { return g }
+        g.reserveCapacity(2 * w * h - w - h)
+        for r in 0..<h {
+            for c in 0..<(w - 1) {
+                g.append(t[r * w + c + 1] - t[r * w + c])
             }
         }
-        for r in 0..<(n - 1) {
-            for c in 0..<n {
-                g.append(t[(r + 1) * n + c] - t[r * n + c])
+        for r in 0..<(h - 1) {
+            for c in 0..<w {
+                g.append(t[(r + 1) * w + c] - t[r * w + c])
             }
         }
         return g
@@ -173,7 +312,12 @@ enum PictureHash {
 
     /// The fourth field of PULL: thumbSide squared bytes as hex.
     static func parseThumb(_ hex: Substring) -> [Double]? {
-        let n = thumbSide * thumbSide
+        parseCells(hex, side: thumbSide)
+    }
+
+    /// side squared bytes as hex, such as the fifth PULL field at detailSide.
+    static func parseCells(_ hex: Substring, side: Int) -> [Double]? {
+        let n = side * side
         let bytes = Array(hex.utf8)
         if bytes.count != n * 2 { return nil }
         var out = [Double]()

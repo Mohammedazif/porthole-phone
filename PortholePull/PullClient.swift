@@ -8,6 +8,7 @@ final class PullClient: ObservableObject {
     @Published var status = "Opening"
     @Published var address = ""
     @Published var code = ""
+    @Published private(set) var chosenOriginal = ""
     private let queue = DispatchQueue(label: "porthole.pull")
     private var connection: NWConnection?
     private var browser: NWBrowser?
@@ -18,6 +19,27 @@ final class PullClient: ObservableObject {
     private var reconnectWork: DispatchWorkItem?
     private let stay = SilentKeepAlive()
     private weak var index: PhotoIndex?
+    // Accessed only on queue. Explicit selection bypasses visual matching once.
+    private var chosenIdentifier: String?
+
+    func chooseOriginal(_ identifier: String) {
+        queue.async {
+            guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject else {
+                DispatchQueue.main.async { self.status = "Allow access to that item in Settings → Porthole → Photos" }
+                return
+            }
+            self.chosenIdentifier = identifier
+            let name = PHAssetResource.assetResources(for: asset).first?.originalFilename ?? "Selected original"
+            DispatchQueue.main.async { self.chosenOriginal = name }
+        }
+    }
+
+    func clearChosenOriginal() {
+        queue.async {
+            self.chosenIdentifier = nil
+            DispatchQueue.main.async { self.chosenOriginal = "" }
+        }
+    }
 
     func bind(index: PhotoIndex) {
         self.index = index
@@ -234,7 +256,7 @@ final class PullClient: ObservableObject {
         }
         guard greeted, line.hasPrefix("PULL ") else { return }
         let parts = line.split(separator: " ")
-        guard parts.count == 3 || parts.count == 4, let hash = UInt64(parts[1], radix: 16),
+        guard (3...5).contains(parts.count), let hash = UInt64(parts[1], radix: 16),
               let aspect = Double(parts[2]) else {
             send("MISS\n")
             return
@@ -243,8 +265,23 @@ final class PullClient: ObservableObject {
             send("MISS\n")
             return
         }
-        let thumb = parts.count == 4 ? PictureHash.parseThumb(parts[3]) : nil
-        let found = index.match(hash: hash, aspect: aspect, thumb: thumb)
+        let thumb = parts.count >= 4 ? PictureHash.parseThumb(parts[3]) : nil
+        // PCs since phone 2.5 add the same picture at 64 cells a side.
+        let detail = parts.count == 5 ? PictureHash.parseCells(parts[4], side: PictureHash.detailSide) : nil
+        if let identifier = chosenIdentifier {
+            chosenIdentifier = nil
+            DispatchQueue.main.async { self.chosenOriginal = "" }
+            guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject else {
+                send("MISS selected-item-unavailable\n")
+                return
+            }
+            export(asset)
+            return
+        }
+        DispatchQueue.main.async { self.status = "Finding that photo or video" }
+        let found = index.match(hash: hash, aspect: aspect, thumb: thumb, detail: detail) { [weak self] text in
+            DispatchQueue.main.async { self?.status = text }
+        }
         guard index.ready, let asset = found.asset else {
             if found.closest < 65 {
                 // The debug thumb stays last: the PC reads the final field as hex.
@@ -259,9 +296,9 @@ final class PullClient: ObservableObject {
                 if !index.ready {
                     self.status = "Load photos, then drag the picture again"
                 } else if closest < 65 {
-                    self.status = "No single photo matched (closest \(closest) bits)"
+                    self.status = "Could not identify this item. Use Choose original, then drag again. (\(closest) bits)"
                 } else {
-                    self.status = "No single photo matched the window"
+                    self.status = "Could not identify this item. Use Choose original, then drag again."
                 }
             }
             return
@@ -287,6 +324,11 @@ final class PullClient: ObservableObject {
             .appendingPathComponent(UUID().uuidString + "-" + name)
         let options = PHAssetResourceRequestOptions()
         options.isNetworkAccessAllowed = true
+        options.progressHandler = { [weak self] progress in
+            DispatchQueue.main.async {
+                self?.status = "Downloading original from iCloud: \(Int(progress * 100))%"
+            }
+        }
         let kind = asset.mediaType == .video ? "video" : "photo"
         DispatchQueue.main.async { self.status = "Reading that \(kind)" }
         PHAssetResourceManager.default().writeData(for: resource, toFile: file, options: options) { [weak self] error in
