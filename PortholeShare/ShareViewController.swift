@@ -3,8 +3,8 @@ import UIKit
 import UniformTypeIdentifiers
 
 /// Photos > Select > Share > Porthole. Sends the chosen photos and videos themselves to
-/// Porthole on the PC, which then carries them all on the next Ctrl+drag out of its
-/// window. Nothing is matched: these are exactly the items picked.
+/// Porthole on the PC, which saves them in Downloads. Nothing is matched: these are
+/// exactly the items picked.
 final class ShareViewController: UIViewController {
     private let titleLabel = UILabel()
     private let status = UILabel()
@@ -275,7 +275,7 @@ final class ShareViewController: UIViewController {
     private func sent() {
         let count = files.count
         stop()
-        say("Sent \(count) item\(count == 1 ? "" : "s"). On the PC, hold Ctrl and drag out of the Porthole window.",
+        say("Sent \(count) item\(count == 1 ? "" : "s") to the PC's Downloads.",
             progress: 1)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
             self.extensionContext?.completeRequest(returningItems: nil, completionHandler: nil)

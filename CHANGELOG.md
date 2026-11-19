@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.15
+
+Share > Porthole says the items went to the PC's Downloads: the PC now saves shared items there straight away, and Ctrl+drag takes one item at a time. Includes 2.14's faster search.
+
 ## 2.14
 
 Drags answer quickly again. 2.11's off-centre cuts scored thousands of photos seven times each on one core, so a drag waited 6 to 8 seconds. Now each photo is scored at the centre and where its quick hash sat, only the closest 40 at every cut, and the work runs on all of the phone's cores. The sharper copies for the closer look are read at the same time instead of one after another, and the video scan runs on all cores too. Each answer carries its timings for the PC's log.
