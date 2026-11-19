@@ -27,7 +27,7 @@ struct ContentView: View {
                             .frame(width: 44, height: 44)
                         Text("Share screen")
                     }
-                    Text("Sends what this iPhone shows to Porthole over Wi-Fi, Photos bars and pop-ups included. Turn Screen Mirroring off while sharing, and keep this app connected below.")
+                    Text("Sends what this iPhone shows to Porthole over Wi-Fi, Photos bars and pop-ups included. Screen Mirroring can stay off. Keep this app connected below.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

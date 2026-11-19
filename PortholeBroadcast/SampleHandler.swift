@@ -89,7 +89,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             case .failed, .cancelled:
                 self.dropLink()
             case .waiting:
-                connection.cancel()
+                break /* the path comes up after mirroring is off; cancelling here drops the share */
             default:
                 break
             }

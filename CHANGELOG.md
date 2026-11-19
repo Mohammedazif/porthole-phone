@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.3
+
+Share screen works with Screen Mirroring off. The broadcast was dropping the PC while Wi-Fi was still coming up, and that path is already up only when mirroring is on.
+
 ## 2.2
 
 The shared screen stays closer to now. The encoder sends each frame immediately instead of holding pictures to smooth the bitrate, and the picture's long side is 1080, the same size AirPlay already uses, so the PC is not drawing a much larger window. Turn Screen Mirroring off while sharing.
