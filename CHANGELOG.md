@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.4
+
+Share screen stays tappable with Screen Mirroring off. iOS disables that system button while the app is playing the silence that keeps the photo link alive, and mirroring had been the thing that stopped the silence. The silence now plays only after you leave the app.
+
 ## 2.3
 
 Share screen works with Screen Mirroring off. The broadcast was dropping the PC while Wi-Fi was still coming up, and that path is already up only when mirroring is on.

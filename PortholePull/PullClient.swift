@@ -26,7 +26,6 @@ final class PullClient: ObservableObject {
     /// Bonjour is what makes iOS show Local Network. A plain TCP connect often does not.
     func prepare() {
         loadSaved()
-        stay.start()
         guard browser == nil else { return }
         let parameters = NWParameters.tcp
         let browser = NWBrowser(for: .bonjour(type: "_porthole._tcp", domain: nil), using: parameters)
@@ -55,13 +54,20 @@ final class PullClient: ObservableObject {
     }
 
     func cameForward() {
-        stay.start()
+        // Silence uses a playback session, and iOS then disables Share screen
+        // until mirroring takes the sound away. Play it only in the background.
+        stay.stop()
         guard !greeted, normalized() != nil else { return }
         connect()
     }
 
     func enteredBackground() {
         stay.start()
+    }
+
+    /// Drops the playback session so the system Share screen button will accept a tap.
+    func pauseKeepAlive() {
+        stay.stop()
     }
 
     func connect() {
@@ -73,7 +79,6 @@ final class PullClient: ObservableObject {
         code = fields.token
         UserDefaults.standard.set(fields.host, forKey: "porthole.host")
         UserDefaults.standard.set(fields.token, forKey: "porthole.code")
-        stay.start()
         reconnectWork?.cancel()
         connection?.cancel()
         buffer.removeAll()
@@ -382,6 +387,7 @@ private final class SilentKeepAlive {
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
     private var attached = false
+    private var wanted = false
     private var observers: [NSObjectProtocol] = []
 
     /// iOS stops the engine when the audio route changes, for example when AirPlay
@@ -406,13 +412,20 @@ private final class SilentKeepAlive {
     }
 
     private func restart() {
-        if !engine.isRunning || !player.isPlaying {
-            player.stop()
-            start()
-        }
+        guard wanted, !engine.isRunning || !player.isPlaying else { return }
+        player.stop()
+        start()
+    }
+
+    func stop() {
+        wanted = false
+        player.stop()
+        engine.stop()
+        try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
     }
 
     func start() {
+        wanted = true
         let session = AVAudioSession.sharedInstance()
         do {
             try session.setCategory(.playback, options: [.mixWithOthers])
