@@ -19,6 +19,10 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var session: VTCompressionSession?
     private var sessionWidth = 0
     private var sessionHeight = 0
+    private var transfer: VTPixelTransferSession?
+    private var pool: CVPixelBufferPool?
+    private var poolWidth = 0
+    private var poolHeight = 0
     private var lastFrame = CMTime.invalid
     private var stopped = false
 
@@ -144,8 +148,12 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
         let width = CVPixelBufferGetWidth(image)
         let height = CVPixelBufferGetHeight(image)
-        if session == nil || width != sessionWidth || height != sessionHeight {
-            makeSession(width: width, height: height)
+        let fitted = Self.fit(width: width, height: height, longEdge: 1080)
+        let source = fitted.w == width && fitted.h == height ? image : scale(image, to: fitted)
+        let encW = CVPixelBufferGetWidth(source)
+        let encH = CVPixelBufferGetHeight(source)
+        if session == nil || encW != sessionWidth || encH != sessionHeight {
+            makeSession(width: encW, height: encH)
         }
         guard let session else {
             unsent()
@@ -153,7 +161,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         }
         let properties: CFDictionary? = key
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame as String: true] as CFDictionary : nil
-        VTCompressionSessionEncodeFrame(session, imageBuffer: image, presentationTimeStamp: time,
+        VTCompressionSessionEncodeFrame(session, imageBuffer: source, presentationTimeStamp: time,
                                         duration: .invalid, frameProperties: properties,
                                         infoFlagsOut: nil) { [weak self] status, _, sample in
             guard let self else { return }
@@ -177,15 +185,23 @@ final class SampleHandler: RPBroadcastSampleHandler {
                                                 outputCallback: nil, refcon: nil,
                                                 compressionSessionOut: &created)
         guard status == noErr, let made = created else { return }
+        let bitrate = 4_000_000
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-        VTSessionSetProperty(made, key: kVTCompressionPropertyKey_ProfileLevel,
-                             value: kVTProfileLevel_H264_High_AutoLevel)
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+        VTSessionSetProperty(made, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: NSNumber(value: 0))
+        VTSessionSetProperty(made, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
+                             value: kCFBooleanTrue)
+        VTSessionSetProperty(made, key: kVTCompressionPropertyKey_ProfileLevel,
+                             value: kVTProfileLevel_H264_Baseline_AutoLevel)
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_AverageBitRate,
-                             value: NSNumber(value: 5_000_000))
+                             value: NSNumber(value: bitrate))
+        // One frame of bitrate budget. A one-second window is what holds the picture back.
+        let bytesPerFrame = bitrate / 8 / 30
+        VTSessionSetProperty(made, key: kVTCompressionPropertyKey_DataRateLimits,
+                             value: [NSNumber(value: bytesPerFrame), NSNumber(value: 1.0 / 30.0)] as CFArray)
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: 30))
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
-                             value: NSNumber(value: 2))
+                             value: NSNumber(value: 1))
         VTCompressionSessionPrepareToEncodeFrames(made)
         session = made
         sessionWidth = width
@@ -219,6 +235,53 @@ final class SampleHandler: RPBroadcastSampleHandler {
         lock.lock()
         unacked = max(0, unacked - 1)
         lock.unlock()
+    }
+
+    /// Longer side at most `longEdge`, both sides even, so the PC draws the same size it
+    /// already handles for AirPlay.
+    private static func fit(width: Int, height: Int, longEdge: Int) -> (w: Int, h: Int) {
+        let long = max(width, height)
+        if long <= longEdge || width < 2 || height < 2 { return (width, height) }
+        if width >= height {
+            let w = longEdge & ~1
+            let h = max(2, ((height * w + width / 2) / width) & ~1)
+            return (w, h)
+        }
+        let h = longEdge & ~1
+        let w = max(2, ((width * h + height / 2) / height) & ~1)
+        return (w, h)
+    }
+
+    /// The original buffer when it already fits, otherwise a scaled copy. A failed scale
+    /// keeps the original so the broadcast continues.
+    private func scale(_ image: CVImageBuffer, to size: (w: Int, h: Int)) -> CVImageBuffer {
+        if transfer == nil {
+            var made: VTPixelTransferSession?
+            guard VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &made) == noErr,
+                  let made else { return image }
+            transfer = made
+        }
+        if pool == nil || poolWidth != size.w || poolHeight != size.h {
+            let attrs: [CFString: Any] = [
+                kCVPixelBufferWidthKey: size.w,
+                kCVPixelBufferHeightKey: size.h,
+                kCVPixelBufferPixelFormatTypeKey: CVPixelBufferGetPixelFormatType(image),
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary
+            ]
+            var made: CVPixelBufferPool?
+            guard CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &made) == kCVReturnSuccess,
+                  let made else { return image }
+            pool = made
+            poolWidth = size.w
+            poolHeight = size.h
+        }
+        var dst: CVPixelBuffer?
+        guard let pool, let transfer,
+              CVPixelBufferPoolCreatePixelBuffer(nil, pool, &dst) == kCVReturnSuccess, let dst,
+              VTPixelTransferSessionTransferImage(transfer, from: image, to: dst) == noErr else {
+            return image
+        }
+        return dst
     }
 
     /// Length-prefixed NAL units to start codes, with SPS and PPS before a keyframe.

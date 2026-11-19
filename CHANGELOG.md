@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.2
+
+The shared screen stays closer to now. The encoder sends each frame immediately instead of holding pictures to smooth the bitrate, and the picture's long side is 1080, the same size AirPlay already uses, so the PC is not drawing a much larger window. Turn Screen Mirroring off while sharing.
+
 ## 2.1
 
 Less lag while sharing the screen. Porthole on the PC now answers each frame, and the app skips a frame instead of queueing it while two are still unanswered, so a slow moment on Wi-Fi drops frames rather than building up delay. The stream is 5 Mbit/s instead of 8. Needs the PC build from the same day.
