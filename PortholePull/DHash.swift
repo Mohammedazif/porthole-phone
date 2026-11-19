@@ -71,21 +71,34 @@ enum PictureHash {
         /// The query is the picture itself, cut to this shape (its edges were found).
         /// along: where the cut sits on the free axis, 0 to 1. Photos does not always cut
         /// a grid thumbnail from the exact centre.
-        case crop(aspect: Double, along: Double = 0.5)
+        /// zoom below 1 keeps that much of the cut around its centre: a screen cut a
+        /// little inside the thumbnail's edges shows the picture slightly zoomed.
+        case crop(aspect: Double, along: Double = 0.5, zoom: Double = 1)
         /// The query is the whole screen of this shape; the picture is fitted inside
         /// it on this background, the way Photos shows one item. Needs no edges.
         case fit(screen: Double, background: Double)
+
+        /// The same placement, zoomed in around its centre. A fitted screen stays as is.
+        func zoomed(_ z: Double) -> Placement {
+            if case .crop(let aspect, let along, _) = self { return .crop(aspect: aspect, along: along, zoom: z) }
+            return self
+        }
     }
+
+    /// Zooms the confirmation tries. A 3% zoom alone costs the right photo most of
+    /// its lead at 64 cells, and the screen's thumbnail can be a pixel or two inside.
+    static let zooms: [Double] = [1, 0.98, 0.96]
 
     /// Cells of a luma picture as it appears under a placement. shape overrides the
     /// picture's own width / height, for video frames stored as a square grid.
     static func cells(luma: [UInt8], width: Int, height: Int, placement: Placement, side: Int,
                       shape: Double? = nil, samples k: Int = 4) -> [Double] {
         switch placement {
-        case .crop(let aspect, let along):
+        case .crop(let aspect, let along, let zoom):
             guard let shape else {
                 return thumb(luma: luma, width: width,
-                             crop: crop(width: width, height: height, aspect: aspect, along: along), side: side)
+                             crop: crop(width: width, height: height, aspect: aspect, along: along, zoom: zoom),
+                             side: side)
             }
             // A video frame kept as a square grid of a picture this shape: cut the centre
             // to the shape on screen, such as a square library thumbnail of a tall video.
@@ -289,7 +302,7 @@ enum PictureHash {
 
     /// A full photo cut to the shape it has on screen; along places the cut on the free
     /// axis, 0.5 being the centre.
-    static func crop(width: Int, height: Int, aspect: Double, along: Double = 0.5) -> Crop {
+    static func crop(width: Int, height: Int, aspect: Double, along: Double = 0.5, zoom: Double = 1) -> Crop {
         var c = Crop(x: 0, y: 0, w: width, h: height)
         if width < 2 || height < 2 || aspect < 0.05 { return c }
         let photo = Double(width) / Double(height)
@@ -300,6 +313,14 @@ enum PictureHash {
         } else if photo < aspect {
             c.h = min(height, max(2, Int((Double(width) / aspect).rounded())))
             c.y = Int((Double(height - c.h) * t).rounded())
+        }
+        if zoom < 1, zoom > 0.5 {
+            let w = max(2, Int((Double(c.w) * zoom).rounded()))
+            let h = max(2, Int((Double(c.h) * zoom).rounded()))
+            c.x += (c.w - w) / 2
+            c.y += (c.h - h) / 2
+            c.w = w
+            c.h = h
         }
         return c
     }

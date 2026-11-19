@@ -214,21 +214,32 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         let query = PictureHash.pattern(detail ?? thumb, side: side)
         var refined: [Candidate] = []
         for candidate in close {
-            let cells: [Double]
+            let luma: [UInt8], width: Int, height: Int
             if let asset = PHAsset.fetchAssets(withLocalIdentifiers: [candidate.id], options: nil).firstObject,
                let sampled = Self.render(asset, longSide: 320) {
-                cells = PictureHash.cells(luma: sampled.luma, width: sampled.width, height: sampled.height,
-                                          placement: placement(candidate), side: side)
+                (luma, width, height) = (sampled.luma, sampled.width, sampled.height)
             } else if let index = position[candidate.id] {
                 let photo = items[index]
-                cells = PictureHash.cells(luma: photo.luma, width: photo.gridW, height: photo.gridH,
-                                          placement: placement(candidate), side: side)
+                (luma, width, height) = (photo.luma, photo.gridW, photo.gridH)
             } else {
                 continue
             }
-            let pattern = PictureHash.pattern(cells, side: side)
-            refined.append(Candidate(id: candidate.id, score: PictureHash.similarity(query, pattern),
-                                     pattern: pattern, along: candidate.along))
+            // Each candidate at its best of a few zooms: the right one gains far more than
+            // a different picture does, so the lead grows.
+            // Copies are told apart by the unzoomed pattern, so two copies stay copies
+            // whichever zoom each scored best at.
+            var best = -1.0
+            var plain: PictureHash.Pattern?
+            for zoom in PictureHash.zooms {
+                let cells = PictureHash.cells(luma: luma, width: width, height: height,
+                                              placement: placement(candidate).zoomed(zoom), side: side)
+                let pattern = PictureHash.pattern(cells, side: side)
+                if plain == nil { plain = pattern }
+                best = max(best, PictureHash.similarity(query, pattern))
+            }
+            if let plain {
+                refined.append(Candidate(id: candidate.id, score: best, pattern: plain, along: candidate.along))
+            }
         }
         refined.sort { $0.score > $1.score }
         let minimum = detail != nil ? PictureHash.detailMin : PictureHash.gradientMin

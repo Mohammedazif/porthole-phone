@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.12
+
+Grid thumbnails are found far more often. The sharper confirmation also tries the picture zoomed in by 2% and 4%: the PC's thumbnail could sit a pixel or two inside the real one, and that small zoom alone cost the right photo most of its lead, so it was refused. Best with the PC build from the same day, which cuts the whole thumbnail and paints out Select mode's checkmark.
+
 ## 2.11
 
 Fewer wrong files. A win that is not near-perfect is confirmed on sharper copies of the closest candidates, and refused when that look disagrees: a page of handwriting had been sent for a ticked screenshot. Photos does not always cut a grid thumbnail from the centre, so several cut positions are tried. The match's scores go to the PC with each file, for its log.
