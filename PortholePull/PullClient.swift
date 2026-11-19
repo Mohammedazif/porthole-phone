@@ -345,6 +345,35 @@ private final class SilentKeepAlive {
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
     private var attached = false
+    private var observers: [NSObjectProtocol] = []
+
+    /// iOS stops the engine when the audio route changes, for example when AirPlay
+    /// mirroring starts or Porthole on the PC restarts. Without the silence playing,
+    /// the app is suspended a few seconds later and the photo link drops.
+    init() {
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine,
+                                            queue: .main) { [weak self] _ in self?.restart() })
+        observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil,
+                                            queue: .main) { [weak self] _ in self?.restart() })
+        observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil,
+                                            queue: .main) { [weak self] note in
+            guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  AVAudioSession.InterruptionType(rawValue: raw) == .ended else { return }
+            self?.restart()
+        })
+    }
+
+    deinit {
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
+
+    private func restart() {
+        if !engine.isRunning || !player.isPlaying {
+            player.stop()
+            start()
+        }
+    }
 
     func start() {
         let session = AVAudioSession.sharedInstance()

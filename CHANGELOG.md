@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.11
+
+The app stays connected in the background after the audio route changes, such as when mirroring starts or Porthole on the PC restarts. iOS stopped the silent audio that keeps the app running, and suspended it a few seconds later.
+
 ## 1.10
 
 The app reconnects by itself after Porthole on the PC restarts. A connect that was refused while the PC was down used to wait until the app was opened again.
