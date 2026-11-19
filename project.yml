@@ -5,8 +5,8 @@ options:
     iOS: "17.0"
 settings:
   base:
-    MARKETING_VERSION: "2.8"
-    CURRENT_PROJECT_VERSION: "28"
+    MARKETING_VERSION: "2.9"
+    CURRENT_PROJECT_VERSION: "29"
     SWIFT_VERSION: "5.0"
     TARGETED_DEVICE_FAMILY: "1"
     CODE_SIGNING_ALLOWED: "NO"
@@ -27,6 +27,8 @@ targets:
     dependencies:
       - target: PortholeBroadcast
         embed: true
+      - target: PortholeShare
+        embed: true
     scheme: {}
   PortholeBroadcast:
     type: app-extension
@@ -38,4 +40,15 @@ targets:
         PRODUCT_NAME: PortholeBroadcast
         PRODUCT_BUNDLE_IDENTIFIER: local.porthole.pull.broadcast
         INFOPLIST_FILE: PortholeBroadcast/Info.plist
+        APPLICATION_EXTENSION_API_ONLY: "YES"
+  PortholeShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - PortholeShare
+    settings:
+      base:
+        PRODUCT_NAME: PortholeShare
+        PRODUCT_BUNDLE_IDENTIFIER: local.porthole.pull.share
+        INFOPLIST_FILE: PortholeShare/Info.plist
         APPLICATION_EXTENSION_API_ONLY: "YES"

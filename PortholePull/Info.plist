@@ -26,6 +26,7 @@
 	<array>
 		<string>_porthole._tcp</string>
 		<string>_porthole-screen._tcp</string>
+		<string>_porthole-share._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Porthole sends the original photo and this iPhone's screen to your PC on this Wi-Fi.</string>

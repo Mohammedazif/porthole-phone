@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.9
+
+Send several photos and videos at once. In Photos, tap Select, pick them, tap Share and choose Porthole. The app sends those files themselves, in their original format, to Porthole on the PC, which carries them all on the next Ctrl+drag out of its window. Nothing is matched, so items scrolled off screen, videos and iCloud items all work. Open the Porthole app on the iPhone once first, so the PC knows this phone. Needs the PC build from the same day.
+
 ## 2.8
 
 The whole-screen comparison keeps every photo's small fitted copy between drags, so after the first drag it is only a comparison and a screen that is not in the library is refused quickly. Works with the same PC build as 2.6.
