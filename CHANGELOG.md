@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.10
+
+Videos are found from their library-grid thumbnails. A thumbnail is a square cut from the middle of the video, and the app used to skip every video of another shape; it now cuts each stored frame the same way. Works with the PC build from the same day, which reads the grid's cells exactly at any zoom.
+
 ## 2.9
 
 Send several photos and videos at once. In Photos, tap Select, pick them, tap Share and choose Porthole. The app sends those files themselves, in their original format, to Porthole on the PC, which carries them all on the next Ctrl+drag out of its window. Nothing is matched, so items scrolled off screen, videos and iCloud items all work. Open the Porthole app on the iPhone once first, so the PC knows this phone. Needs the PC build from the same day.

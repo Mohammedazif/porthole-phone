@@ -373,19 +373,20 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         }
         var coarse: [Coarse] = []
         for (index, entry) in entries.enumerated() {
-            if let aspect = shapeFilter, aspect > 0, entry.aspect > 0, abs(entry.aspect - aspect) / aspect > 0.12 { continue }
-            if fitted && entry.aspect <= 0 { continue }
+            // Cropped to the shape on screen rather than skipped: a library thumbnail is a
+            // square cut from the middle of a tall or wide video.
+            if entry.aspect <= 0 { continue }
             var bestGrad = -2.0
             var scored: [(frame: Int, rank: Double)] = []
             scored.reserveCapacity(entry.frames.count)
             for (frameIndex, frame) in entry.frames.enumerated() {
                 let pixels: [UInt8]
-                if fitted {
-                    pixels = PictureHash.cells(luma: frame, width: side, height: side, placement: placement,
-                                               side: side, shape: entry.aspect, samples: 1)
-                        .map { UInt8(min(255, max(0, $0.rounded()))) }
+                if !fitted, let aspect = shapeFilter, aspect > 0, abs(entry.aspect - aspect) / aspect <= 0.03 {
+                    pixels = frame // already this shape
                 } else {
-                    pixels = frame
+                    pixels = PictureHash.cells(luma: frame, width: side, height: side, placement: placement,
+                                               side: side, shape: entry.aspect, samples: 2)
+                        .map { UInt8(min(255, max(0, $0.rounded()))) }
                 }
                 let s = query.score(pixels)
                 bestGrad = max(bestGrad, s.grad)

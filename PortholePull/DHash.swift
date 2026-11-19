@@ -81,11 +81,34 @@ enum PictureHash {
                       shape: Double? = nil, samples k: Int = 4) -> [Double] {
         switch placement {
         case .crop(let aspect):
-            if shape != nil {
-                return thumb(luma: luma, width: width, crop: Crop(x: 0, y: 0, w: width, h: height), side: side)
+            guard let shape else {
+                return thumb(luma: luma, width: width, crop: crop(width: width, height: height, aspect: aspect),
+                             side: side)
             }
-            return thumb(luma: luma, width: width, crop: crop(width: width, height: height, aspect: aspect),
-                         side: side)
+            // A video frame kept as a square grid of a picture this shape: cut the centre
+            // to the shape on screen, such as a square library thumbnail of a tall video.
+            var out = [Double](repeating: 0, count: side * side)
+            guard width >= 1, height >= 1, luma.count >= width * height, aspect > 0, shape > 0 else { return out }
+            var rw = 1.0, rh = 1.0
+            if shape > aspect { rw = aspect / shape } else { rh = shape / aspect }
+            let rx = (1 - rw) / 2, ry = (1 - rh) / 2
+            let n = Double(side), kk = Double(k), fw = Double(width), fh = Double(height)
+            luma.withUnsafeBufferPointer { p in
+                for r in 0..<side {
+                    for c in 0..<side {
+                        var sum = 0.0
+                        for sy in 0..<k {
+                            let y = ry + rh * (Double(r) + (Double(sy) + 0.5) / kk) / n
+                            for sx in 0..<k {
+                                let x = rx + rw * (Double(c) + (Double(sx) + 0.5) / kk) / n
+                                sum += Double(p[min(height - 1, Int(y * fh)) * width + min(width - 1, Int(x * fw))])
+                            }
+                        }
+                        out[r * side + c] = sum / (kk * kk)
+                    }
+                }
+            }
+            return out
         case .fit(let screen, let background):
             var out = [Double](repeating: background, count: side * side)
             guard width >= 1, height >= 1, luma.count >= width * height, screen > 0 else { return out }
