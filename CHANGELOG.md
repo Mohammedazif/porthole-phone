@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.8
+
+The whole-screen comparison keeps every photo's small fitted copy between drags, so after the first drag it is only a comparison and a screen that is not in the library is refused quickly. Works with the same PC build as 2.6.
+
 ## 2.7
 
 Answers sooner when the screen is not a photo or video from the library, such as the home screen: videos are decoded only when one is already close. Works with the same PC build as 2.6.

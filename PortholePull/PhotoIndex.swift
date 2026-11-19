@@ -34,6 +34,13 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
     private var refreshPending = false
     private var lastRefresh = Date.distantPast
     private var videoGeneration = 0
+    /// Bumped whenever `photos` is replaced, so caches built from it know they are stale.
+    private var photosGeneration = 0
+    /// Every photo fitted to the screen at 16 cells, for the whole-screen quick pass.
+    /// Only the PullClient queue touches these. The screen's shape never changes, so
+    /// after the first drag the pass is just a comparison.
+    private var fitKey = ""
+    private var fitCells: [[UInt8]] = []
 
     deinit {
         if observing { PHPhotoLibrary.shared().unregisterChangeObserver(self) }
@@ -297,18 +304,27 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
     private func matchFitted(_ screen: Screen) -> (asset: PHAsset?, note: String) {
         lock.lock()
         let items = photos
+        let generation = photosGeneration
         lock.unlock()
         let placement = screen.placement
         let quickSide = PictureHash.videoSide
         guard !items.isEmpty, screen.thumb.count == PictureHash.thumbSide * PictureHash.thumbSide,
               let quick = PictureHash.FrameQuery(cells: PictureHash.shrink(screen.thumb, to: quickSide), side: quickSide)
         else { return (nil, "none") }
+        let background = PictureHash.background(screen.thumb, side: PictureHash.thumbSide)
+        let key = String(format: "%d %.3f %d", generation, screen.aspect, Int(background / 24))
+        if key != fitKey || fitCells.count != items.count {
+            fitCells = items.map { photo in
+                PictureHash.cells(luma: photo.luma, width: photo.gridW, height: photo.gridH,
+                                  placement: placement, side: quickSide, samples: 2)
+                    .map { UInt8(min(255, max(0, $0.rounded()))) }
+            }
+            fitKey = key
+        }
         var rough: [(index: Int, rank: Double)] = []
         rough.reserveCapacity(items.count)
-        for (index, photo) in items.enumerated() {
-            let cells = PictureHash.cells(luma: photo.luma, width: photo.gridW, height: photo.gridH,
-                                          placement: placement, side: quickSide, samples: 2)
-            let s = quick.score(cells.map { UInt8(min(255, max(0, $0.rounded()))) })
+        for (index, cells) in fitCells.enumerated() {
+            let s = quick.score(cells)
             rough.append((index, 0.6 * s.grad + 0.4 * s.luma))
         }
         rough.sort { $0.rank > $1.rank }
@@ -595,6 +611,7 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
             self.manager = nil
             self.lock.lock()
             self.photos = finished
+            self.photosGeneration += 1
             self.lock.unlock()
             self.ready = true
             self.status = "Ready, \(finished.count) photos"
