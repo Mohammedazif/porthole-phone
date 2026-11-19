@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.7
+
+Answers sooner when the screen is not a photo or video from the library, such as the home screen: videos are decoded only when one is already close. Works with the same PC build as 2.6.
+
 ## 2.6
 
 A photo or video whose edges cannot be seen is found too, such as a black screenshot on Photos' black page, or a white one in light mode. The PC also sends the whole phone screen, and the app places each library item on it the way Photos shows one item, fitted to the screen, so no edges are needed. Photos' bars and side buttons count less. Needs the PC build from the same day.

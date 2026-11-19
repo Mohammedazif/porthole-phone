@@ -392,6 +392,12 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
             return (asset, note)
         }
 
+        // Decoding takes seconds. When no video is even near, such as on the home screen,
+        // answer now. A video dragged mid-motion scored 0.44 here before it was refined.
+        if top < (fitted ? 0.40 : 0.30) {
+            return (nil, note + " not near")
+        }
+
         // Twenty-four coarse frames can miss the exact moment, above all when the camera
         // moves. Decode real frames around the closest moments of a short list.
         var seen = Set<Int>()
