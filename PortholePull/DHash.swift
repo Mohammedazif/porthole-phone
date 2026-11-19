@@ -52,6 +52,8 @@ enum PictureHash {
             gradients(cells, side: n),
             region(cells, side: n, top: margin, bottom: margin, left: margin, right: margin),
             region(cells, side: n, top: band, bottom: band + n / 16, left: 0, right: 0),
+            // Photos' Live Text and other side buttons sit on the screen's right edge.
+            region(cells, side: n, top: band, bottom: band + n / 16, left: n / 16, right: n / 10),
         ])
     }
 
@@ -62,6 +64,72 @@ enum PictureHash {
             best = max(best, correlation(a.parts[i], b.parts[i]))
         }
         return best
+    }
+
+    /// How a library picture appears in the query.
+    enum Placement {
+        /// The query is the picture itself, cut to this shape (its edges were found).
+        case crop(aspect: Double)
+        /// The query is the whole screen of this shape; the picture is fitted inside
+        /// it on this background, the way Photos shows one item. Needs no edges.
+        case fit(screen: Double, background: Double)
+    }
+
+    /// Cells of a luma picture as it appears under a placement. shape overrides the
+    /// picture's own width / height, for video frames stored as a square grid.
+    static func cells(luma: [UInt8], width: Int, height: Int, placement: Placement, side: Int,
+                      shape: Double? = nil, samples k: Int = 4) -> [Double] {
+        switch placement {
+        case .crop(let aspect):
+            if shape != nil {
+                return thumb(luma: luma, width: width, crop: Crop(x: 0, y: 0, w: width, h: height), side: side)
+            }
+            return thumb(luma: luma, width: width, crop: crop(width: width, height: height, aspect: aspect),
+                         side: side)
+        case .fit(let screen, let background):
+            var out = [Double](repeating: background, count: side * side)
+            guard width >= 1, height >= 1, luma.count >= width * height, screen > 0 else { return out }
+            let a = shape ?? Double(width) / Double(height)
+            var rw = 1.0, rh = 1.0
+            if a > screen { rh = screen / a } else { rw = a / screen }
+            let rx = (1 - rw) / 2, ry = (1 - rh) / 2
+            let n = Double(side), kk = Double(k)
+            let fw = Double(width), fh = Double(height)
+            luma.withUnsafeBufferPointer { p in
+                for r in 0..<side {
+                    for c in 0..<side {
+                        var sum = 0.0
+                        for sy in 0..<k {
+                            let v = (Double(r) + (Double(sy) + 0.5) / kk) / n
+                            let y = (v - ry) / rh
+                            for sx in 0..<k {
+                                let u = (Double(c) + (Double(sx) + 0.5) / kk) / n
+                                let x = (u - rx) / rw
+                                if x >= 0, x < 1, y >= 0, y < 1 {
+                                    sum += Double(p[min(height - 1, Int(y * fh)) * width + min(width - 1, Int(x * fw))])
+                                } else {
+                                    sum += background
+                                }
+                            }
+                        }
+                        out[r * side + c] = sum / (kk * kk)
+                    }
+                }
+            }
+            return out
+        }
+    }
+
+    /// Photos' page colour behind one item: black, or white in light mode. Read from the
+    /// screen's top and bottom rows, which are page and bars more than picture.
+    static func background(_ t: [Double], side n: Int) -> Double {
+        guard t.count == n * n, n >= 8 else { return 0 }
+        var edge: [Double] = []
+        for r in Array(0..<3) + Array((n - 3)..<n) {
+            edge.append(contentsOf: t[(r * n)..<(r * n + n)])
+        }
+        edge.sort()
+        return edge[edge.count / 2]
     }
 
     /// Gradients of the cells left after cutting the given rows and columns away.

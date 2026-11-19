@@ -256,7 +256,7 @@ final class PullClient: ObservableObject {
         }
         guard greeted, line.hasPrefix("PULL ") else { return }
         let parts = line.split(separator: " ")
-        guard (3...5).contains(parts.count), let hash = UInt64(parts[1], radix: 16),
+        guard (3...6).contains(parts.count), let hash = UInt64(parts[1], radix: 16),
               let aspect = Double(parts[2]) else {
             send("MISS\n")
             return
@@ -267,7 +267,17 @@ final class PullClient: ObservableObject {
         }
         let thumb = parts.count >= 4 ? PictureHash.parseThumb(parts[3]) : nil
         // PCs since phone 2.5 add the same picture at 64 cells a side.
-        let detail = parts.count == 5 ? PictureHash.parseCells(parts[4], side: PictureHash.detailSide) : nil
+        let detail = parts.count >= 5 ? PictureHash.parseCells(parts[4], side: PictureHash.detailSide) : nil
+        // From 2.6: S<aspect>:<32-cell hex>:<64-cell hex> of the whole phone screen.
+        var screen: PhotoIndex.Screen?
+        if parts.count == 6, parts[5].hasPrefix("S") {
+            let fields = parts[5].dropFirst().split(separator: ":")
+            if fields.count == 3, let shape = Double(fields[0]), shape > 0,
+               let whole = PictureHash.parseThumb(fields[1]),
+               let wholeDetail = PictureHash.parseCells(fields[2], side: PictureHash.detailSide) {
+                screen = PhotoIndex.Screen(aspect: shape, thumb: whole, detail: wholeDetail)
+            }
+        }
         if let identifier = chosenIdentifier {
             chosenIdentifier = nil
             DispatchQueue.main.async { self.chosenOriginal = "" }
@@ -279,7 +289,7 @@ final class PullClient: ObservableObject {
             return
         }
         DispatchQueue.main.async { self.status = "Finding that photo or video" }
-        let found = index.match(hash: hash, aspect: aspect, thumb: thumb, detail: detail) { [weak self] text in
+        let found = index.match(hash: hash, aspect: aspect, thumb: thumb, detail: detail, screen: screen) { [weak self] text in
             DispatchQueue.main.async { self?.status = text }
         }
         guard index.ready, let asset = found.asset else {

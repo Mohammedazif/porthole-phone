@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.6
+
+A photo or video whose edges cannot be seen is found too, such as a black screenshot on Photos' black page, or a white one in light mode. The PC also sends the whole phone screen, and the app places each library item on it the way Photos shows one item, fitted to the screen, so no edges are needed. Photos' bars and side buttons count less. Needs the PC build from the same day.
+
 ## 2.5
 
 More photos and videos drag across. Needs the PC build from the same day, which also sends the picture at 64 x 64.
