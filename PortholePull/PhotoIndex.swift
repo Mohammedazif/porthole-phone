@@ -122,6 +122,8 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         var score: Double
         /// The item's own pattern, to tell copies of one picture from different pictures.
         var pattern: PictureHash.Pattern
+        /// Where its best cut sat, for a cropped picture.
+        var along = 0.5
     }
 
     /// The picture the PC cut out first, then the whole screen; photos, then videos.
@@ -196,12 +198,17 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
     }
 
     /// Ranked by the index's small copies, then the close ones again on sharper copies.
-    /// This is what separates two shots of a burst, or a photo from its edited twin.
+    /// This is what separates two shots of a burst, or a photo from its edited twin. A
+    /// win that is not near-perfect is confirmed the same way: a wrong file is worse
+    /// than none, and a page of text can look like a list on a phone at 32 cells.
     private func closerLook(_ ranked: [Candidate], items: [IndexedPhoto], at position: [String: Int],
-                            placement: PictureHash.Placement, detail: [Double]?, thumb: [Double]) -> (id: String?, note: String) {
+                            placement: (Candidate) -> PictureHash.Placement, detail: [Double]?,
+                            thumb: [Double]) -> (id: String?, note: String) {
         let first = Self.decide(ranked, min: PictureHash.gradientMin)
-        if first.id != nil { return first }
-        guard let top = ranked.first, top.score >= 0.4 else { return first }
+        guard let top = ranked.first else { return first }
+        let runner = ranked.count > 1 ? ranked[1].score : -1
+        if first.id != nil, top.score >= 0.92, top.score - runner >= 0.10 { return first }
+        guard top.score >= 0.4 else { return first }
         let close = ranked.prefix(8).filter { $0.score >= top.score - 0.15 }
         let side = detail != nil ? PictureHash.detailSide : PictureHash.thumbSide
         let query = PictureHash.pattern(detail ?? thumb, side: side)
@@ -211,21 +218,29 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
             if let asset = PHAsset.fetchAssets(withLocalIdentifiers: [candidate.id], options: nil).firstObject,
                let sampled = Self.render(asset, longSide: 320) {
                 cells = PictureHash.cells(luma: sampled.luma, width: sampled.width, height: sampled.height,
-                                          placement: placement, side: side)
+                                          placement: placement(candidate), side: side)
             } else if let index = position[candidate.id] {
                 let photo = items[index]
                 cells = PictureHash.cells(luma: photo.luma, width: photo.gridW, height: photo.gridH,
-                                          placement: placement, side: side)
+                                          placement: placement(candidate), side: side)
             } else {
                 continue
             }
             let pattern = PictureHash.pattern(cells, side: side)
-            refined.append(Candidate(id: candidate.id, score: PictureHash.similarity(query, pattern), pattern: pattern))
+            refined.append(Candidate(id: candidate.id, score: PictureHash.similarity(query, pattern),
+                                     pattern: pattern, along: candidate.along))
         }
         refined.sort { $0.score > $1.score }
         let minimum = detail != nil ? PictureHash.detailMin : PictureHash.gradientMin
         let closer = Self.decide(refined, min: minimum)
-        return (closer.id, first.note + " detail " + closer.note)
+        let note = first.note + " detail " + closer.note
+        if closer.id != nil { return (closer.id, note) }
+        // The first pick stands only when the sharper look still puts it first, clearly.
+        if let id = first.id, let best = refined.first, best.id == top.id, best.score >= 0.5,
+           best.score - (refined.count > 1 ? refined[1].score : -1) >= 0.05 {
+            return (id, note + " kept")
+        }
+        return (nil, note + (first.id != nil ? " unconfirmed" : ""))
     }
 
     private func matchPhotos(hash: UInt64, aspect: Double, thumb: [Double]?, detail: [Double]?) -> Match {
@@ -237,10 +252,17 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         var bestDistance = 65
         var second = 65
         for (index, photo) in items.enumerated() {
-            let rendered = PictureHash.dhashCrop(luma: photo.luma, width: photo.gridW,
-                                                 height: photo.gridH, aspect: aspect)
-            if rendered == 0 && hash != 0 { continue }
-            let distance = (hash ^ rendered).nonzeroBitCount
+            // The cut may not be centred: the closest of three positions counts.
+            var distance = 65
+            for along in [0.5, 0.2, 0.8] {
+                let rendered = PictureHash.dhashCrop(luma: photo.luma, width: photo.gridW,
+                                                     height: photo.gridH, aspect: aspect, along: along)
+                if rendered == 0 && hash != 0 { continue }
+                distance = min(distance, (hash ^ rendered).nonzeroBitCount)
+                let shape = Double(photo.gridW) / Double(photo.gridH)
+                if abs(shape - aspect) / aspect < 0.02 { break } // same shape: nothing to slide
+            }
+            if distance == 65 { continue }
             distances[index] = distance
             if distance < bestDistance {
                 second = bestDistance
@@ -266,16 +288,24 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         let query = PictureHash.pattern(thumb, side: side)
         var order = items.indices.filter { distances[$0] < 65 }
         order.sort { distances[$0] < distances[$1] }
-        let limit = max(400, order.prefix { distances[$0] <= PictureHash.candidateBits }.count)
+        let limit = max(600, order.prefix { distances[$0] <= PictureHash.candidateBits }.count)
         var ranked: [Candidate] = []
         var position: [String: Int] = [:]
         for index in order.prefix(limit) {
             let photo = items[index]
-            let cells = PictureHash.cells(luma: photo.luma, width: photo.gridW, height: photo.gridH,
-                                          placement: placement, side: side)
-            let pattern = PictureHash.pattern(cells, side: side)
-            ranked.append(Candidate(id: photo.localIdentifier, score: PictureHash.similarity(query, pattern),
-                                    pattern: pattern))
+            let shape = Double(photo.gridW) / Double(photo.gridH)
+            let slides = abs(shape - aspect) / aspect >= 0.02
+            var best: Candidate?
+            for along in slides ? PictureHash.alongs : [0.5] {
+                let cells = PictureHash.cells(luma: photo.luma, width: photo.gridW, height: photo.gridH,
+                                              placement: .crop(aspect: aspect, along: along), side: side)
+                let pattern = PictureHash.pattern(cells, side: side)
+                let score = PictureHash.similarity(query, pattern)
+                if best == nil || score > best!.score {
+                    best = Candidate(id: photo.localIdentifier, score: score, pattern: pattern, along: along)
+                }
+            }
+            if let best { ranked.append(best) }
             position[photo.localIdentifier] = index
         }
         ranked.sort { $0.score > $1.score }
@@ -286,15 +316,11 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
                                           placement: placement, side: side)
         let debug = String(format: " near %dx%d ", near.gridW, near.gridH) + PictureHash.hex(nearCells)
 
-        let verdict = closerLook(ranked, items: items, at: position, placement: placement,
+        let verdict = closerLook(ranked, items: items, at: position,
+                                 placement: { .crop(aspect: aspect, along: $0.along) },
                                  detail: detail, thumb: thumb)
         if let id = verdict.id, let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject {
             return Match(asset: asset, closest: distances[position[id] ?? best], note: verdict.note)
-        }
-        // A picture the gradients cannot place is still sent when its dHash stands well apart.
-        if bestDistance <= PictureHash.matchMax, second >= bestDistance + PictureHash.matchGap,
-           let top = ranked.first, top.id == items[best].localIdentifier, top.score >= 0.5 {
-            return Match(asset: fetch(items[best]), closest: bestDistance, note: verdict.note)
         }
         return Match(asset: nil, closest: bestDistance, note: verdict.note, debug: debug)
     }
@@ -342,7 +368,7 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
             position[photo.localIdentifier] = entry.index
         }
         ranked.sort { $0.score > $1.score }
-        let verdict = closerLook(ranked, items: items, at: position, placement: placement,
+        let verdict = closerLook(ranked, items: items, at: position, placement: { _ in placement },
                                  detail: screen.detail.isEmpty ? nil : screen.detail, thumb: screen.thumb)
         guard let id = verdict.id else { return (nil, verdict.note) }
         return (PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject, verdict.note)

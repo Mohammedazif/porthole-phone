@@ -313,10 +313,13 @@ final class PullClient: ObservableObject {
             }
             return
         }
-        export(asset)
+        // The scores go after the name, for the PC log; older PCs ignore them.
+        let why = (found.note + " " + found.video).components(separatedBy: .newlines).joined(separator: " ")
+        export(asset, note: why.trimmingCharacters(in: .whitespaces))
     }
 
-    private func export(_ asset: PHAsset) {
+    private func export(_ asset: PHAsset, note: String = "") {
+        exportNote = note
         let resources = PHAssetResource.assetResources(for: asset)
         let wanted: [PHAssetResourceType] = asset.mediaType == .video
             ? [.video, .fullSizeVideo] : [.photo, .fullSizePhoto]
@@ -354,6 +357,9 @@ final class PullClient: ObservableObject {
     }
 
     /// FILE line, then the file in 1 MB pieces, each sent after the previous one is taken.
+    /// Scores of the match being sent, appended to its FILE line.
+    private var exportNote = ""
+
     private func stream(_ file: URL, name: String) {
         let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?.int64Value ?? 0
         guard size > 0, let handle = try? FileHandle(forReadingFrom: file), let link = connection else {
@@ -380,7 +386,7 @@ final class PullClient: ObservableObject {
                 next()
             })
         }
-        send("FILE \(size) \(name)\n")
+        send("FILE \(size) \(name)" + (exportNote.isEmpty ? "" : " " + exportNote) + "\n")
         next()
     }
 

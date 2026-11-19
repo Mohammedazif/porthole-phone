@@ -69,7 +69,9 @@ enum PictureHash {
     /// How a library picture appears in the query.
     enum Placement {
         /// The query is the picture itself, cut to this shape (its edges were found).
-        case crop(aspect: Double)
+        /// along: where the cut sits on the free axis, 0 to 1. Photos does not always cut
+        /// a grid thumbnail from the exact centre.
+        case crop(aspect: Double, along: Double = 0.5)
         /// The query is the whole screen of this shape; the picture is fitted inside
         /// it on this background, the way Photos shows one item. Needs no edges.
         case fit(screen: Double, background: Double)
@@ -80,10 +82,10 @@ enum PictureHash {
     static func cells(luma: [UInt8], width: Int, height: Int, placement: Placement, side: Int,
                       shape: Double? = nil, samples k: Int = 4) -> [Double] {
         switch placement {
-        case .crop(let aspect):
+        case .crop(let aspect, let along):
             guard let shape else {
-                return thumb(luma: luma, width: width, crop: crop(width: width, height: height, aspect: aspect),
-                             side: side)
+                return thumb(luma: luma, width: width,
+                             crop: crop(width: width, height: height, aspect: aspect, along: along), side: side)
             }
             // A video frame kept as a square grid of a picture this shape: cut the centre
             // to the shape on screen, such as a square library thumbnail of a tall video.
@@ -91,7 +93,7 @@ enum PictureHash {
             guard width >= 1, height >= 1, luma.count >= width * height, aspect > 0, shape > 0 else { return out }
             var rw = 1.0, rh = 1.0
             if shape > aspect { rw = aspect / shape } else { rh = shape / aspect }
-            let rx = (1 - rw) / 2, ry = (1 - rh) / 2
+            let rx = (1 - rw) * along, ry = (1 - rh) * along
             let n = Double(side), kk = Double(k), fw = Double(width), fh = Double(height)
             luma.withUnsafeBufferPointer { p in
                 for r in 0..<side {
@@ -270,9 +272,9 @@ enum PictureHash {
     /// dHash of the centre of a full photo, cropped to the shape on screen.
     /// A library thumbnail is square; the camera file usually is not. Cropping
     /// both to the same shape is what makes those two pictures comparable.
-    static func dhashCrop(luma: [UInt8], width: Int, height: Int, aspect: Double) -> UInt64 {
+    static func dhashCrop(luma: [UInt8], width: Int, height: Int, aspect: Double, along: Double = 0.5) -> UInt64 {
         if width < 2 || height < 2 || aspect < 0.05 || luma.count < width * height { return 0 }
-        let c = crop(width: width, height: height, aspect: aspect)
+        let c = crop(width: width, height: height, aspect: aspect, along: along)
         return dhash(width: c.w, height: c.h) { x, y in
             luma[(c.y + y) * width + (c.x + x)]
         }
@@ -285,20 +287,25 @@ enum PictureHash {
         var h: Int
     }
 
-    /// The centre of a full photo cut to the shape it has on screen.
-    static func crop(width: Int, height: Int, aspect: Double) -> Crop {
+    /// A full photo cut to the shape it has on screen; along places the cut on the free
+    /// axis, 0.5 being the centre.
+    static func crop(width: Int, height: Int, aspect: Double, along: Double = 0.5) -> Crop {
         var c = Crop(x: 0, y: 0, w: width, h: height)
         if width < 2 || height < 2 || aspect < 0.05 { return c }
         let photo = Double(width) / Double(height)
+        let t = min(1, max(0, along))
         if photo > aspect {
             c.w = min(width, max(2, Int((Double(height) * aspect).rounded())))
-            c.x = (width - c.w) / 2
+            c.x = Int((Double(width - c.w) * t).rounded())
         } else if photo < aspect {
             c.h = min(height, max(2, Int((Double(width) / aspect).rounded())))
-            c.y = (height - c.h) / 2
+            c.y = Int((Double(height - c.h) * t).rounded())
         }
         return c
     }
+
+    /// Cut positions tried when the photo's shape differs from the shape on screen.
+    static let alongs: [Double] = [0.5, 0.35, 0.65, 0.2, 0.8, 0.0, 1.0]
 
     /// Box average into thumbSide x thumbSide cells. Cell bounds are the PC's:
     /// rows [r*h/n, max(that+1, (r+1)*h/n)), and the same for columns.

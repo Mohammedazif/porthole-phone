@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.11
+
+Fewer wrong files. A win that is not near-perfect is confirmed on sharper copies of the closest candidates, and refused when that look disagrees: a page of handwriting had been sent for a ticked screenshot. Photos does not always cut a grid thumbnail from the centre, so several cut positions are tried. The match's scores go to the PC with each file, for its log.
+
 ## 2.10
 
 Videos are found from their library-grid thumbnails. A thumbnail is a square cut from the middle of the video, and the app used to skip every video of another shape; it now cuts each stored frame the same way. Works with the PC build from the same day, which reads the grid's cells exactly at any zoom.
