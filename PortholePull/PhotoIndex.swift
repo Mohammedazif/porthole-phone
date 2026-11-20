@@ -93,7 +93,9 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
                     PHPhotoLibrary.shared().register(self)
                     self.observing = true
                 }
-                self.status = "Updating library"
+                if !self.ready {
+                    self.status = Self.photoCacheExists() ? "Checking for new photos" : "Updating library"
+                }
                 // Off the main thread: walking ~60,000 items there froze the app at launch,
                 // and with it the Start Broadcast sheet that runs inside the app.
                 self.indexQueue.async { self.index() }
@@ -641,23 +643,46 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
 
     private func index() {
         // Videos are indexed by their preview frame, so a video matches near its start.
+        lock.lock()
+        var previous = Dictionary(photos.map { ($0.localIdentifier, $0) }, uniquingKeysWith: { _, new in new })
+        videoGeneration += 1 // stop an older video scan before starting another
+        lock.unlock()
+        if previous.isEmpty {
+            previous = Self.loadPhotoCache()
+        }
         let fetch = PHFetchOptions()
         fetch.predicate = NSPredicate(format: "mediaType == %d || mediaType == %d",
                                       PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue)
         let assets = PHAsset.fetchAssets(with: fetch)
         let total = assets.count
-        lock.lock()
-        let previous = Dictionary(photos.map { ($0.localIdentifier, $0) }, uniquingKeysWith: { _, new in new })
-        videoGeneration += 1 // stop an older video scan before starting another
-        lock.unlock()
+        let checking = !previous.isEmpty
         if total == 0 {
+            if checking { Self.savePhotoCache([]) }
             DispatchQueue.main.async {
+                self.lock.lock()
                 self.photos = []
+                self.photosGeneration += 1
+                self.lock.unlock()
                 self.ready = true
                 self.status = "No photos in the library"
                 self.finishIndex()
             }
             return
+        }
+        if checking {
+            let kept = Array(previous.values)
+            DispatchQueue.main.async {
+                self.lock.lock()
+                guard self.photos.isEmpty else {
+                    self.lock.unlock()
+                    return
+                }
+                self.photos = kept
+                self.photosGeneration += 1
+                self.lock.unlock()
+                self.ready = true
+                self.status = "Ready, \(kept.count) photos"
+            }
         }
         let manager = PHCachingImageManager()
         DispatchQueue.main.async { self.manager = manager }
@@ -667,6 +692,7 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         let collect = NSLock()
         var found: [IndexedPhoto] = []
         var done = 0
+        var sampledNew = 0
         for n in 0..<total {
             let asset = assets.object(at: n)
             guard asset.pixelWidth >= 2, asset.pixelHeight >= 2 else { continue }
@@ -713,29 +739,38 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
                     found.append(IndexedPhoto(luma: sampled.luma, gridW: sampled.width, gridH: sampled.height,
                                               localIdentifier: asset.localIdentifier, modified: modified))
                     done += 1
+                    sampledNew += 1
                     let count = done
                     collect.unlock()
                     if count % 200 == 0 {
                         DispatchQueue.main.async {
-                            self.status = "Indexing photos \(count)"
+                            self.status = checking ? "Indexing new photos \(count)" : "Indexing photos \(count)"
                         }
                     }
                 }
             }
         }
-        group.notify(queue: .main) {
+        group.notify(queue: self.indexQueue) {
             collect.lock()
             let finished = found
+            let sampled = sampledNew
             collect.unlock()
-            self.manager = nil
-            self.lock.lock()
-            self.photos = finished
-            self.photosGeneration += 1
-            self.lock.unlock()
-            self.ready = true
-            self.status = "Ready, \(finished.count) photos"
-            self.indexVideos(photoCount: finished.count)
-            self.finishIndex()
+            let oldIds = Set(previous.keys)
+            let newIds = Set(finished.map { $0.localIdentifier })
+            if sampled > 0 || oldIds != newIds {
+                Self.savePhotoCache(finished)
+            }
+            DispatchQueue.main.async {
+                self.manager = nil
+                self.lock.lock()
+                self.photos = finished
+                self.photosGeneration += 1
+                self.lock.unlock()
+                self.ready = true
+                self.status = "Ready, \(finished.count) photos"
+                self.indexVideos(photoCount: finished.count)
+                self.finishIndex()
+            }
         }
     }
 
@@ -849,6 +884,75 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         }
         if frames.isEmpty { return nil }
         return VideoEntry(localIdentifier: asset.localIdentifier, modified: modified, aspect: aspect, frames: frames)
+    }
+
+    private static var photoCacheURL: URL? {
+        try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                     appropriateFor: nil, create: true)
+            .appendingPathComponent("photo-index-v1.bin")
+    }
+
+    private static func photoCacheExists() -> Bool {
+        guard let url = photoCacheURL else { return false }
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+
+    private static func savePhotoCache(_ photos: [IndexedPhoto]) {
+        guard let url = photoCacheURL else { return }
+        var body = Data()
+        func put<T>(_ value: T) {
+            withUnsafeBytes(of: value) { body.append(contentsOf: $0) }
+        }
+        var count: UInt32 = 0
+        for photo in photos {
+            let id = Array(photo.localIdentifier.utf8)
+            let width = photo.gridW
+            let height = photo.gridH
+            guard id.count <= Int(UInt16.max), width > 0, height > 0, width <= 256, height <= 256,
+                  photo.luma.count == width * height else { continue }
+            put(UInt16(id.count))
+            body.append(contentsOf: id)
+            put(photo.modified)
+            put(UInt16(width))
+            put(UInt16(height))
+            body.append(contentsOf: photo.luma)
+            count += 1
+        }
+        var data = Data("PHI1".utf8)
+        withUnsafeBytes(of: count) { data.append(contentsOf: $0) }
+        data.append(body)
+        try? data.write(to: url, options: .atomic)
+    }
+
+    private static func loadPhotoCache() -> [String: IndexedPhoto] {
+        guard let url = photoCacheURL, let data = try? Data(contentsOf: url), data.count >= 8,
+              Data(data.prefix(4)) == Data("PHI1".utf8) else { return [:] }
+        let bytes = [UInt8](data)
+        var at = 4
+        func take(_ count: Int) -> [UInt8]? {
+            guard count >= 0, at + count <= bytes.count else { return nil }
+            defer { at += count }
+            return Array(bytes[at..<(at + count)])
+        }
+        func number<T>(_: T.Type) -> T? {
+            guard let raw = take(MemoryLayout<T>.size) else { return nil }
+            return raw.withUnsafeBytes { $0.load(as: T.self) }
+        }
+        var out: [String: IndexedPhoto] = [:]
+        guard let count = number(UInt32.self) else { return [:] }
+        for _ in 0..<count {
+            guard let idLength = number(UInt16.self), let idBytes = take(Int(idLength)),
+                  let id = String(bytes: idBytes, encoding: .utf8),
+                  let modified = number(Double.self),
+                  let gridW = number(UInt16.self), let gridH = number(UInt16.self) else { return [:] }
+            let width = Int(gridW)
+            let height = Int(gridH)
+            guard width > 0, height > 0, width <= 256, height <= 256,
+                  let luma = take(width * height) else { return [:] }
+            out[id] = IndexedPhoto(luma: luma, gridW: width, gridH: height,
+                                   localIdentifier: id, modified: modified)
+        }
+        return out
     }
 
     private static var videoCacheURL: URL? {

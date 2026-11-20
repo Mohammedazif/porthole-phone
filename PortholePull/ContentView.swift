@@ -1,3 +1,4 @@
+import AVFoundation
 import Photos
 import PhotosUI
 import ReplayKit
@@ -62,6 +63,7 @@ struct ContentView: View {
     @State private var explainingSend = false
     @State private var scanning = false
     @State private var shareFile: ShareFile?
+    @State private var received: ReceivedFile?
     @State private var activityFilter = 0
 
     private var version: String {
@@ -96,6 +98,7 @@ struct ContentView: View {
             client.prepare()
             index.requestAccessAndIndex()
             updateCapture()
+            openPendingNotice()
         }
         // The system broadcast button lives here, outside the screens that come and go:
         // pressing it after its screen was swapped out showed no Start Broadcast sheet.
@@ -113,6 +116,7 @@ struct ContentView: View {
                 client.cameForward()
                 index.refreshIfNeeded()
                 updateCapture()
+                presentArrival()
             }
             if phase == .background { client.enteredBackground() }
         }
@@ -134,11 +138,34 @@ struct ContentView: View {
         .sheet(item: $shareFile) { item in
             ActivitySheet(url: item.url)
         }
+        .sheet(item: $received) { item in
+            ReceivedFileSheet(item: item, client: client)
+        }
+        .onChange(of: client.arrival?.id) { _, _ in
+            presentArrival()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .portholeOpenReceived)) { _ in
+            openPendingNotice()
+        }
         .safeAreaInset(edge: .top) {
             if let arrival = client.arrival {
                 arrivalBanner(arrival)
             }
         }
+    }
+
+    private func openPendingNotice() {
+        guard let name = NoticeDelegate.pendingName else { return }
+        NoticeDelegate.pendingName = nil
+        guard let url = client.fileURL(named: name) else { return }
+        received = ReceivedFile(url: url, name: name)
+    }
+
+    /// Opens the file that just arrived, then drops the banner so it cannot stay up.
+    private func presentArrival() {
+        guard scenePhase == .active, let arrival = client.arrival, let file = arrival.file else { return }
+        received = ReceivedFile(url: file, name: arrival.name)
+        client.clearArrival()
     }
 
     private var findPC: some View {
@@ -369,7 +396,16 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
                 ForEach(filteredHistory) { item in
-                    ActivityRow(item: item)
+                    if let path = item.path, let url = client.fileURL(named: path) {
+                        Button {
+                            received = ReceivedFile(url: url, name: item.title)
+                        } label: {
+                            ActivityRow(item: item, canOpen: true)
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        ActivityRow(item: item, canOpen: false)
+                    }
                 }
             } header: {
                 HStack {
@@ -417,9 +453,9 @@ struct ContentView: View {
             Section("Sharing") {
                 LabeledContent("Clipboard sync", value: client.clipStatus.isEmpty ? "On while connected" : "On")
                 LabeledContent("Photos", value: index.accessLabel)
-                LabeledContent("Files to the PC", value: "Downloads")
-                LabeledContent("Files from the PC", value: "Files › Porthole")
-                Text("Pictures and videos from the PC go to Photos.")
+                LabeledContent("Files to the PC", value: "PC folder")
+                LabeledContent("Files from the PC", value: "In this app")
+                Text("The PC saves files in Downloads unless you choose another folder in its Settings. Files from the PC stay here so you can save or share them.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -510,32 +546,48 @@ struct ContentView: View {
 
     private func arrivalBanner(_ arrival: PullClient.Arrival) -> some View {
         HStack(spacing: 12) {
-            Image(systemName: arrival.openPhotos ? "photo" : "doc.fill")
-                .font(.title3)
-                .frame(width: 40, height: 40)
-                .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            VStack(alignment: .leading, spacing: 2) {
-                Text("\(arrival.name) received")
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-                Text(arrival.openPhotos ? "Saved to Photos" : "Saved to Files › Porthole")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+            Button {
+                presentArrival()
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "doc.fill")
+                        .font(.title3)
+                        .frame(width: 40, height: 40)
+                        .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(arrival.name) received")
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(1)
+                        Text("Tap to save or share")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
+            .buttonStyle(.plain)
             Spacer(minLength: 8)
-            Button("Open") { openArrival(arrival) }
-                .font(.subheadline.weight(.semibold))
-            Button { client.clearArrival() } label: {
-                Image(systemName: "xmark").font(.footnote.weight(.bold))
+            Button {
+                client.clearArrival()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.footnote.weight(.bold))
+                    .frame(width: 32, height: 32)
             }
+            .buttonStyle(.plain)
             .foregroundStyle(.secondary)
             .accessibilityLabel("Close")
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .glassPanel(RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .padding(.vertical, 6)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
         .padding(.horizontal, 12)
         .transition(.move(edge: .top).combined(with: .opacity))
+        .task(id: arrival.id) {
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            if scenePhase == .active, client.arrival?.id == arrival.id {
+                client.clearArrival()
+            }
+        }
     }
 
     private func applyScan(_ text: String) {
@@ -554,22 +606,12 @@ struct ContentView: View {
         client.connect()
     }
 
-    private func openArrival(_ arrival: PullClient.Arrival) {
-        if arrival.openPhotos, let url = URL(string: "photos-redirect://") {
-            UIApplication.shared.open(url)
-            return
-        }
-        if let file = arrival.file {
-            shareFile = ShareFile(url: file)
-        }
-    }
-
     private var sendFilesHelp: some View {
         NavigationStack {
             VStack(alignment: .leading, spacing: 16) {
                 Text("Share from any app")
                     .font(.title2.bold())
-                Text("In Files, Photos, Voice Memos, or Mail, select the items and tap Share, then Porthole. The PC keeps the original file, name and all, in Downloads.")
+                Text("In Files, Photos, Voice Memos, or Mail, select the items and tap Share, then Porthole. The PC keeps the original file. It goes to Downloads unless you choose another folder in the PC app's Settings.")
                     .foregroundStyle(.secondary)
                 Text("To send one photo the PC could not match, use Activity › Pick from library, then drag that card out of the PC window.")
                     .foregroundStyle(.secondary)
@@ -615,6 +657,112 @@ struct ContentView: View {
 private struct ShareFile: Identifiable {
     let id = UUID()
     let url: URL
+}
+
+private struct ReceivedFile: Identifiable {
+    let id = UUID()
+    let url: URL
+    let name: String
+}
+
+private struct ReceivedFileSheet: View {
+    let item: ReceivedFile
+    let client: PullClient
+    @Environment(\.dismiss) private var dismiss
+    @State private var preview: UIImage?
+    @State private var note = "Kept in this app. Save it or share it."
+    @State private var share: ShareFile?
+    @State private var exporting = false
+
+    private var media: Bool { PullClient.isPhotoOrVideo(item.name) }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 16) {
+                Group {
+                    if let preview {
+                        Image(uiImage: preview)
+                            .resizable()
+                            .scaledToFit()
+                    } else {
+                        Image(systemName: media ? "film" : "doc.fill")
+                            .font(.system(size: 48))
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, minHeight: 120)
+                    }
+                }
+                .frame(maxHeight: 280)
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                Text(item.name)
+                    .font(.headline)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                Text(note)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                if media {
+                    GlassCapsuleButton(title: "Save to Photos", systemImage: "photo", prominent: true) {
+                        client.saveToPhotos(item.url) { ok in
+                            note = ok ? "Saved to Photos" : "Allow Photos for Porthole, then try Save again."
+                        }
+                    }
+                } else {
+                    GlassCapsuleButton(title: "Save to Files", systemImage: "folder", prominent: true) {
+                        exporting = true
+                    }
+                }
+                GlassCapsuleButton(title: "Share", systemImage: "square.and.arrow.up") {
+                    share = ShareFile(url: item.url)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(20)
+            .navigationTitle("Received")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .sheet(item: $share) { file in
+            ActivitySheet(url: file.url)
+        }
+        .sheet(isPresented: $exporting) {
+            ExportPicker(url: item.url)
+        }
+        .onAppear(perform: loadPreview)
+    }
+
+    private func loadPreview() {
+        let ext = (item.name as NSString).pathExtension.lowercased()
+        if ["jpg", "jpeg", "png", "heic", "heif", "gif", "tif", "tiff", "webp"].contains(ext) {
+            preview = UIImage(contentsOfFile: item.url.path)
+            return
+        }
+        guard ["mov", "mp4", "m4v"].contains(ext) else { return }
+        let asset = AVAsset(url: item.url)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        let time = CMTime(seconds: 0.2, preferredTimescale: 600)
+        generator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, image, _, _, _ in
+            guard let image else { return }
+            let picture = UIImage(cgImage: image)
+            DispatchQueue.main.async { self.preview = picture }
+        }
+    }
+}
+
+private struct ExportPicker: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        UIDocumentPickerViewController(forExporting: [url], asCopy: true)
+    }
+
+    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
 }
 
 private struct ActivitySheet: UIViewControllerRepresentable {
@@ -686,6 +834,7 @@ struct OriginalPicker: UIViewControllerRepresentable {
 /// One line of Activity: which way it went, what, and when.
 private struct ActivityRow: View {
     let item: PullClient.ActivityItem
+    var canOpen = false
 
     var body: some View {
         HStack(spacing: 12) {
@@ -704,10 +853,16 @@ private struct ActivityRow: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 8)
+            if canOpen {
+                Image(systemName: "chevron.right")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
             Text(item.date, style: .time)
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
+        .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
     }
 }

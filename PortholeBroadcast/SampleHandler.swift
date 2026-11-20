@@ -26,10 +26,14 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var lastFrame = CMTime.invalid
     private var stopped = false
 
-    /// About 30 frames a second. A frame is skipped, not queued, while this many are
+    /// About 24 frames a second. A frame is skipped, not queued, while this many are
     /// still unanswered, so a slow moment on Wi-Fi drops frames instead of adding lag.
-    private let minInterval = 1.0 / 31.0
+    private let minInterval = 1.0 / 24.0
     private let maxUnacked = 2
+    /// The PC draws this at 1080 on the long side, so a larger encode only heats the phone.
+    private let longEdge = 1080
+    private let frameRate = 24
+    private let bitrate = 3_500_000
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
         queue.async { self.browse() }
@@ -148,9 +152,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
         let width = CVPixelBufferGetWidth(image)
         let height = CVPixelBufferGetHeight(image)
-        // 1440 on the long side: at 1080 the picture was enlarged, and soft, in a phone-
-        // sized window on a 150% or 200% Windows display.
-        let fitted = Self.fit(width: width, height: height, longEdge: 1440)
+        let fitted = Self.fit(width: width, height: height, longEdge: longEdge)
         let source = fitted.w == width && fitted.h == height ? image : scale(image, to: fitted)
         let encW = CVPixelBufferGetWidth(source)
         let encH = CVPixelBufferGetHeight(source)
@@ -187,7 +189,6 @@ final class SampleHandler: RPBroadcastSampleHandler {
                                                 outputCallback: nil, refcon: nil,
                                                 compressionSessionOut: &created)
         guard status == noErr, let made = created else { return }
-        let bitrate = 6_000_000
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: NSNumber(value: 0))
@@ -198,12 +199,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_AverageBitRate,
                              value: NSNumber(value: bitrate))
         // One frame of bitrate budget. A one-second window is what holds the picture back.
-        let bytesPerFrame = bitrate / 8 / 30
+        let bytesPerFrame = bitrate / 8 / frameRate
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_DataRateLimits,
-                             value: [NSNumber(value: bytesPerFrame), NSNumber(value: 1.0 / 30.0)] as CFArray)
-        VTSessionSetProperty(made, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: 30))
+                             value: [NSNumber(value: bytesPerFrame), NSNumber(value: 1.0 / Double(frameRate))] as CFArray)
+        VTSessionSetProperty(made, key: kVTCompressionPropertyKey_ExpectedFrameRate,
+                             value: NSNumber(value: frameRate))
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
-                             value: NSNumber(value: 1))
+                             value: NSNumber(value: 2))
         VTCompressionSessionPrepareToEncodeFrames(made)
         session = made
         sessionWidth = width

@@ -3,7 +3,7 @@ import UIKit
 import UniformTypeIdentifiers
 
 /// Share > Porthole from any app: Photos, Files, Voice Memos, Mail. Sends the chosen
-/// files themselves to Porthole on the PC, which saves them in Downloads. Nothing is
+/// files themselves to Porthole on the PC, which saves them in the folder set there. Nothing is
 /// matched: these are exactly the items picked.
 final class ShareViewController: UIViewController {
     private let status = UILabel()
@@ -13,8 +13,11 @@ final class ShareViewController: UIViewController {
     private let sizeLabel = UILabel()
     private let pcName = UILabel()
     private let change = UIButton(type: .system)
+    private var sheet: UIStackView?
     private var marks: [UIImageView] = []
     private var readyToSend = false
+    /// Folder name advertised by the PC. Nil until that record arrives.
+    private var savePlace: String?
 
     /// Everything below is touched only on this queue.
     private let queue = DispatchQueue(label: "porthole.share")
@@ -30,8 +33,8 @@ final class ShareViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = .systemGroupedBackground
-        preferredContentSize = CGSize(width: 420, height: 560)
+        view.backgroundColor = .systemBackground
+        preferredContentSize = CGSize(width: 420, height: 320)
 
         let title = UILabel()
         title.text = "Send to PC"
@@ -67,23 +70,13 @@ final class ShareViewController: UIViewController {
         pcColumn.alignment = .center
         pcColumn.spacing = 12
 
-        let destTitle = UILabel()
-        destTitle.text = "Save on PC to"
-        destTitle.font = .systemFont(ofSize: 15)
-        destTitle.textColor = .secondaryLabel
-        let dest = UILabel()
-        dest.text = "Downloads"
-        dest.font = .systemFont(ofSize: 15, weight: .semibold)
-        let destRow = UIStackView(arrangedSubviews: [destTitle, dest])
-        destRow.axis = .horizontal
-        destRow.distribution = .equalSpacing
-
         fileStack.axis = .vertical
         fileStack.spacing = 0
         let filesCard = UIView()
         filesCard.backgroundColor = .secondarySystemGroupedBackground
         filesCard.layer.cornerRadius = 16
         filesCard.layer.cornerCurve = .continuous
+        filesCard.setContentHuggingPriority(.required, for: .vertical)
         fileStack.translatesAutoresizingMaskIntoConstraints = false
         filesCard.addSubview(fileStack)
 
@@ -98,17 +91,18 @@ final class ShareViewController: UIViewController {
         let header = UIStackView(arrangedSubviews: [title, closeButton])
         header.axis = .horizontal
         header.alignment = .center
-        let body = UIStackView(arrangedSubviews: [header, pcColumn, destRow, filesCard, sizeLabel, bar, button])
+        let body = UIStackView(arrangedSubviews: [header, pcColumn, filesCard, sizeLabel, bar, button])
         body.axis = .vertical
-        body.spacing = 16
+        body.spacing = 14
         body.translatesAutoresizingMaskIntoConstraints = false
+        body.setContentHuggingPriority(.required, for: .vertical)
+        sheet = body
         view.addSubview(body)
         sizeLabel.font = .systemFont(ofSize: 13)
         sizeLabel.textColor = .secondaryLabel
-        let bottom = body.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16)
-        bottom.priority = .defaultHigh
+        let bottom = body.bottomAnchor.constraint(lessThanOrEqualTo: view.bottomAnchor, constant: -16)
         NSLayoutConstraint.activate([
-            body.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16),
+            body.topAnchor.constraint(equalTo: view.topAnchor, constant: 18),
             body.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
             body.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
             bottom,
@@ -120,25 +114,41 @@ final class ShareViewController: UIViewController {
         ])
     }
 
-    /// Prominent Liquid Glass on iOS 26; an ink capsule before it.
+    /// Ink capsule. Glass was drawing a blank pill, so the title is set in both colors.
     private static func sendStyle(title: String) -> UIButton.Configuration {
-        #if compiler(>=6.2)
-        if #available(iOS 26.0, *) {
-            var config = UIButton.Configuration.prominentGlass()
-            config.title = title
-            config.baseBackgroundColor = .label
-            config.baseForegroundColor = .systemBackground
-            config.buttonSize = .large
-            return config
-        }
-        #endif
         var config = UIButton.Configuration.filled()
         config.title = title
-        config.baseBackgroundColor = .label
-        config.baseForegroundColor = .systemBackground
+        config.baseBackgroundColor = UIColor { $0.userInterfaceStyle == .dark ? .white : UIColor(white: 0.08, alpha: 1) }
+        config.baseForegroundColor = UIColor { $0.userInterfaceStyle == .dark ? .black : .white }
         config.cornerStyle = .capsule
         config.buttonSize = .large
+        config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { incoming in
+            var out = incoming
+            out.font = .systemFont(ofSize: 17, weight: .semibold)
+            out.foregroundColor = UIColor { $0.userInterfaceStyle == .dark ? .black : .white }
+            return out
+        }
         return config
+    }
+
+    private func placeLine() -> String {
+        if let savePlace, !savePlace.isEmpty {
+            return "Saves in \(savePlace)"
+        }
+        return "Saves in the folder set on this PC"
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        guard let sheet else { return }
+        let fitted = sheet.systemLayoutSizeFitting(
+            CGSize(width: max(view.bounds.width - 40, 280), height: 0),
+            withHorizontalFittingPriority: .required,
+            verticalFittingPriority: .fittingSizeLevel).height
+        let height = fitted + 36
+        if abs(preferredContentSize.height - height) > 2 {
+            preferredContentSize = CGSize(width: 420, height: min(max(height, 260), 560))
+        }
     }
 
     @objc private func sendTapped() {
@@ -164,22 +174,32 @@ final class ShareViewController: UIViewController {
         let found = NWBrowser(for: .bonjour(type: "_porthole-share._tcp", domain: nil), using: .tcp)
         found.browseResultsChangedHandler = { [weak self] results, _ in
             guard let self, !self.stopped else { return }
-            let pcs = results.compactMap { result -> (String, NWEndpoint)? in
-                if case let .service(name, _, _, _) = result.endpoint { return (name, result.endpoint) }
-                return nil
+            let pcs = results.compactMap { result -> (String, NWEndpoint, String?)? in
+                guard case let .service(name, _, _, _) = result.endpoint else { return nil }
+                var folder: String?
+                if case let .bonjour(txt) = result.metadata {
+                    folder = txt["dir"]
+                }
+                return (name, result.endpoint, folder)
             }.sorted { $0.0 < $1.0 }
             if self.chosen == nil || !pcs.contains(where: { $0.1 == self.chosen }) {
                 self.chosen = pcs.first?.1
             }
-            let current = pcs.first(where: { $0.1 == self.chosen })?.0
+            let current = pcs.first(where: { $0.1 == self.chosen })
             DispatchQueue.main.async {
-                self.pcName.text = current ?? "Looking for your PC"
+                self.pcName.text = current?.0 ?? "Looking for your PC"
+                self.savePlace = current?.2
+                if self.readyToSend { self.status.text = self.placeLine() }
                 self.change.isHidden = pcs.count < 2
                 self.change.menu = UIMenu(children: pcs.map { pc in
-                    UIAction(title: pc.0, state: pc.0 == current ? .on : .off) { [weak self] _ in
+                    UIAction(title: pc.0, state: pc.0 == current?.0 ? .on : .off) { [weak self] _ in
                         self?.queue.async {
                             self?.chosen = pc.1
-                            DispatchQueue.main.async { self?.pcName.text = pc.0 }
+                            DispatchQueue.main.async {
+                                self?.pcName.text = pc.0
+                                self?.savePlace = pc.2
+                                if self?.readyToSend == true { self?.status.text = self?.placeLine() }
+                            }
                         }
                     }
                 })
@@ -214,10 +234,17 @@ final class ShareViewController: UIViewController {
             self.fileStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
             self.marks = []
             for (index, row) in rows.enumerated() {
+                let icon = UIImageView(image: UIImage(systemName: "doc.fill"))
+                icon.tintColor = .secondaryLabel
+                icon.contentMode = .scaleAspectFit
+                icon.setContentHuggingPriority(.required, for: .horizontal)
+                icon.widthAnchor.constraint(equalToConstant: 22).isActive = true
+                icon.heightAnchor.constraint(equalToConstant: 22).isActive = true
                 let name = UILabel()
                 name.text = row.0
                 name.font = .systemFont(ofSize: 15, weight: .medium)
                 name.lineBreakMode = .byTruncatingMiddle
+                name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
                 let bytes = UILabel()
                 bytes.text = ByteCountFormatter.string(fromByteCount: row.1, countStyle: .file)
                 bytes.font = .systemFont(ofSize: 13)
@@ -228,7 +255,7 @@ final class ShareViewController: UIViewController {
                 mark.alpha = 0
                 mark.setContentHuggingPriority(.required, for: .horizontal)
                 self.marks.append(mark)
-                let line = UIStackView(arrangedSubviews: [name, bytes, mark])
+                let line = UIStackView(arrangedSubviews: [icon, name, bytes, mark])
                 line.axis = .horizontal
                 line.spacing = 8
                 line.alignment = .center
@@ -248,9 +275,10 @@ final class ShareViewController: UIViewController {
                 }
             }
             let count = rows.count
-            self.sizeLabel.text = ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
-            self.status.text = "Saves in Downloads on the PC"
-            self.setButton(count == 1 ? "Send 1 file" : "Send \(count) files")
+            self.sizeLabel.text = count == 1 ? nil : ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
+            self.sizeLabel.isHidden = count < 2
+            self.status.text = self.placeLine()
+            self.setButton(count == 1 ? "Send" : "Send \(count) files")
             self.readyToSend = true
             self.button.isEnabled = true
         }

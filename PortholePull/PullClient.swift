@@ -3,6 +3,51 @@ import Foundation
 import Network
 import Photos
 import UIKit
+import UserNotifications
+
+extension Notification.Name {
+    static let portholeOpenReceived = Notification.Name("porthole.openReceived")
+}
+
+enum PhoneNotice {
+    static func arm() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = NoticeDelegate.shared
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    static func fileArrived(_ name: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "File from your PC"
+        content.body = name
+        content.sound = .default
+        content.userInfo = ["file": name]
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+}
+
+final class NoticeDelegate: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = NoticeDelegate()
+    static var pendingName: String?
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .list, .sound])
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        let name = response.notification.request.content.userInfo["file"] as? String ?? ""
+        DispatchQueue.main.async {
+            Self.pendingName = name
+            NotificationCenter.default.post(name: .portholeOpenReceived, object: name)
+        }
+        completionHandler()
+    }
+}
 
 struct NearbyPC: Identifiable, Equatable {
     let name: String
@@ -19,8 +64,8 @@ final class PullClient: ObservableObject {
     @Published private(set) var chosenOriginal = ""
     @Published private(set) var clipStatus = ""
     struct Arrival: Equatable {
+        var id = UUID()
         var name: String
-        var openPhotos: Bool
         var file: URL?
     }
     @Published var arrival: Arrival?
@@ -33,6 +78,8 @@ final class PullClient: ObservableObject {
         var detail: String
         var isFile: Bool
         var incoming: Bool
+        /// File name inside Files › Porthole, when this row can be opened again.
+        var path: String? = nil
     }
     @Published private(set) var history: [ActivityItem] = []
     private static let historyKey = "porthole.activity"
@@ -126,9 +173,9 @@ final class PullClient: ObservableObject {
     }
 
     /// Callable from any queue; the list lives on the main thread.
-    private func note(_ title: String, _ detail: String, file: Bool, incoming: Bool) {
+    private func note(_ title: String, _ detail: String, file: Bool, incoming: Bool, path: String? = nil) {
         DispatchQueue.main.async {
-            self.history.insert(ActivityItem(title: title, detail: detail, isFile: file, incoming: incoming), at: 0)
+            self.history.insert(ActivityItem(title: title, detail: detail, isFile: file, incoming: incoming, path: path), at: 0)
             if self.history.count > PullClient.historyLimit {
                 self.history.removeLast(self.history.count - PullClient.historyLimit)
             }
@@ -145,6 +192,7 @@ final class PullClient: ObservableObject {
 
     /// Bonjour is what makes iOS show Local Network. A plain TCP connect often does not.
     func prepare() {
+        PhoneNotice.arm()
         loadSaved()
         loadHistory()
         guard browser == nil else { return }
@@ -496,6 +544,13 @@ final class PullClient: ObservableObject {
             flushClip()
             return
         }
+        if line == "CLIP?" {
+            guard greeted else { return }
+            DispatchQueue.main.async { [weak self] in
+                self?.answerClipAsk(tries: 6)
+            }
+            return
+        }
         guard greeted, line.hasPrefix("PULL ") else { return }
         if choicePending {
             choicePending = false
@@ -715,14 +770,7 @@ final class PullClient: ObservableObject {
             return
         }
         send("SAVED\n")
-        switch Self.mediaKind(name) {
-        case .photo:
-            addToPhotos(saved, video: false, name: name)
-        case .video:
-            addToPhotos(saved, video: true, name: name)
-        case .file:
-            announce(name: name, photos: false, file: saved)
-        }
+        announce(saved)
     }
 
     private func abortPush() {
@@ -781,37 +829,47 @@ final class PullClient: ObservableObject {
         }
     }
 
-    private func addToPhotos(_ file: URL, video: Bool, name: String) {
-        DispatchQueue.main.async { self.status = "Saving \(name) to Photos" }
-        PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
-            guard let self else { return }
+    /// Copies a received photo or video into Photos and leaves the file in the app.
+    func saveToPhotos(_ url: URL, done: @escaping (Bool) -> Void) {
+        let video = Self.mediaKind(url.lastPathComponent) == .video
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
             guard status == .authorized || status == .limited else {
-                self.announce(name: name, photos: false, file: file)
+                DispatchQueue.main.async { done(false) }
                 return
             }
             PHPhotoLibrary.shared().performChanges({
                 if video {
-                    PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: file)
+                    PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
                 } else {
-                    PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: file)
+                    PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: url)
                 }
             }) { ok, _ in
-                if ok {
-                    try? FileManager.default.removeItem(at: file)
-                    self.announce(name: name, photos: true, file: nil)
-                } else {
-                    self.announce(name: name, photos: false, file: file)
-                }
+                DispatchQueue.main.async { done(ok) }
             }
         }
     }
 
-    private func announce(name: String, photos: Bool, file: URL?) {
-        note(name, photos ? "From the PC · saved in Photos" : "From the PC · in Files › Porthole",
-             file: true, incoming: true)
+    /// A file kept under Files › Porthole, by the name stored on an activity row.
+    func fileURL(named name: String) -> URL? {
+        guard !name.isEmpty, !name.contains("/"), !name.contains("\\"),
+              let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let url = docs.appendingPathComponent("Porthole", isDirectory: true).appendingPathComponent(name)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    static func isPhotoOrVideo(_ name: String) -> Bool {
+        mediaKind(name) != .file
+    }
+
+    private func announce(_ file: URL) {
+        let name = file.lastPathComponent
+        note(name, "From the PC", file: true, incoming: true, path: name)
         DispatchQueue.main.async {
-            self.arrival = Arrival(name: name, openPhotos: photos, file: file)
-            self.status = photos ? "\(name) is in Photos" : "\(name) is in Files › Porthole"
+            self.arrival = Arrival(name: name, file: file)
+            self.status = "\(name) received"
+            PhoneNotice.fileArrived(name)
         }
     }
 
@@ -857,7 +915,18 @@ final class PullClient: ObservableObject {
         return (kind, n)
     }
 
-    private func considerLocal(force: Bool) {
+    private func answerClipAsk(tries: Int) {
+        if UIPasteboard.general.changeCount != seenCount {
+            considerLocal(force: true, announceEmpty: false)
+            return
+        }
+        if tries <= 0 { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.answerClipAsk(tries: tries - 1)
+        }
+    }
+
+    private func considerLocal(force: Bool, announceEmpty: Bool = true) {
         if writingRemote { return }
         let board = UIPasteboard.general
         if !force && board.changeCount == seenCount { return }
@@ -898,7 +967,7 @@ final class PullClient: ObservableObject {
             return
         }
         seenCount = board.changeCount
-        if force {
+        if force && announceEmpty {
             clipStatus = "Nothing to send. Settings → Apps → Porthole → Paste from Other Apps → Allow, then copy again."
         }
     }
