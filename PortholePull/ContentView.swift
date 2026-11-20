@@ -67,7 +67,7 @@ struct ContentView: View {
                         findPC
                     }
                 }
-                .background(Color(white: 0.953))
+                .background(Color(.systemGroupedBackground))
             }
             .tabItem { Label("Porthole", systemImage: "circle.circle") }
 
@@ -145,7 +145,7 @@ struct ContentView: View {
                                 }
                                 .padding(16)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(.background, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                             }
                             .buttonStyle(.plain)
                         }
@@ -163,7 +163,7 @@ struct ContentView: View {
                         }
                         .padding(16)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(.background, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                     }
                     .buttonStyle(.plain)
                 }
@@ -206,7 +206,7 @@ struct ContentView: View {
                     statusRow("Photos", index.status, false)
                     statusRow("Clipboard", client.clipStatus.isEmpty ? "On while this app is open" : client.clipStatus, true)
                 }
-                .background(.background, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                 HStack(spacing: 12) {
                     GlassCapsuleButton(title: "Send files", systemImage: "doc") { explainingSend = true }
                     GlassCapsuleButton(title: "Send clipboard", systemImage: "doc.on.clipboard") {
@@ -282,7 +282,7 @@ struct ContentView: View {
                 statusRow("Sound", "On the PC", false)
                 statusRow("Controls", "Use the PC window", true)
             }
-            .background(.background, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
             Spacer()
             GlassCapsuleButton(title: "Stop sharing", systemImage: "stop.fill", prominent: true, tint: .red) {
                 broadcast.press()

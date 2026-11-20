@@ -1,4 +1,12 @@
 import SwiftUI
+import UIKit
+
+/// Ink for the main action: near-black in light mode, white in dark mode, so the button
+/// never sinks into the background. onInk is the text on it.
+enum Ink {
+    static let fill = Color(UIColor { $0.userInterfaceStyle == .dark ? .white : UIColor(white: 0.07, alpha: 1) })
+    static let onFill = Color(UIColor { $0.userInterfaceStyle == .dark ? .black : .white })
+}
 
 // Liquid Glass on iOS 26, built with Xcode 26 or later. Older systems and older Xcode
 // builds get the frosted look Porthole had before, so the app still runs from iOS 17.
@@ -16,9 +24,9 @@ struct GlassCapsuleButton: View {
         #if compiler(>=6.2)
         if #available(iOS 26.0, *) {
             if prominent {
-                Button(action: action) { label }
+                Button(action: action) { label.foregroundStyle(tint == nil ? Ink.onFill : Color.white) }
                     .buttonStyle(.glassProminent)
-                    .tint(tint ?? Color(white: 0.07))
+                    .tint(tint ?? Ink.fill)
                     .controlSize(.large)
             } else {
                 Button(action: action) { label }
@@ -49,10 +57,10 @@ struct GlassCapsuleButton: View {
             label
                 .padding(.vertical, 8)
                 .padding(.horizontal, expands ? 0 : 16)
-                .foregroundStyle(prominent ? Color.white : (tint ?? Color.primary))
+                .foregroundStyle(prominent ? (tint == nil ? Ink.onFill : Color.white) : (tint ?? Color.primary))
                 .background {
                     if prominent {
-                        Capsule().fill((tint ?? Color(white: 0.07)).opacity(0.92))
+                        Capsule().fill((tint ?? Ink.fill).opacity(0.92))
                     } else {
                         Capsule().fill(.ultraThinMaterial)
                     }
@@ -122,13 +130,14 @@ struct GlassPanel<S: Shape>: ViewModifier {
     }
 }
 
-/// The Share screen lens: dark glass that reacts to the touch on iOS 26.
+/// The Share screen lens: dark glass on iOS 26.
 struct LensGlass: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
         #if compiler(>=6.2)
         if #available(iOS 26.0, *) {
-            content.glassEffect(.regular.tint(.black.opacity(0.6)).interactive(), in: Circle())
+            // Not .interactive(): an interactive glass layer takes the tap the button needs.
+            content.glassEffect(.regular.tint(.black.opacity(0.6)), in: Circle())
         } else {
             content
         }

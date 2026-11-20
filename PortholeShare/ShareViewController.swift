@@ -333,6 +333,14 @@ final class ShareViewController: UIViewController {
         if (base as NSString).pathExtension.lowercased() == ext.lowercased() {
             base = (base as NSString).deletingPathExtension
         }
+        // Photos hands over a temporary copy named with a UUID: name it by kind and time instead.
+        if UUID(uuidString: base) != nil {
+            let stamp = DateFormatter()
+            stamp.locale = Locale(identifier: "en_US_POSIX")
+            stamp.dateFormat = "yyyyMMdd-HHmmss"
+            let kind = type.conforms(to: .movie) ? "Video" : type.conforms(to: .image) ? "Photo" : "File"
+            base = "\(kind)-\(stamp.string(from: Date()))" + (index > 0 ? "-\(index + 1)" : "")
+        }
         let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
         func clean(_ text: String) -> String { String(text.map { allowed.contains($0) ? $0 : "_" }) }
         let cleanExt = String(clean(ext).prefix(8))
