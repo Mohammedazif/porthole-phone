@@ -148,7 +148,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
         let width = CVPixelBufferGetWidth(image)
         let height = CVPixelBufferGetHeight(image)
-        let fitted = Self.fit(width: width, height: height, longEdge: 1080)
+        // 1440 on the long side: at 1080 the picture was enlarged, and soft, in a phone-
+        // sized window on a 150% or 200% Windows display.
+        let fitted = Self.fit(width: width, height: height, longEdge: 1440)
         let source = fitted.w == width && fitted.h == height ? image : scale(image, to: fitted)
         let encW = CVPixelBufferGetWidth(source)
         let encH = CVPixelBufferGetHeight(source)
@@ -185,7 +187,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
                                                 outputCallback: nil, refcon: nil,
                                                 compressionSessionOut: &created)
         guard status == noErr, let made = created else { return }
-        let bitrate = 4_000_000
+        let bitrate = 6_000_000
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: NSNumber(value: 0))
