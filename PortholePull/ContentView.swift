@@ -266,7 +266,7 @@ struct ContentView: View {
         } label: {
             ZStack {
                 Circle()
-                    .fill(.black.opacity(0.82))
+                    .fill(Ink.lens)
                     .frame(width: 168, height: 168)
                     .overlay {
                         Circle().strokeBorder(.white.opacity(0.45), lineWidth: 1)

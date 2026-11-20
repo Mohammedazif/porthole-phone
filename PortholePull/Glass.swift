@@ -6,6 +6,15 @@ import UIKit
 enum Ink {
     static let fill = Color(UIColor { $0.userInterfaceStyle == .dark ? .white : UIColor(white: 0.07, alpha: 1) })
     static let onFill = Color(UIColor { $0.userInterfaceStyle == .dark ? .black : .white })
+    /// The Share screen lens: ink in light mode, a raised grey in dark mode so it still
+    /// stands off the black page. Its white mark reads on both.
+    static let lens = Color(UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 0.18, alpha: 1)
+                                                                      : UIColor(white: 0.07, alpha: 1) })
+    /// Edge of a frosted button: bright on light pages, faint on dark ones.
+    static let rim = Color(UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 1, alpha: 0.16)
+                                                                     : UIColor(white: 1, alpha: 0.7) })
+    static let shadow = Color(UIColor { $0.userInterfaceStyle == .dark ? UIColor(white: 0, alpha: 0.4)
+                                                                        : UIColor(white: 0, alpha: 0.08) })
 }
 
 // Liquid Glass on iOS 26, built with Xcode 26 or later. Older systems and older Xcode
@@ -65,8 +74,8 @@ struct GlassCapsuleButton: View {
                         Capsule().fill(.ultraThinMaterial)
                     }
                 }
-                .overlay { Capsule().strokeBorder(.white.opacity(prominent ? 0.25 : 0.7), lineWidth: 1) }
-                .shadow(color: .black.opacity(0.08), radius: 10, y: 4)
+                .overlay { Capsule().strokeBorder(prominent ? Color.white.opacity(0.25) : Ink.rim, lineWidth: 1) }
+                .shadow(color: Ink.shadow, radius: 10, y: 4)
         }
         .buttonStyle(.plain)
     }
@@ -105,7 +114,7 @@ struct GlassIconButton: View {
             symbol
                 .frame(width: 44, height: 44)
                 .background(.ultraThinMaterial, in: Circle())
-                .overlay { Circle().strokeBorder(.white.opacity(0.7), lineWidth: 1) }
+                .overlay { Circle().strokeBorder(Ink.rim, lineWidth: 1) }
         }
         .buttonStyle(.plain)
         .accessibilityLabel(label)
