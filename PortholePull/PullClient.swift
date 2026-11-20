@@ -8,6 +8,7 @@ final class PullClient: ObservableObject {
     @Published var status = "Opening"
     @Published var address = ""
     @Published var code = ""
+    @Published private(set) var linked = false
     @Published private(set) var chosenOriginal = ""
     @Published private(set) var clipStatus = ""
     private let queue = DispatchQueue(label: "porthole.pull")
@@ -125,6 +126,22 @@ final class PullClient: ObservableObject {
         stay.stop()
     }
 
+    /// Drops the saved PC so another address and code can be entered.
+    func forgetPC() {
+        reconnectWork?.cancel()
+        connection?.cancel()
+        connection = nil
+        greeted = false
+        syncReady = false
+        linked = false
+        address = ""
+        code = ""
+        clipStatus = ""
+        UserDefaults.standard.removeObject(forKey: "porthole.host")
+        UserDefaults.standard.removeObject(forKey: "porthole.code")
+        status = "Enter the address and code shown on the PC."
+    }
+
     func connect() {
         guard let fields = normalized() else {
             show("Enter the address and code from F1 help")
@@ -217,6 +234,7 @@ final class PullClient: ObservableObject {
             }
         case .failed(let error):
             greeted = false
+            linked = false
             show("Not connected. \(explain(error))")
             scheduleReconnect()
         case .cancelled:
@@ -267,6 +285,7 @@ final class PullClient: ObservableObject {
                 let hadHello = self.greeted
                 self.greeted = false
                 DispatchQueue.main.async {
+                    self.linked = false
                     self.show(hadHello ? "Disconnected. Reconnecting." : "The PC closed the connection. Check the code in F1 help.")
                     self.scheduleReconnect()
                 }
@@ -308,7 +327,10 @@ final class PullClient: ObservableObject {
     private func handle(_ line: String) {
         if line == "OK" {
             greeted = true
-            DispatchQueue.main.async { self.status = "Connected. You can open Photos." }
+            DispatchQueue.main.async {
+                self.linked = true
+                self.status = "Connected. You can open Photos."
+            }
             return
         }
         if line == "SYNC" {

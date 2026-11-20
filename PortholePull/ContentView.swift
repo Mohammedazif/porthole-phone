@@ -42,91 +42,39 @@ struct ContentView: View {
     @StateObject private var client = PullClient()
     @StateObject private var broadcast = BroadcastTrigger()
     @State private var choosingOriginal = false
+    @State private var enteringPC = false
+    @State private var sharing = false
+    @State private var shareStarted = Date()
+    @State private var explainingSend = false
+    @State private var activityFilter = 0
+
+    private var version: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+    }
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section("Screen") {
-                    Button("Share screen") {
-                        client.pauseKeepAlive()
-                        DispatchQueue.main.async { broadcast.press() }
-                    }
-                    .background {
-                        BroadcastPicker(trigger: broadcast)
-                            .frame(width: 44, height: 44)
-                            .opacity(0.02)
-                            .allowsHitTesting(false)
-                    }
-                    Text("Sends what this iPhone shows to Porthole over Wi-Fi, Photos bars and pop-ups included. Screen Mirroring can stay off. Keep this app connected below.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-                Section("This PC") {
-                    TextField("Address from F1 help", text: $client.address)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.numbersAndPunctuation)
-                    TextField("Code from F1 help", text: $client.code)
-                        .textInputAutocapitalization(.characters)
-                        .autocorrectionDisabled()
-                    Text("You can paste the whole F1 line into the address. Port 47731.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-                Section("Library") {
-                    Text(index.status)
-                    Button(index.ready ? "Refresh library" : "Load photos") {
-                        index.requestAccessAndIndex(refresh: true)
-                    }
-                }
-                Section("Original file") {
-                    Button("Choose original") { choosingOriginal = true }
-                    if client.chosenOriginal.isEmpty {
-                        Text("If a photo or video will not drag, choose it here. Then drag the original-file card out of the Porthole window on your PC. It sends exactly the original you chose, including from iCloud.")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
+        TabView {
+            NavigationStack {
+                Group {
+                    if sharing && client.linked {
+                        sharingScreen
+                    } else if client.linked {
+                        connected
                     } else {
-                        VStack(spacing: 12) {
-                            Image(systemName: "doc")
-                                .font(.largeTitle)
-                            Text(client.chosenOriginal)
-                                .font(.headline)
-                            Text("On your PC, hold and drag this card onto the desktop or a folder.")
-                                .font(.footnote)
-                        }
-                        .multilineTextAlignment(.center)
-                        .padding()
-                        .frame(maxWidth: .infinity, minHeight: 160)
-                        .foregroundStyle(Color.black)
-                        .background(Color.white)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                        Button("Cancel selection", role: .cancel) { client.clearChosenOriginal() }
+                        findPC
                     }
                 }
-                Section("Link") {
-                    Text(client.status)
-                    Button("Connect") {
-                        client.bind(index: index)
-                        client.connect()
-                    }
-                }
-                Section("Clipboard") {
-                    Text("Copy on the PC, then paste here with Ctrl+V. Copy on this iPhone and it lands on the PC. Set Settings → Apps → Porthole → Paste from Other Apps to Allow.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                    Button("Send clipboard to PC") { client.sendClipboardNow() }
-                    if !client.clipStatus.isEmpty {
-                        Text(client.clipStatus)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                Section {
-                    Text("Open this once, wait until it says Ready and Connected, then open the photo. Drag that picture off the Porthole window. The original file follows the cursor.")
-                }
+                .background(Color(white: 0.953))
             }
-            .navigationTitle("Porthole")
+            .tabItem { Label("Porthole", systemImage: "circle.circle") }
+
+            NavigationStack { activity }
+                .tabItem { Label("Activity", systemImage: "clock") }
+
+            NavigationStack { settings }
+                .tabItem { Label("Settings", systemImage: "gearshape") }
         }
+        .tint(.primary)
         .onAppear {
             client.bind(index: index)
             client.prepare()
@@ -145,6 +93,336 @@ struct ContentView: View {
                 if let identifier { client.chooseOriginal(identifier) }
             }
         }
+        .sheet(isPresented: $enteringPC) { manualEntry }
+        .sheet(isPresented: $explainingSend) { sendFilesHelp }
+    }
+
+    private var findPC: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Find your PC")
+                        .font(.largeTitle.bold())
+                    Text("Porthole on this Wi-Fi. Enter the address and code shown on the PC, or tap a PC you have used.")
+                        .foregroundStyle(.secondary)
+                }
+                if !client.address.isEmpty {
+                    Button { client.connect() } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Porthole").font(.headline)
+                                Text(client.address).font(.subheadline).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Text("Connect").font(.subheadline.weight(.semibold))
+                        }
+                        .padding(16)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.background, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                }
+                Text(client.status)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                glassButton("Enter address and code", prominent: false) { enteringPC = true }
+                Text("Don't see your PC? Open Porthole on it and keep both on the same Wi-Fi. Porthole needs Local Network access, in Settings › Porthole.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(20)
+        }
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private var connected: some View {
+        ScrollView {
+            VStack(spacing: 22) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Connected").font(.subheadline).foregroundStyle(.secondary)
+                        Text("Porthole").font(.title2.bold())
+                        Text(client.address).font(.footnote).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    glassButton("Switch", prominent: false, expands: false) { enteringPC = true }
+                }
+                shareLens
+                Text("Tap, then Start Broadcast. Everything on screen, including sound, appears on the PC.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                VStack(spacing: 0) {
+                    statusRow("Mouse and keyboard", client.status, false)
+                    statusRow("Photos", index.status, false)
+                    statusRow("Clipboard", client.clipStatus.isEmpty ? "On while this app is open" : client.clipStatus, true)
+                }
+                .background(.background, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                HStack(spacing: 12) {
+                    glassButton("Send files", prominent: false) { explainingSend = true }
+                    glassButton("Send clipboard", prominent: false) { client.sendClipboardNow() }
+                }
+            }
+            .padding(20)
+        }
+    }
+
+    private var shareLens: some View {
+        Button {
+            client.pauseKeepAlive()
+            shareStarted = Date()
+            sharing = true
+            DispatchQueue.main.async { broadcast.press() }
+        } label: {
+            ZStack {
+                Circle()
+                    .fill(.black.opacity(0.82))
+                    .frame(width: 168, height: 168)
+                    .overlay {
+                        Circle().strokeBorder(.white.opacity(0.45), lineWidth: 1)
+                    }
+                    .shadow(color: .black.opacity(0.18), radius: 24, y: 10)
+                VStack(spacing: 6) {
+                    portholeMark
+                    Text("Share screen")
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .background {
+            BroadcastPicker(trigger: broadcast)
+                .frame(width: 44, height: 44)
+                .opacity(0.02)
+                .allowsHitTesting(false)
+        }
+    }
+
+    private var portholeMark: some View {
+        ZStack {
+            Circle().stroke(.white.opacity(0.9), lineWidth: 2).frame(width: 36, height: 36)
+            Capsule().fill(.white.opacity(0.85)).frame(width: 16, height: 3).offset(y: -4)
+            Capsule().fill(.white.opacity(0.55)).frame(width: 12, height: 3)
+            Capsule().fill(.white.opacity(0.35)).frame(width: 8, height: 3).offset(y: 4)
+        }
+    }
+
+    private var sharingScreen: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Button { sharing = false } label: {
+                Image(systemName: "chevron.left")
+                    .font(.body.weight(.semibold))
+                    .frame(width: 36, height: 36)
+                    .background(.ultraThinMaterial, in: Circle())
+            }
+            .buttonStyle(.plain)
+            Text("LIVE")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.red)
+            Text("Sharing to")
+                .foregroundStyle(.secondary)
+            Text("Porthole")
+                .font(.largeTitle.bold())
+            TimelineView(.periodic(from: shareStarted, by: 30)) { context in
+                let minutes = Int(context.date.timeIntervalSince(shareStarted) / 60)
+                Text("\(minutes) \(minutes == 1 ? "minute" : "minutes") shared")
+                    .font(.title3.weight(.semibold))
+            }
+            Text("You can leave this app. Everything on screen, including notifications, shows on the PC until you stop.")
+                .foregroundStyle(.secondary)
+            VStack(spacing: 0) {
+                statusRow("Picture", "Live", false)
+                statusRow("Sound", "On the PC", false)
+                statusRow("Controls", "Use the PC window", true)
+            }
+            .background(.background, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            Spacer()
+            Button {
+                broadcast.press()
+                sharing = false
+            } label: {
+                Text("Stop sharing")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 14)
+                    .background(.red.opacity(0.16), in: Capsule())
+                    .overlay { Capsule().strokeBorder(.red.opacity(0.35), lineWidth: 1) }
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.red)
+        }
+        .padding(20)
+    }
+
+    private var activity: some View {
+        List {
+            Picker("Show", selection: $activityFilter) {
+                Text("All").tag(0)
+                Text("Files").tag(1)
+                Text("Clipboard").tag(2)
+            }
+            .pickerStyle(.segmented)
+            .listRowBackground(Color.clear)
+            if activityFilter != 2 {
+                Section {
+                    Button("Pick from library") { choosingOriginal = true }
+                    if client.chosenOriginal.isEmpty {
+                        Text("If a dragged photo is not the only match, pick it here. Then drag that card out of the Porthole window. It sends the original you chose.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text(client.chosenOriginal)
+                        Text("On the PC, hold and drag this choice onto the desktop or a folder.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                        Button("Cancel selection", role: .cancel) { client.clearChosenOriginal() }
+                    }
+                } header: {
+                    Text("Original file")
+                }
+            }
+            if activityFilter != 1 {
+                Section("Clipboard") {
+                    Text(client.clipStatus.isEmpty ? "Nothing copied yet." : client.clipStatus)
+                    Button("Send clipboard") { client.sendClipboardNow() }
+                }
+            }
+            Section("Library") {
+                Text(index.status)
+            }
+        }
+        .navigationTitle("Activity")
+    }
+
+    private var settings: some View {
+        List {
+            Section("Control from the PC") {
+                check("AssistiveTouch on", "Accessibility › Touch › AssistiveTouch. Shows the pointer.")
+                check("Dwell Control off", "In AssistiveTouch. Otherwise the pointer taps by itself.")
+                check("Pair Porthole", "Settings › Bluetooth › Other Devices.")
+                Button("Open iPhone Settings") {
+                    guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                    UIApplication.shared.open(url)
+                }
+            }
+            Section("Sharing") {
+                LabeledContent("Clipboard sync", value: client.clipStatus.isEmpty ? "On while connected" : "On")
+                LabeledContent("Photos", value: index.ready ? "Full" : "Not loaded")
+                Text("Files shared from this iPhone save to Downloads on the PC.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            Section {
+                Button("Forget this PC", role: .destructive) {
+                    sharing = false
+                    client.forgetPC()
+                }
+            } footer: {
+                Text("Version \(version)")
+            }
+        }
+        .navigationTitle("Settings")
+    }
+
+    private var manualEntry: some View {
+        NavigationStack {
+            Form {
+                TextField("Address from the PC", text: $client.address)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.numbersAndPunctuation)
+                TextField("Code from the PC", text: $client.code)
+                    .textInputAutocapitalization(.characters)
+                    .autocorrectionDisabled()
+                Text("You can paste the whole line from the PC into the address. Port 47731.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            .navigationTitle("This PC")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { enteringPC = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Connect") {
+                        client.connect()
+                        enteringPC = false
+                    }
+                }
+            }
+        }
+        .presentationDetents([.medium])
+    }
+
+    private var sendFilesHelp: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Share from any app")
+                    .font(.title2.bold())
+                Text("In Files, Photos, Voice Memos, or Mail, select the items and tap Share, then Porthole. The PC keeps the original file, name and all, in Downloads.")
+                    .foregroundStyle(.secondary)
+                Text("To send one photo the PC could not match, use Activity › Pick from library, then drag that card out of the PC window.")
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(20)
+            .navigationTitle("Send files")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { explainingSend = false }
+                }
+            }
+        }
+        .presentationDetents([.medium])
+    }
+
+    private func statusRow(_ name: String, _ state: String, _ last: Bool) -> some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(name)
+                Spacer()
+                Text(state)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.trailing)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            if !last { Divider().padding(.leading, 16) }
+        }
+    }
+
+    private func check(_ name: String, _ help: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(name)
+            Text(help).font(.footnote).foregroundStyle(.secondary)
+        }
+    }
+
+    private func glassButton(_ title: String, prominent: Bool, expands: Bool = true, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.headline)
+                .frame(maxWidth: expands ? .infinity : nil)
+                .padding(.horizontal, expands ? 0 : 16)
+                .padding(.vertical, 12)
+                .background {
+                    if prominent {
+                        Capsule().fill(.black.opacity(0.88))
+                    } else {
+                        Capsule().fill(.ultraThinMaterial)
+                    }
+                }
+                .overlay {
+                    Capsule().strokeBorder(.white.opacity(prominent ? 0.28 : 0.7), lineWidth: 1)
+                }
+                .foregroundStyle(prominent ? .white : .primary)
+                .shadow(color: .black.opacity(0.06), radius: 8, y: 3)
+        }
+        .buttonStyle(.plain)
     }
 }
 

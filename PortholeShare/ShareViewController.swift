@@ -6,10 +6,12 @@ import UniformTypeIdentifiers
 /// Porthole on the PC, which saves them in Downloads. Nothing is matched: these are
 /// exactly the items picked.
 final class ShareViewController: UIViewController {
-    private let titleLabel = UILabel()
     private let status = UILabel()
-    private let bar = UIProgressView(progressViewStyle: .default)
-    private let button = UIButton(type: .system)
+    private let bar = UIProgressView(progressViewStyle: .bar)
+    private let button = UIButton(type: .custom)
+    private let fileStack = UIStackView()
+    private let sizeLabel = UILabel()
+    private var readyToSend = false
 
     /// Everything below is touched only on this queue.
     private let queue = DispatchQueue(label: "porthole.share")
@@ -23,26 +25,152 @@ final class ShareViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = .systemBackground
-        titleLabel.text = "Send to Porthole"
-        titleLabel.font = .preferredFont(forTextStyle: .headline)
-        titleLabel.textAlignment = .center
+        view.backgroundColor = .systemGroupedBackground
+        preferredContentSize = CGSize(width: 420, height: 560)
+
+        let title = UILabel()
+        title.text = "Send to PC"
+        title.font = .systemFont(ofSize: 22, weight: .bold)
+        let close = UIButton(type: .close)
+        close.addTarget(self, action: #selector(close), for: .touchUpInside)
+
+        let pc = UILabel()
+        pc.text = "Porthole"
+        pc.font = .systemFont(ofSize: 17, weight: .semibold)
+        status.font = .systemFont(ofSize: 14)
+        status.textColor = .secondaryLabel
+        status.numberOfLines = 2
         status.text = "Getting the originals ready"
-        status.numberOfLines = 0
-        status.textAlignment = .center
-        status.font = .preferredFont(forTextStyle: .body)
-        button.setTitle("Cancel", for: .normal)
-        button.addTarget(self, action: #selector(close), for: .touchUpInside)
-        let stack = UIStackView(arrangedSubviews: [titleLabel, status, bar, button])
-        stack.axis = .vertical
-        stack.spacing = 18
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(stack)
+        let pcColumn = UIStackView(arrangedSubviews: [pc, status])
+        pcColumn.axis = .vertical
+        pcColumn.spacing = 2
+
+        let destTitle = UILabel()
+        destTitle.text = "Save on PC to"
+        destTitle.font = .systemFont(ofSize: 15)
+        destTitle.textColor = .secondaryLabel
+        let dest = UILabel()
+        dest.text = "Downloads"
+        dest.font = .systemFont(ofSize: 15, weight: .semibold)
+        let destRow = UIStackView(arrangedSubviews: [destTitle, dest])
+        destRow.axis = .horizontal
+        destRow.distribution = .equalSpacing
+
+        fileStack.axis = .vertical
+        fileStack.spacing = 0
+        let filesCard = UIView()
+        filesCard.backgroundColor = .secondarySystemGroupedBackground
+        filesCard.layer.cornerRadius = 16
+        filesCard.layer.cornerCurve = .continuous
+        fileStack.translatesAutoresizingMaskIntoConstraints = false
+        filesCard.addSubview(fileStack)
+
+        bar.progressTintColor = .label
+        bar.trackTintColor = .tertiarySystemFill
+        bar.isHidden = true
+
+        var config = UIButton.Configuration.filled()
+        config.title = "Send"
+        config.baseBackgroundColor = .label
+        config.baseForegroundColor = .systemBackground
+        config.cornerStyle = .capsule
+        config.buttonSize = .large
+        button.configuration = config
+        button.isEnabled = false
+        button.addTarget(self, action: #selector(sendTapped), for: .touchUpInside)
+
+        let header = UIStackView(arrangedSubviews: [title, close])
+        header.axis = .horizontal
+        header.alignment = .center
+        let body = UIStackView(arrangedSubviews: [header, pcColumn, destRow, filesCard, sizeLabel, bar, button])
+        body.axis = .vertical
+        body.spacing = 16
+        body.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(body)
+        sizeLabel.font = .systemFont(ofSize: 13)
+        sizeLabel.textColor = .secondaryLabel
+        let bottom = body.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16)
+        bottom.priority = .defaultHigh
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: view.layoutMarginsGuide.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: view.layoutMarginsGuide.trailingAnchor),
-            stack.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            body.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16),
+            body.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
+            body.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            bottom,
+            fileStack.topAnchor.constraint(equalTo: filesCard.topAnchor, constant: 4),
+            fileStack.leadingAnchor.constraint(equalTo: filesCard.leadingAnchor, constant: 12),
+            fileStack.trailingAnchor.constraint(equalTo: filesCard.trailingAnchor, constant: -12),
+            fileStack.bottomAnchor.constraint(equalTo: filesCard.bottomAnchor, constant: -4),
+            button.heightAnchor.constraint(equalToConstant: 52),
         ])
+    }
+
+    @objc private func sendTapped() {
+        if !readyToSend {
+            close()
+            return
+        }
+        readyToSend = false
+        button.isEnabled = false
+        queue.async { self.browse() }
+    }
+
+    private func setButton(_ title: String) {
+        DispatchQueue.main.async {
+            guard var config = self.button.configuration else { return }
+            config.title = title
+            self.button.configuration = config
+            self.button.isEnabled = true
+        }
+    }
+
+    /// Lists every file and waits for Send. Nothing goes to the PC until that tap.
+    private func presentFile() {
+        let rows = files.map { file -> (String, Int64) in
+            let size = (try? FileManager.default.attributesOfItem(atPath: file.url.path)[.size] as? NSNumber)?.int64Value ?? 0
+            return (file.name, size)
+        }
+        let total = rows.reduce(Int64(0)) { $0 + $1.1 }
+        DispatchQueue.main.async {
+            self.fileStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+            for (index, row) in rows.enumerated() {
+                let name = UILabel()
+                name.text = row.0
+                name.font = .systemFont(ofSize: 15, weight: .medium)
+                name.lineBreakMode = .byTruncatingMiddle
+                let bytes = UILabel()
+                bytes.text = ByteCountFormatter.string(fromByteCount: row.1, countStyle: .file)
+                bytes.font = .systemFont(ofSize: 13)
+                bytes.textColor = .secondaryLabel
+                bytes.setContentHuggingPriority(.required, for: .horizontal)
+                let line = UIStackView(arrangedSubviews: [name, bytes])
+                line.axis = .horizontal
+                line.spacing = 8
+                line.layoutMargins = UIEdgeInsets(top: 10, left: 0, bottom: 10, right: 0)
+                line.isLayoutMarginsRelativeArrangement = true
+                if index < rows.count - 1 {
+                    let wrap = UIStackView(arrangedSubviews: [line])
+                    wrap.axis = .vertical
+                    let rule = UIView()
+                    rule.backgroundColor = .separator
+                    rule.translatesAutoresizingMaskIntoConstraints = false
+                    rule.heightAnchor.constraint(equalToConstant: 1.0 / UIScreen.main.scale).isActive = true
+                    wrap.addArrangedSubview(rule)
+                    self.fileStack.addArrangedSubview(wrap)
+                } else {
+                    self.fileStack.addArrangedSubview(line)
+                }
+            }
+            let count = rows.count
+            self.sizeLabel.text = ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
+            self.status.text = "Connected · Downloads"
+            self.setButton(count == 1 ? "Send 1 file" : "Send \(count) files")
+            self.readyToSend = true
+            self.button.isEnabled = true
+        }
+    }
+
+    private func pulse(_ on: Bool) {
+        _ = on
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -65,7 +193,10 @@ final class ShareViewController: UIViewController {
     private func say(_ text: String, progress: Float? = nil) {
         DispatchQueue.main.async {
             self.status.text = text
-            if let progress { self.bar.setProgress(progress, animated: true) }
+            if let progress {
+                self.bar.isHidden = false
+                self.bar.setProgress(progress, animated: true)
+            }
         }
     }
 
@@ -74,7 +205,9 @@ final class ShareViewController: UIViewController {
         guard !stopped else { return }
         stop()
         say(text)
-        DispatchQueue.main.async { self.button.setTitle("Close", for: .normal) }
+        pulse(false)
+        DispatchQueue.main.async { self.readyToSend = false }
+        setButton("Close")
     }
 
     private func stop() {
@@ -146,8 +279,7 @@ final class ShareViewController: UIViewController {
                 self.fail("These items could not be read.")
                 return
             }
-            self.say("Looking for Porthole on the PC")
-            self.browse()
+            self.presentFile()
         }
     }
 
@@ -183,6 +315,7 @@ final class ShareViewController: UIViewController {
             guard let self else { return }
             switch state {
             case .ready:
+                self.pulse(true)
                 link.send(content: Data("PSHR 1 \(self.files.count)\n".utf8), completion: .contentProcessed { _ in })
                 self.sendFile(0)
             case .failed:
@@ -208,14 +341,15 @@ final class ShareViewController: UIViewController {
             fail("Could not read \(file.name).")
             return
         }
-        say("Sending \(index + 1) of \(files.count)", progress: Float(index) / Float(files.count))
+        let count = Float(max(files.count, 1))
+        say("Sending \(index + 1) of \(files.count)", progress: Float(index) / count)
         link.send(content: Data("FILE \(size) \(file.name)\n".utf8), completion: .contentProcessed { _ in })
-        pump(handle, left: size, index: index)
+        pump(handle, left: size, total: size, index: index)
     }
 
     /// One megabyte at a time, each after the last has gone, so a long video never sits
     /// in this extension's small memory.
-    private func pump(_ handle: FileHandle, left: Int64, index: Int) {
+    private func pump(_ handle: FileHandle, left: Int64, total: Int64, index: Int) {
         guard let link = connection, !stopped else {
             try? handle.close()
             return
@@ -234,6 +368,9 @@ final class ShareViewController: UIViewController {
             }
             return
         }
+        let count = Float(max(files.count, 1))
+        let sentInFile = Float(total - left) / Float(max(total, 1))
+        say("Sending \(index + 1) of \(files.count)", progress: min(0.98, (Float(index) + sentInFile) / count))
         let chunk = autoreleasepool { handle.readData(ofLength: Int(min(left, 1 << 20))) }
         if chunk.isEmpty {
             try? handle.close()
@@ -247,7 +384,7 @@ final class ShareViewController: UIViewController {
                 self.fail("Lost the connection to the PC while sending.")
                 return
             }
-            self.pump(handle, left: left - Int64(chunk.count), index: index)
+            self.pump(handle, left: left - Int64(chunk.count), total: total, index: index)
         })
     }
 
@@ -275,9 +412,14 @@ final class ShareViewController: UIViewController {
     private func sent() {
         let count = files.count
         stop()
-        say("Sent \(count) item\(count == 1 ? "" : "s") to the PC's Downloads.",
-            progress: 1)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+        DispatchQueue.main.async {
+            self.status.text = count == 1 ? "Sent to Porthole" : "Sent \(count) files to Porthole"
+            self.bar.isHidden = false
+            self.bar.setProgress(1, animated: true)
+            self.readyToSend = false
+            self.setButton("Sent")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.15) {
             self.extensionContext?.completeRequest(returningItems: nil, completionHandler: nil)
         }
     }
