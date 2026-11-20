@@ -43,6 +43,9 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
     /// after the first drag the pass is just a comparison.
     private var fitKey = ""
     private var fitCells: [[UInt8]] = []
+    private let indexQueue = DispatchQueue(label: "porthole.index", qos: .utility)
+    /// Thumbnails arrive on the main thread; they are shrunk to cells here instead.
+    private let sampleQueue = DispatchQueue(label: "porthole.sample", qos: .utility, attributes: .concurrent)
 
     deinit {
         if observing { PHPhotoLibrary.shared().unregisterChangeObserver(self) }
@@ -91,7 +94,9 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
                     self.observing = true
                 }
                 self.status = "Updating library"
-                self.index()
+                // Off the main thread: walking ~60,000 items there froze the app at launch,
+                // and with it the Start Broadcast sheet that runs inside the app.
+                self.indexQueue.async { self.index() }
             }
         }
     }
@@ -655,8 +660,10 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
             return
         }
         let manager = PHCachingImageManager()
-        self.manager = manager
+        DispatchQueue.main.async { self.manager = manager }
         let group = DispatchGroup()
+        // A bounded number of thumbnails in flight, instead of every one at once.
+        let inFlight = DispatchSemaphore(value: 32)
         let collect = NSLock()
         var found: [IndexedPhoto] = []
         var done = 0
@@ -670,6 +677,7 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
                 collect.unlock()
                 continue
             }
+            inFlight.wait()
             group.enter()
             let options = PHImageRequestOptions()
             options.deliveryMode = .highQualityFormat
@@ -693,19 +701,24 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
                 }
                 finished = true
                 once.unlock()
-                defer { group.leave() }
                 let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
-                guard !cancelled, let image else { return }
-                guard let sampled = Self.sample(image) else { return }
-                collect.lock()
-                found.append(IndexedPhoto(luma: sampled.luma, gridW: sampled.width, gridH: sampled.height,
-                                          localIdentifier: asset.localIdentifier, modified: modified))
-                done += 1
-                let count = done
-                collect.unlock()
-                if count % 40 == 0 {
-                    DispatchQueue.main.async {
-                        self.status = "Indexing photos \(count)"
+                self.sampleQueue.async {
+                    defer {
+                        inFlight.signal()
+                        group.leave()
+                    }
+                    guard !cancelled, let image else { return }
+                    guard let sampled = Self.sample(image) else { return }
+                    collect.lock()
+                    found.append(IndexedPhoto(luma: sampled.luma, gridW: sampled.width, gridH: sampled.height,
+                                              localIdentifier: asset.localIdentifier, modified: modified))
+                    done += 1
+                    let count = done
+                    collect.unlock()
+                    if count % 200 == 0 {
+                        DispatchQueue.main.async {
+                            self.status = "Indexing photos \(count)"
+                        }
                     }
                 }
             }

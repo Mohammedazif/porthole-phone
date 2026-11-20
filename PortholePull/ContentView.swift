@@ -31,7 +31,9 @@ struct BroadcastPicker: UIViewRepresentable {
 
     func makeUIView(context: Context) -> RPSystemBroadcastPickerView {
         let picker = RPSystemBroadcastPickerView(frame: CGRect(x: 0, y: 0, width: 44, height: 44))
-        picker.preferredExtension = "local.porthole.pull.broadcast"
+        // From this app's own ID: a signing tool may have renamed both, and a stale name
+        // leaves the sheet without Porthole to pick.
+        picker.preferredExtension = (Bundle.main.bundleIdentifier ?? "local.porthole.pull") + ".broadcast"
         picker.showsMicrophoneButton = false
         trigger.picker = picker
         return picker
