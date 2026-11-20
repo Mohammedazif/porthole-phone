@@ -36,13 +36,13 @@ final class ShareViewController: UIViewController {
         let title = UILabel()
         title.text = "Send to PC"
         title.font = .systemFont(ofSize: 22, weight: .bold)
-        let close = UIButton(type: .close)
-        close.addTarget(self, action: #selector(close), for: .touchUpInside)
+        let closeButton = UIButton(type: .close)
+        closeButton.addTarget(self, action: #selector(ShareViewController.close), for: .touchUpInside)
         #if compiler(>=6.2)
         if #available(iOS 26.0, *) {
             var glass = UIButton.Configuration.glass()
             glass.image = UIImage(systemName: "xmark")
-            close.configuration = glass
+            closeButton.configuration = glass
         }
         #endif
 
@@ -95,7 +95,7 @@ final class ShareViewController: UIViewController {
         button.isEnabled = false
         button.addTarget(self, action: #selector(sendTapped), for: .touchUpInside)
 
-        let header = UIStackView(arrangedSubviews: [title, close])
+        let header = UIStackView(arrangedSubviews: [title, closeButton])
         header.axis = .horizontal
         header.alignment = .center
         let body = UIStackView(arrangedSubviews: [header, pcColumn, destRow, filesCard, sizeLabel, bar, button])
