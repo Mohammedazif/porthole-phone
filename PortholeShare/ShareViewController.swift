@@ -2,20 +2,25 @@ import Network
 import UIKit
 import UniformTypeIdentifiers
 
-/// Photos > Select > Share > Porthole. Sends the chosen photos and videos themselves to
-/// Porthole on the PC, which saves them in Downloads. Nothing is matched: these are
-/// exactly the items picked.
+/// Share > Porthole from any app: Photos, Files, Voice Memos, Mail. Sends the chosen
+/// files themselves to Porthole on the PC, which saves them in Downloads. Nothing is
+/// matched: these are exactly the items picked.
 final class ShareViewController: UIViewController {
     private let status = UILabel()
     private let bar = UIProgressView(progressViewStyle: .bar)
     private let button = UIButton(type: .custom)
     private let fileStack = UIStackView()
     private let sizeLabel = UILabel()
+    private let pcName = UILabel()
+    private let change = UIButton(type: .system)
+    private var marks: [UIImageView] = []
     private var readyToSend = false
 
     /// Everything below is touched only on this queue.
     private let queue = DispatchQueue(label: "porthole.share")
     private var browser: NWBrowser?
+    private var finder: NWBrowser?
+    private var chosen: NWEndpoint?
     private var connection: NWConnection?
     private var files: [(url: URL, name: String)] = []
     private var folder: URL?
@@ -33,17 +38,34 @@ final class ShareViewController: UIViewController {
         title.font = .systemFont(ofSize: 22, weight: .bold)
         let close = UIButton(type: .close)
         close.addTarget(self, action: #selector(close), for: .touchUpInside)
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            var glass = UIButton.Configuration.glass()
+            glass.image = UIImage(systemName: "xmark")
+            close.configuration = glass
+        }
+        #endif
 
-        let pc = UILabel()
-        pc.text = "Porthole"
+        let pc = pcName
+        pc.text = "Looking for your PC"
         pc.font = .systemFont(ofSize: 17, weight: .semibold)
+        var changeConfig = UIButton.Configuration.plain()
+        changeConfig.title = "Change"
+        changeConfig.contentInsets = .zero
+        change.configuration = changeConfig
+        change.showsMenuAsPrimaryAction = true
+        change.isHidden = true
         status.font = .systemFont(ofSize: 14)
         status.textColor = .secondaryLabel
         status.numberOfLines = 2
         status.text = "Getting the originals ready"
-        let pcColumn = UIStackView(arrangedSubviews: [pc, status])
-        pcColumn.axis = .vertical
-        pcColumn.spacing = 2
+        let pcText = UIStackView(arrangedSubviews: [pc, status])
+        pcText.axis = .vertical
+        pcText.spacing = 2
+        let pcColumn = UIStackView(arrangedSubviews: [pcText, change])
+        pcColumn.axis = .horizontal
+        pcColumn.alignment = .center
+        pcColumn.spacing = 12
 
         let destTitle = UILabel()
         destTitle.text = "Save on PC to"
@@ -69,13 +91,7 @@ final class ShareViewController: UIViewController {
         bar.trackTintColor = .tertiarySystemFill
         bar.isHidden = true
 
-        var config = UIButton.Configuration.filled()
-        config.title = "Send"
-        config.baseBackgroundColor = .label
-        config.baseForegroundColor = .systemBackground
-        config.cornerStyle = .capsule
-        config.buttonSize = .large
-        button.configuration = config
+        button.configuration = ShareViewController.sendStyle(title: "Send")
         button.isEnabled = false
         button.addTarget(self, action: #selector(sendTapped), for: .touchUpInside)
 
@@ -104,6 +120,27 @@ final class ShareViewController: UIViewController {
         ])
     }
 
+    /// Prominent Liquid Glass on iOS 26; an ink capsule before it.
+    private static func sendStyle(title: String) -> UIButton.Configuration {
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            var config = UIButton.Configuration.prominentGlass()
+            config.title = title
+            config.baseBackgroundColor = .label
+            config.baseForegroundColor = .systemBackground
+            config.buttonSize = .large
+            return config
+        }
+        #endif
+        var config = UIButton.Configuration.filled()
+        config.title = title
+        config.baseBackgroundColor = .label
+        config.baseForegroundColor = .systemBackground
+        config.cornerStyle = .capsule
+        config.buttonSize = .large
+        return config
+    }
+
     @objc private func sendTapped() {
         if !readyToSend {
             close()
@@ -111,15 +148,58 @@ final class ShareViewController: UIViewController {
         }
         readyToSend = false
         button.isEnabled = false
-        queue.async { self.browse() }
+        queue.async {
+            if let chosen = self.chosen {
+                self.finder?.cancel()
+                self.finder = nil
+                self.connect(to: chosen)
+            } else {
+                self.browse()
+            }
+        }
+    }
+
+    /// Lists Porthole PCs while the sheet is open, so it can say which one gets the files.
+    private func findPCs() {
+        let found = NWBrowser(for: .bonjour(type: "_porthole-share._tcp", domain: nil), using: .tcp)
+        found.browseResultsChangedHandler = { [weak self] results, _ in
+            guard let self, !self.stopped else { return }
+            let pcs = results.compactMap { result -> (String, NWEndpoint)? in
+                if case let .service(name, _, _, _) = result.endpoint { return (name, result.endpoint) }
+                return nil
+            }.sorted { $0.0 < $1.0 }
+            if self.chosen == nil || !pcs.contains(where: { $0.1 == self.chosen }) {
+                self.chosen = pcs.first?.1
+            }
+            let current = pcs.first(where: { $0.1 == self.chosen })?.0
+            DispatchQueue.main.async {
+                self.pcName.text = current ?? "Looking for your PC"
+                self.change.isHidden = pcs.count < 2
+                self.change.menu = UIMenu(children: pcs.map { pc in
+                    UIAction(title: pc.0, state: pc.0 == current ? .on : .off) { [weak self] _ in
+                        self?.queue.async {
+                            self?.chosen = pc.1
+                            DispatchQueue.main.async { self?.pcName.text = pc.0 }
+                        }
+                    }
+                })
+            }
+        }
+        found.start(queue: queue)
+        finder = found
     }
 
     private func setButton(_ title: String) {
         DispatchQueue.main.async {
-            guard var config = self.button.configuration else { return }
-            config.title = title
-            self.button.configuration = config
+            self.button.configuration = ShareViewController.sendStyle(title: title)
             self.button.isEnabled = true
+        }
+    }
+
+    private func markSent(_ index: Int) {
+        DispatchQueue.main.async {
+            guard index < self.marks.count else { return }
+            UIView.animate(withDuration: 0.25) { self.marks[index].alpha = 1 }
         }
     }
 
@@ -132,6 +212,7 @@ final class ShareViewController: UIViewController {
         let total = rows.reduce(Int64(0)) { $0 + $1.1 }
         DispatchQueue.main.async {
             self.fileStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+            self.marks = []
             for (index, row) in rows.enumerated() {
                 let name = UILabel()
                 name.text = row.0
@@ -142,9 +223,15 @@ final class ShareViewController: UIViewController {
                 bytes.font = .systemFont(ofSize: 13)
                 bytes.textColor = .secondaryLabel
                 bytes.setContentHuggingPriority(.required, for: .horizontal)
-                let line = UIStackView(arrangedSubviews: [name, bytes])
+                let mark = UIImageView(image: UIImage(systemName: "checkmark.circle.fill"))
+                mark.tintColor = .systemGreen
+                mark.alpha = 0
+                mark.setContentHuggingPriority(.required, for: .horizontal)
+                self.marks.append(mark)
+                let line = UIStackView(arrangedSubviews: [name, bytes, mark])
                 line.axis = .horizontal
                 line.spacing = 8
+                line.alignment = .center
                 line.layoutMargins = UIEdgeInsets(top: 10, left: 0, bottom: 10, right: 0)
                 line.isLayoutMarginsRelativeArrangement = true
                 if index < rows.count - 1 {
@@ -162,7 +249,7 @@ final class ShareViewController: UIViewController {
             }
             let count = rows.count
             self.sizeLabel.text = ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
-            self.status.text = "Connected · Downloads"
+            self.status.text = "Saves in Downloads on the PC"
             self.setButton(count == 1 ? "Send 1 file" : "Send \(count) files")
             self.readyToSend = true
             self.button.isEnabled = true
@@ -179,6 +266,7 @@ final class ShareViewController: UIViewController {
         queue.async {
             guard !self.started else { return }
             self.started = true
+            self.findPCs()
             self.collect(providers)
         }
     }
@@ -214,6 +302,8 @@ final class ShareViewController: UIViewController {
         stopped = true
         browser?.cancel()
         browser = nil
+        finder?.cancel()
+        finder = nil
         connection?.cancel()
         connection = nil
         if let folder { try? FileManager.default.removeItem(at: folder) }
@@ -222,13 +312,17 @@ final class ShareViewController: UIViewController {
 
     // MARK: Reading the items
 
-    /// The first type each item offers is its original format, such as HEIC or MOV.
+    /// A photo or video comes in its original format, such as HEIC or MOV: the first type
+    /// it offers. Anything else (PDF, ZIP, audio, documents) comes as the file it is.
+    /// Web links and bare text are not files and are skipped.
     private static func originalType(of provider: NSItemProvider) -> UTType? {
-        for id in provider.registeredTypeIdentifiers {
-            guard let type = UTType(id) else { continue }
-            if type.conforms(to: .movie) || type.conforms(to: .image) { return type }
+        let types = provider.registeredTypeIdentifiers.compactMap(UTType.init)
+        if let media = types.first(where: { $0.conforms(to: .movie) || $0.conforms(to: .image) }) {
+            return media
         }
-        return nil
+        return types.first { type in
+            type.conforms(to: .data) && !type.conforms(to: .url) && type != .plainText && type != .utf8PlainText
+        }
     }
 
     /// Letters, digits, dot, dash and underscore only: what the PC accepts.
@@ -364,6 +458,7 @@ final class ShareViewController: UIViewController {
                         : "The PC stopped after \(index) of \(self.files.count).")
                     return
                 }
+                self.markSent(index)
                 self.sendFile(index + 1)
             }
             return

@@ -170,8 +170,9 @@ struct ContentView: View {
                 Text(client.status)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
-                glassButton("Scan the code on the PC", prominent: true) { scanning = true }
-                glassButton("Enter address and code", prominent: false) { enteringPC = true }
+                GlassCapsuleButton(title: "Scan code on PC screen", systemImage: "qrcode.viewfinder",
+                                   prominent: true) { scanning = true }
+                GlassCapsuleButton(title: "Enter address and code") { enteringPC = true }
                 Text("Don't see your PC? Open Porthole on it and keep both on the same Wi-Fi. Porthole needs Local Network access, in Settings › Porthole.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -191,7 +192,9 @@ struct ContentView: View {
                         Text(client.address).font(.footnote).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    glassButton("Switch", prominent: false, expands: false) { enteringPC = true }
+                    GlassIconButton(systemImage: "arrow.left.arrow.right", label: "Switch PC") {
+                        enteringPC = true
+                    }
                 }
                 shareLens
                 Text("Tap, then Start Broadcast. Everything on screen, including sound, appears on the PC.")
@@ -205,8 +208,10 @@ struct ContentView: View {
                 }
                 .background(.background, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                 HStack(spacing: 12) {
-                    glassButton("Send files", prominent: false) { explainingSend = true }
-                    glassButton("Send clipboard", prominent: false) { client.sendClipboardNow() }
+                    GlassCapsuleButton(title: "Send files", systemImage: "doc") { explainingSend = true }
+                    GlassCapsuleButton(title: "Send clipboard", systemImage: "doc.on.clipboard") {
+                        client.sendClipboardNow()
+                    }
                 }
             }
             .padding(20)
@@ -228,6 +233,7 @@ struct ContentView: View {
                         Circle().strokeBorder(.white.opacity(0.45), lineWidth: 1)
                     }
                     .shadow(color: .black.opacity(0.18), radius: 24, y: 10)
+                    .modifier(LensGlass())
                 VStack(spacing: 6) {
                     portholeMark
                     Text("Share screen")
@@ -256,13 +262,7 @@ struct ContentView: View {
 
     private var sharingScreen: some View {
         VStack(alignment: .leading, spacing: 18) {
-            Button { sharing = false } label: {
-                Image(systemName: "chevron.left")
-                    .font(.body.weight(.semibold))
-                    .frame(width: 36, height: 36)
-                    .background(.ultraThinMaterial, in: Circle())
-            }
-            .buttonStyle(.plain)
+            GlassIconButton(systemImage: "chevron.left", label: "Back") { sharing = false }
             Text("LIVE")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.red)
@@ -284,21 +284,16 @@ struct ContentView: View {
             }
             .background(.background, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
             Spacer()
-            Button {
+            GlassCapsuleButton(title: "Stop sharing", systemImage: "stop.fill", prominent: true, tint: .red) {
                 broadcast.press()
                 sharing = false
-            } label: {
-                Text("Stop sharing")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                    .background(.red.opacity(0.16), in: Capsule())
-                    .overlay { Capsule().strokeBorder(.red.opacity(0.35), lineWidth: 1) }
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(.red)
         }
         .padding(20)
+    }
+
+    private var filteredHistory: [PullClient.ActivityItem] {
+        client.history.filter { activityFilter == 0 || (activityFilter == 1) == $0.isFile }
     }
 
     private var activity: some View {
@@ -310,32 +305,61 @@ struct ContentView: View {
             }
             .pickerStyle(.segmented)
             .listRowBackground(Color.clear)
+            .listRowInsets(EdgeInsets())
             if activityFilter != 2 {
                 Section {
-                    Button("Pick from library") { choosingOriginal = true }
                     if client.chosenOriginal.isEmpty {
-                        Text("If a dragged photo is not the only match, pick it here. Then drag that card out of the Porthole window. It sends the original you chose.")
+                        Text("If a photo you drag off the PC window isn't the only match, pick it here. Then drag again, and the PC takes the one you chose.")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     } else {
-                        Text(client.chosenOriginal)
-                        Text("On the PC, hold and drag this choice onto the desktop or a folder.")
+                        Label(client.chosenOriginal, systemImage: "checkmark.circle.fill")
+                        Text("On the PC, drag the photo out of the Porthole window.")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                         Button("Cancel selection", role: .cancel) { client.clearChosenOriginal() }
                     }
+                    GlassCapsuleButton(title: "Pick from library", systemImage: "photo.on.rectangle") {
+                        choosingOriginal = true
+                    }
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets())
                 } header: {
-                    Text("Original file")
+                    Text("Photo for the PC")
+                }
+            }
+            Section {
+                if filteredHistory.isEmpty {
+                    Text(activityFilter == 2 ? "Copy something on either side and it shows here."
+                                             : "Files you send or receive show here.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(filteredHistory) { item in
+                    ActivityRow(item: item)
+                }
+            } header: {
+                HStack {
+                    Text("Recent")
+                    Spacer()
+                    if !client.history.isEmpty {
+                        Button("Clear") { client.clearHistory() }
+                            .font(.footnote)
+                            .textCase(nil)
+                    }
                 }
             }
             if activityFilter != 1 {
                 Section("Clipboard") {
-                    Text(client.clipStatus.isEmpty ? "Nothing copied yet." : client.clipStatus)
-                    Button("Send clipboard") { client.sendClipboardNow() }
+                    Text(client.clipStatus.isEmpty ? "Copies move both ways while Porthole is open." : client.clipStatus)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    GlassCapsuleButton(title: "Send clipboard", systemImage: "doc.on.clipboard") {
+                        client.sendClipboardNow()
+                    }
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets())
                 }
-            }
-            Section("Library") {
-                Text(index.status)
             }
         }
         .navigationTitle("Activity")
@@ -350,15 +374,19 @@ struct ContentView: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                 check("Pair Porthole", "Settings › Bluetooth › Other Devices.")
-                Button("Open iPhone Settings") {
+                GlassCapsuleButton(title: "Open iPhone Settings", systemImage: "gear") {
                     guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
                     UIApplication.shared.open(url)
                 }
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets())
             }
             Section("Sharing") {
                 LabeledContent("Clipboard sync", value: client.clipStatus.isEmpty ? "On while connected" : "On")
                 LabeledContent("Photos", value: index.accessLabel)
-                Text("Files shared from this iPhone save to Downloads on the PC.")
+                LabeledContent("Files to the PC", value: "Downloads")
+                LabeledContent("Files from the PC", value: "Files › Porthole")
+                Text("Pictures and videos from the PC go to Photos.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -450,19 +478,32 @@ struct ContentView: View {
 
     private func arrivalBanner(_ arrival: PullClient.Arrival) -> some View {
         HStack(spacing: 12) {
-            Text(arrival.openPhotos ? "\(arrival.name) is in Photos" : "\(arrival.name) is in Files")
-                .font(.subheadline)
-                .lineLimit(2)
+            Image(systemName: arrival.openPhotos ? "photo" : "doc.fill")
+                .font(.title3)
+                .frame(width: 40, height: 40)
+                .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(arrival.name) received")
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                Text(arrival.openPhotos ? "Saved to Photos" : "Saved to Files › Porthole")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
             Spacer(minLength: 8)
             Button("Open") { openArrival(arrival) }
                 .font(.subheadline.weight(.semibold))
-            Button("Close") { client.clearArrival() }
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+            Button { client.clearArrival() } label: {
+                Image(systemName: "xmark").font(.footnote.weight(.bold))
+            }
+            .foregroundStyle(.secondary)
+            .accessibilityLabel("Close")
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .background(.background)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .glassPanel(RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .padding(.horizontal, 12)
+        .transition(.move(edge: .top).combined(with: .opacity))
     }
 
     private func applyScan(_ text: String) {
@@ -537,28 +578,6 @@ struct ContentView: View {
         }
     }
 
-    private func glassButton(_ title: String, prominent: Bool, expands: Bool = true, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(.headline)
-                .frame(maxWidth: expands ? .infinity : nil)
-                .padding(.horizontal, expands ? 0 : 16)
-                .padding(.vertical, 12)
-                .background {
-                    if prominent {
-                        Capsule().fill(.black.opacity(0.88))
-                    } else {
-                        Capsule().fill(.ultraThinMaterial)
-                    }
-                }
-                .overlay {
-                    Capsule().strokeBorder(.white.opacity(prominent ? 0.28 : 0.7), lineWidth: 1)
-                }
-                .foregroundStyle(prominent ? .white : .primary)
-                .shadow(color: .black.opacity(0.06), radius: 8, y: 3)
-        }
-        .buttonStyle(.plain)
-    }
 }
 
 private struct ShareFile: Identifiable {
@@ -629,5 +648,34 @@ struct OriginalPicker: UIViewControllerRepresentable {
         func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
             onChoose(results.first?.assetIdentifier)
         }
+    }
+}
+
+/// One line of Activity: which way it went, what, and when.
+private struct ActivityRow: View {
+    let item: PullClient.ActivityItem
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: item.isFile ? (item.incoming ? "arrow.down.doc" : "arrow.up.doc")
+                                          : "doc.on.clipboard")
+                .font(.body)
+                .frame(width: 36, height: 36)
+                .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.title)
+                    .font(.subheadline.weight(.medium))
+                    .lineLimit(1)
+                Text(item.detail)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Text(item.date, style: .time)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .combine)
     }
 }

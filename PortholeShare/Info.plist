@@ -25,7 +25,7 @@
 		<string>_porthole-share._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Porthole sends the photos and videos you share to your PC on this Wi-Fi.</string>
+	<string>Porthole sends the files you share to your PC on this Wi-Fi.</string>
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionPointIdentifier</key>
@@ -39,6 +39,8 @@
 				<key>NSExtensionActivationSupportsImageWithMaxCount</key>
 				<integer>500</integer>
 				<key>NSExtensionActivationSupportsMovieWithMaxCount</key>
+				<integer>500</integer>
+				<key>NSExtensionActivationSupportsFileWithMaxCount</key>
 				<integer>500</integer>
 			</dict>
 		</dict>

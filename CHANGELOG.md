@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.0
+
+The iPhone app now shares the PC app's version number. Buttons use Liquid Glass on iOS 26 and keep the frosted look on older iOS. Share › Porthole takes any file, not only photos and videos: PDFs, ZIPs, audio and documents from Files, Mail or any app. The sheet shows which PC gets them, offers Change when there are several, and ticks each file as the PC saves it. Activity lists the files and copies that moved each way today. Settings says where files land on each side. Needs the PC build from the same day.
+
 ## 2.16
 
 Copy and paste go both ways while this app is connected. A copy on the PC becomes the iPhone clipboard, and you paste it with Ctrl+V. A copy on the iPhone becomes the PC clipboard when you open Porthole, or when you tap Send clipboard. Text keeps accents and emoji. One picture moves too. Needs the PC build from the same day. Set Settings → Apps → Porthole → Paste from Other Apps to Allow.

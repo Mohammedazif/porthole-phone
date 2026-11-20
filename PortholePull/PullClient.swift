@@ -25,6 +25,18 @@ final class PullClient: ObservableObject {
     }
     @Published var arrival: Arrival?
     @Published private(set) var choiceIDs: [String] = []
+    /// Files and copies that moved between this iPhone and the PC, newest first.
+    struct ActivityItem: Identifiable, Codable, Equatable {
+        var id = UUID()
+        var date = Date()
+        var title: String
+        var detail: String
+        var isFile: Bool
+        var incoming: Bool
+    }
+    @Published private(set) var history: [ActivityItem] = []
+    private static let historyKey = "porthole.activity"
+    private static let historyLimit = 60
     private let queue = DispatchQueue(label: "porthole.pull")
     private var connection: NWConnection?
     private var browser: NWBrowser?
@@ -102,9 +114,39 @@ final class PullClient: ObservableObject {
         self.index = index
     }
 
+    func clearHistory() {
+        history = []
+        UserDefaults.standard.removeObject(forKey: PullClient.historyKey)
+    }
+
+    private func loadHistory() {
+        guard history.isEmpty, let data = UserDefaults.standard.data(forKey: PullClient.historyKey),
+              let saved = try? JSONDecoder().decode([ActivityItem].self, from: data) else { return }
+        history = saved
+    }
+
+    /// Callable from any queue; the list lives on the main thread.
+    private func note(_ title: String, _ detail: String, file: Bool, incoming: Bool) {
+        DispatchQueue.main.async {
+            self.history.insert(ActivityItem(title: title, detail: detail, isFile: file, incoming: incoming), at: 0)
+            if self.history.count > PullClient.historyLimit {
+                self.history.removeLast(self.history.count - PullClient.historyLimit)
+            }
+            if let data = try? JSONEncoder().encode(self.history) {
+                UserDefaults.standard.set(data, forKey: PullClient.historyKey)
+            }
+        }
+    }
+
+    private static func preview(_ text: String) -> String {
+        let flat = text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
+        return flat.count > 60 ? String(flat.prefix(60)) + "…" : flat
+    }
+
     /// Bonjour is what makes iOS show Local Network. A plain TCP connect often does not.
     func prepare() {
         loadSaved()
+        loadHistory()
         guard browser == nil else { return }
         let parameters = NWParameters.tcp
         let browser = NWBrowser(for: .bonjour(type: "_porthole._tcp", domain: nil), using: parameters)
@@ -598,6 +640,7 @@ final class PullClient: ObservableObject {
             let chunk = handle.readData(ofLength: 1 << 20)
             if chunk.isEmpty {
                 finish("Sent \(name)")
+                note(name, "Original sent to the PC", file: true, incoming: false)
                 return
             }
             link.send(content: chunk, completion: .contentProcessed { error in
@@ -764,6 +807,8 @@ final class PullClient: ObservableObject {
     }
 
     private func announce(name: String, photos: Bool, file: URL?) {
+        note(name, photos ? "From the PC · saved in Photos" : "From the PC · in Files › Porthole",
+             file: true, incoming: true)
         DispatchQueue.main.async {
             self.arrival = Arrival(name: name, openPhotos: photos, file: file)
             self.status = photos ? "\(name) is in Photos" : "\(name) is in Files › Porthole"
@@ -826,6 +871,7 @@ final class PullClient: ObservableObject {
             seenCount = board.changeCount
             queueClip(kind: "P", data: png)
             clipStatus = "Sent the image to the PC"
+            note("Picture", "Copied to the PC", file: false, incoming: false)
             return
         }
         if let text = board.string, !text.isEmpty {
@@ -848,6 +894,7 @@ final class PullClient: ObservableObject {
             seenCount = board.changeCount
             queueClip(kind: "T", data: data)
             clipStatus = "Sent the copy to the PC"
+            note(PullClient.preview(text), "Copied to the PC", file: false, incoming: false)
             return
         }
         seenCount = board.changeCount
@@ -900,10 +947,12 @@ final class PullClient: ObservableObject {
                 board.string = text
                 wrote = true
                 self.clipStatus = "PC clipboard is here. Paste with Ctrl+V."
+                self.note(PullClient.preview(text), "Copied from the PC", file: false, incoming: true)
             } else if kind == "P", let image = UIImage(data: data) {
                 board.image = image
                 wrote = true
                 self.clipStatus = "PC image is here. Paste with Ctrl+V."
+                self.note("Picture", "Copied from the PC", file: false, incoming: true)
             }
             if wrote {
                 self.seenCount = board.changeCount
