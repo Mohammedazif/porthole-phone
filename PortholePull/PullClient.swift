@@ -18,6 +18,13 @@ final class PullClient: ObservableObject {
     @Published private(set) var nearby: [NearbyPC] = []
     @Published private(set) var chosenOriginal = ""
     @Published private(set) var clipStatus = ""
+    struct Arrival: Equatable {
+        var name: String
+        var openPhotos: Bool
+        var file: URL?
+    }
+    @Published var arrival: Arrival?
+    @Published private(set) var choiceIDs: [String] = []
     private let queue = DispatchQueue(label: "porthole.pull")
     private var connection: NWConnection?
     private var browser: NWBrowser?
@@ -45,6 +52,12 @@ final class PullClient: ObservableObject {
     private var lastSent = ""
     private var launchSend = true
     private var pasteObserver: NSObjectProtocol?
+    private var choicePending = false
+    private var pushLeft = 0
+    private var pushHandle: FileHandle?
+    private var pushURL: URL?
+    private var pushName = ""
+    private var pushFailed = false
 
     func chooseOriginal(_ identifier: String) {
         queue.async {
@@ -56,6 +69,26 @@ final class PullClient: ObservableObject {
             let name = PHAssetResource.assetResources(for: asset).first?.originalFilename ?? "Selected original"
             DispatchQueue.main.async { self.chosenOriginal = name }
         }
+    }
+
+    /// The user picked one of two similar photos, or neither.
+    func pickChoice(_ id: String?) {
+        queue.async {
+            guard self.choicePending else { return }
+            self.choicePending = false
+            DispatchQueue.main.async { self.choiceIDs = [] }
+            guard let id,
+                  let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject else {
+                self.send("MISS\n")
+                DispatchQueue.main.async { self.status = "No file sent" }
+                return
+            }
+            self.export(asset, note: "picked")
+        }
+    }
+
+    func clearArrival() {
+        arrival = nil
     }
 
     func clearChosenOriginal() {
@@ -146,6 +179,12 @@ final class PullClient: ObservableObject {
         address = ""
         code = ""
         clipStatus = ""
+        arrival = nil
+        choiceIDs = []
+        queue.async {
+            self.choicePending = false
+            self.abortPush()
+        }
         UserDefaults.standard.removeObject(forKey: "porthole.host")
         UserDefaults.standard.removeObject(forKey: "porthole.code")
         status = "Enter the address and code shown on the PC."
@@ -180,6 +219,8 @@ final class PullClient: ObservableObject {
         buffer.removeAll()
         body.removeAll()
         bodyLeft = 0
+        abortPush()
+        choicePending = false
         syncReady = false
         exporting = false
         greeted = false
@@ -338,7 +379,10 @@ final class PullClient: ObservableObject {
             if error != nil || complete {
                 let hadHello = self.greeted
                 self.greeted = false
+                self.choicePending = false
+                self.abortPush()
                 DispatchQueue.main.async {
+                    self.choiceIDs = []
                     self.linked = false
                     self.show(hadHello ? "Disconnected. Reconnecting." : "The PC closed the connection. Check the code in F1 help.")
                     self.scheduleReconnect()
@@ -350,6 +394,11 @@ final class PullClient: ObservableObject {
     }
 
     private func drain() {
+        if pushLeft > 0 {
+            writePushBody()
+            if pushLeft > 0 { return }
+            finishPush()
+        }
         if bodyLeft > 0 {
             let take = min(bodyLeft, buffer.count)
             if take > 0 {
@@ -374,6 +423,11 @@ final class PullClient: ObservableObject {
                 drain()
                 return
             }
+            if let push = pushHeader(text) {
+                beginPush(bytes: push.0, name: push.1)
+                drain()
+                return
+            }
             handle(text)
         }
     }
@@ -391,6 +445,7 @@ final class PullClient: ObservableObject {
             guard greeted else { return }
             syncReady = true
             send("SYNC\n")
+            send("FILES\n")
             startPasteWatch()
             DispatchQueue.main.async {
                 self.clipStatus = "Clipboard connected. Paste on the iPhone with Ctrl+V."
@@ -400,6 +455,10 @@ final class PullClient: ObservableObject {
             return
         }
         guard greeted, line.hasPrefix("PULL ") else { return }
+        if choicePending {
+            choicePending = false
+            DispatchQueue.main.async { self.choiceIDs = [] }
+        }
         let parts = line.split(separator: " ")
         guard (3...6).contains(parts.count), let hash = UInt64(parts[1], radix: 16),
               let aspect = Double(parts[2]) else {
@@ -436,6 +495,15 @@ final class PullClient: ObservableObject {
         DispatchQueue.main.async { self.status = "Finding that photo or video" }
         let found = index.match(hash: hash, aspect: aspect, thumb: thumb, detail: detail, screen: screen) { [weak self] text in
             DispatchQueue.main.async { self?.status = text }
+        }
+        if found.asset == nil, !found.choices.isEmpty {
+            choicePending = true
+            let ids = found.choices
+            DispatchQueue.main.async {
+                self.choiceIDs = ids
+                self.status = "Two photos look alike. Pick one."
+            }
+            return
         }
         guard index.ready, let asset = found.asset else {
             if found.closest < 65 {
@@ -542,6 +610,164 @@ final class PullClient: ObservableObject {
         }
         send("FILE \(size) \(name)" + (exportNote.isEmpty ? "" : " " + exportNote) + "\n")
         next()
+    }
+
+    private func pushHeader(_ line: String) -> (Int, String)? {
+        guard line.hasPrefix("PUSH ") else { return nil }
+        let rest = line.dropFirst(5)
+        guard let space = rest.firstIndex(of: " ") else { return nil }
+        let countText = rest[..<space]
+        let name = String(rest[rest.index(after: space)...])
+        guard let count = Int(countText), count > 0, count <= 512 * 1024 * 1024 else { return nil }
+        guard !name.isEmpty, !name.contains("/"), !name.contains("\\"), name != ".", name != ".." else { return nil }
+        return (count, name)
+    }
+
+    private func beginPush(bytes: Int, name: String) {
+        pushLeft = bytes
+        pushName = name
+        pushFailed = false
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString + "-" + name)
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        pushURL = url
+        pushHandle = try? FileHandle(forWritingTo: url)
+        if pushHandle == nil { pushFailed = true }
+        DispatchQueue.main.async { self.status = "Receiving \(name)" }
+    }
+
+    private func writePushBody() {
+        let take = min(pushLeft, buffer.count)
+        guard take > 0 else { return }
+        let chunk = buffer.prefix(take)
+        buffer.removeFirst(take)
+        pushLeft -= take
+        if pushFailed { return }
+        do {
+            try pushHandle?.write(contentsOf: chunk)
+        } catch {
+            pushFailed = true
+        }
+    }
+
+    private func finishPush() {
+        try? pushHandle?.close()
+        pushHandle = nil
+        let url = pushURL
+        let name = pushName
+        let failed = pushFailed
+        pushURL = nil
+        pushName = ""
+        pushFailed = false
+        guard let url, !failed, !name.isEmpty else {
+            if let url { try? FileManager.default.removeItem(at: url) }
+            send("NO\n")
+            DispatchQueue.main.async { self.status = "Could not save that file" }
+            return
+        }
+        guard let saved = moveIntoDocuments(url, name: name) else {
+            try? FileManager.default.removeItem(at: url)
+            send("NO\n")
+            DispatchQueue.main.async { self.status = "Could not save \(name)" }
+            return
+        }
+        send("SAVED\n")
+        switch Self.mediaKind(name) {
+        case .photo:
+            addToPhotos(saved, video: false, name: name)
+        case .video:
+            addToPhotos(saved, video: true, name: name)
+        case .file:
+            announce(name: name, photos: false, file: saved)
+        }
+    }
+
+    private func abortPush() {
+        try? pushHandle?.close()
+        pushHandle = nil
+        if let url = pushURL { try? FileManager.default.removeItem(at: url) }
+        pushURL = nil
+        pushLeft = 0
+        pushName = ""
+        pushFailed = false
+    }
+
+    private enum MediaKind { case photo, video, file }
+
+    private static func mediaKind(_ name: String) -> MediaKind {
+        switch (name as NSString).pathExtension.lowercased() {
+        case "jpg", "jpeg", "png", "heic", "heif", "gif", "tif", "tiff":
+            return .photo
+        case "mov", "mp4", "m4v":
+            return .video
+        default:
+            return .file
+        }
+    }
+
+    private func moveIntoDocuments(_ temp: URL, name: String) -> URL? {
+        guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let folder = docs.appendingPathComponent("Porthole", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        } catch {
+            return nil
+        }
+        var dest = folder.appendingPathComponent(name)
+        let base = (name as NSString).deletingPathExtension
+        let ext = (name as NSString).pathExtension
+        var n = 2
+        while FileManager.default.fileExists(atPath: dest.path), n < 50 {
+            let next = ext.isEmpty ? "\(base) \(n)" : "\(base) \(n).\(ext)"
+            dest = folder.appendingPathComponent(next)
+            n += 1
+        }
+        do {
+            try FileManager.default.moveItem(at: temp, to: dest)
+            return dest
+        } catch {
+            do {
+                try FileManager.default.copyItem(at: temp, to: dest)
+                try? FileManager.default.removeItem(at: temp)
+                return dest
+            } catch {
+                return nil
+            }
+        }
+    }
+
+    private func addToPhotos(_ file: URL, video: Bool, name: String) {
+        DispatchQueue.main.async { self.status = "Saving \(name) to Photos" }
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { [weak self] status in
+            guard let self else { return }
+            guard status == .authorized || status == .limited else {
+                self.announce(name: name, photos: false, file: file)
+                return
+            }
+            PHPhotoLibrary.shared().performChanges({
+                if video {
+                    PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: file)
+                } else {
+                    PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: file)
+                }
+            }) { ok, _ in
+                if ok {
+                    try? FileManager.default.removeItem(at: file)
+                    self.announce(name: name, photos: true, file: nil)
+                } else {
+                    self.announce(name: name, photos: false, file: file)
+                }
+            }
+        }
+    }
+
+    private func announce(name: String, photos: Bool, file: URL?) {
+        DispatchQueue.main.async {
+            self.arrival = Arrival(name: name, openPhotos: photos, file: file)
+            self.status = photos ? "\(name) is in Photos" : "\(name) is in Files › Porthole"
+        }
     }
 
     private func safeName(_ raw: String) -> String? {

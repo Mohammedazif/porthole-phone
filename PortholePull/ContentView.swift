@@ -1,5 +1,6 @@
-import ReplayKit
+import Photos
 import PhotosUI
+import ReplayKit
 import SwiftUI
 import UIKit
 
@@ -46,6 +47,8 @@ struct ContentView: View {
     @State private var sharing = false
     @State private var shareStarted = Date()
     @State private var explainingSend = false
+    @State private var scanning = false
+    @State private var shareFile: ShareFile?
     @State private var activityFilter = 0
 
     private var version: String {
@@ -95,6 +98,21 @@ struct ContentView: View {
         }
         .sheet(isPresented: $enteringPC) { manualEntry }
         .sheet(isPresented: $explainingSend) { sendFilesHelp }
+        .sheet(isPresented: $scanning) { scanSheet }
+        .sheet(isPresented: Binding(
+            get: { client.choiceIDs.count == 2 },
+            set: { shown in
+                if !shown, client.choiceIDs.count == 2 { client.pickChoice(nil) }
+            }
+        )) { choiceSheet }
+        .sheet(item: $shareFile) { item in
+            ActivitySheet(url: item.url)
+        }
+        .safeAreaInset(edge: .top) {
+            if let arrival = client.arrival {
+                arrivalBanner(arrival)
+            }
+        }
     }
 
     private var findPC: some View {
@@ -152,6 +170,7 @@ struct ContentView: View {
                 Text(client.status)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+                glassButton("Scan the code on the PC", prominent: true) { scanning = true }
                 glassButton("Enter address and code", prominent: false) { enteringPC = true }
                 Text("Don't see your PC? Open Porthole on it and keep both on the same Wi-Fi. Porthole needs Local Network access, in Settings › Porthole.")
                     .font(.footnote)
@@ -327,6 +346,9 @@ struct ContentView: View {
             Section("Control from the PC") {
                 check("AssistiveTouch on", "Accessibility › Touch › AssistiveTouch. Shows the pointer.")
                 check("Dwell Control off", "In AssistiveTouch. Otherwise the pointer taps by itself.")
+                Text("iOS does not tell apps whether AssistiveTouch or Dwell is on.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
                 check("Pair Porthole", "Settings › Bluetooth › Other Devices.")
                 Button("Open iPhone Settings") {
                     guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
@@ -335,7 +357,7 @@ struct ContentView: View {
             }
             Section("Sharing") {
                 LabeledContent("Clipboard sync", value: client.clipStatus.isEmpty ? "On while connected" : "On")
-                LabeledContent("Photos", value: index.ready ? "Full" : "Not loaded")
+                LabeledContent("Photos", value: index.accessLabel)
                 Text("Files shared from this iPhone save to Downloads on the PC.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -381,6 +403,92 @@ struct ContentView: View {
             }
         }
         .presentationDetents([.medium])
+    }
+
+    private var scanSheet: some View {
+        NavigationStack {
+            QRScanner { text in
+                scanning = false
+                applyScan(text)
+            }
+            .ignoresSafeArea()
+            .navigationTitle("Scan the PC")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { scanning = false }
+                }
+            }
+        }
+    }
+
+    private var choiceSheet: some View {
+        NavigationStack {
+            VStack(spacing: 16) {
+                Text("Which photo is on the PC?")
+                    .font(.title2.bold())
+                Text("Two library photos look alike. Pick the one to send.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                HStack(spacing: 12) {
+                    ForEach(client.choiceIDs, id: \.self) { id in
+                        Button { client.pickChoice(id) } label: {
+                            ChoiceThumb(id: id)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                Button("Neither") { client.pickChoice(nil) }
+            }
+            .padding(20)
+            .navigationTitle("Two photos")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+        .presentationDetents([.medium])
+    }
+
+    private func arrivalBanner(_ arrival: PullClient.Arrival) -> some View {
+        HStack(spacing: 12) {
+            Text(arrival.openPhotos ? "\(arrival.name) is in Photos" : "\(arrival.name) is in Files")
+                .font(.subheadline)
+                .lineLimit(2)
+            Spacer(minLength: 8)
+            Button("Open") { openArrival(arrival) }
+                .font(.subheadline.weight(.semibold))
+            Button("Close") { client.clearArrival() }
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(.background)
+    }
+
+    private func applyScan(_ text: String) {
+        guard let url = URL(string: text), url.scheme == "porthole",
+              let host = url.host, url.port == 47731 else {
+            client.status = "That code is not a Porthole PC."
+            return
+        }
+        let token = url.lastPathComponent
+        guard token.count == 8 else {
+            client.status = "That code is not a Porthole PC."
+            return
+        }
+        client.address = host
+        client.code = token
+        client.connect()
+    }
+
+    private func openArrival(_ arrival: PullClient.Arrival) {
+        if arrival.openPhotos, let url = URL(string: "photos-redirect://") {
+            UIApplication.shared.open(url)
+            return
+        }
+        if let file = arrival.file {
+            shareFile = ShareFile(url: file)
+        }
     }
 
     private var sendFilesHelp: some View {
@@ -450,6 +558,50 @@ struct ContentView: View {
                 .shadow(color: .black.opacity(0.06), radius: 8, y: 3)
         }
         .buttonStyle(.plain)
+    }
+}
+
+private struct ShareFile: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+private struct ActivitySheet: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+
+private struct ChoiceThumb: View {
+    let id: String
+    @State private var image: UIImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image).resizable().scaledToFill()
+            } else {
+                Color.secondary.opacity(0.15)
+            }
+        }
+        .frame(width: 140, height: 140)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .onAppear(perform: load)
+    }
+
+    private func load() {
+        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject else { return }
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .opportunistic
+        options.resizeMode = .fast
+        PHImageManager.default().requestImage(for: asset, targetSize: CGSize(width: 280, height: 280),
+                                              contentMode: .aspectFill, options: options) { image, _ in
+            self.image = image
+        }
     }
 }
 

@@ -31,8 +31,16 @@
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Porthole sends photos, the screen, and the clipboard to your PC on this Wi-Fi.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Porthole reads the code on the PC so this iPhone can connect.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Porthole saves photos and videos sent from the PC into Photos.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Porthole matches the photo on the PC window and sends that original file.</string>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

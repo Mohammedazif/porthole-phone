@@ -21,6 +21,8 @@ struct VideoEntry {
 final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     @Published var status = "Photos not loaded"
     @Published var ready = false
+    /// What iOS actually reports. AssistiveTouch and Dwell are not readable.
+    @Published private(set) var accessLabel = "Not asked"
     private let lock = NSLock()
     private var photos: [IndexedPhoto] = []
     private var videos: [VideoEntry] = []
@@ -66,6 +68,7 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
     }
 
     func requestAccessAndIndex(refresh: Bool = false) {
+        noteAccess(PHPhotoLibrary.authorizationStatus(for: .readWrite))
         if indexing {
             refreshPending = refreshPending || refresh
             return
@@ -75,6 +78,7 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         lastRefresh = Date()
         PHPhotoLibrary.requestAuthorization(for: .readWrite) { [weak self] access in
             DispatchQueue.main.async {
+                self?.noteAccess(access)
                 guard access == .authorized || access == .limited else {
                     self?.indexing = false
                     self?.status = "Allow photo access in Settings"
@@ -92,6 +96,16 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         }
     }
 
+    private func noteAccess(_ access: PHAuthorizationStatus) {
+        switch access {
+        case .authorized: accessLabel = "Allowed"
+        case .limited: accessLabel = "Limited"
+        case .denied, .restricted: accessLabel = "Off"
+        case .notDetermined: accessLabel = "Not asked"
+        @unknown default: accessLabel = "Unknown"
+        }
+    }
+
     struct Match {
         var asset: PHAsset?
         var closest = 65
@@ -101,6 +115,8 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         var video = ""
         /// The closest photo's thumb, which the PC saves beside its own. Always last.
         var debug = ""
+        /// Two different pictures that both clear the minimum when neither wins.
+        var choices: [String] = []
     }
 
     /// The whole phone screen under a drag, from PCs since phone 2.6. Photos shows one
@@ -134,7 +150,7 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         var found = Match()
         if !onlyScreen {
             found = matchPhotos(hash: hash, aspect: aspect, thumb: thumb, detail: detail)
-            if found.asset != nil { return found }
+            if found.asset != nil || !found.choices.isEmpty { return found }
         }
         if let screen {
             progress?("Comparing the whole screen")
@@ -142,6 +158,10 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
             found.note += (found.note.isEmpty ? "" : " ") + "screen " + fitted.note
             if let asset = fitted.asset {
                 found.asset = asset
+                return found
+            }
+            if !fitted.choices.isEmpty {
+                found.choices = fitted.choices
                 return found
             }
         }
@@ -167,9 +187,10 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
     /// The winner, if it leads every different picture by enough. Candidates that are
     /// copies of the winner do not count against it; among those copies the largest
     /// file wins, since that is the camera original rather than a saved copy.
-    private static func decide(_ ranked: [Candidate], min: Double) -> (id: String?, note: String) {
-        guard let top = ranked.first else { return (nil, "none") }
+    private static func decide(_ ranked: [Candidate], min: Double) -> (id: String?, note: String, choices: [String]) {
+        guard let top = ranked.first else { return (nil, "none", []) }
         var runner = -1.0
+        var runnerId: String?
         var copies = [top.id]
         for other in ranked.dropFirst() {
             if PictureHash.similarity(top.pattern, other.pattern) >= PictureHash.copyMin {
@@ -177,14 +198,19 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
                 continue
             }
             runner = other.score
+            runnerId = other.id
             break
         }
         var note = String(format: "%.3f %.3f", top.score, max(runner, -1))
         if copies.count > 1 { note += " copies \(copies.count)" }
         guard top.score >= min, top.score - runner >= PictureHash.requiredGap(top.score) else {
-            return (nil, note)
+            var choices: [String] = []
+            if let runnerId, top.score >= min, runner >= min {
+                choices = [top.id, runnerId]
+            }
+            return (nil, note, choices)
         }
-        guard copies.count > 1 else { return (top.id, note) }
+        guard copies.count > 1 else { return (top.id, note, []) }
         let assets = PHAsset.fetchAssets(withLocalIdentifiers: copies, options: nil)
         var best: PHAsset?
         assets.enumerateObjects { asset, _, _ in
@@ -194,7 +220,7 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
             let older = (asset.creationDate ?? .distantFuture) < (current.creationDate ?? .distantFuture)
             if size > bestSize || (size == bestSize && older) { best = asset }
         }
-        return (best?.localIdentifier ?? top.id, note)
+        return (best?.localIdentifier ?? top.id, note, [])
     }
 
     /// Ranked by the index's small copies, then the close ones again on sharper copies.
@@ -203,7 +229,7 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
     /// than none, and a page of text can look like a list on a phone at 32 cells.
     private func closerLook(_ ranked: [Candidate], items: [IndexedPhoto], at position: [String: Int],
                             placement: (Candidate) -> PictureHash.Placement, detail: [Double]?,
-                            thumb: [Double]) -> (id: String?, note: String) {
+                            thumb: [Double]) -> (id: String?, note: String, choices: [String]) {
         let first = Self.decide(ranked, min: PictureHash.gradientMin)
         guard let top = ranked.first else { return first }
         let runner = ranked.count > 1 ? ranked[1].score : -1
@@ -246,13 +272,14 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         let minimum = detail != nil ? PictureHash.detailMin : PictureHash.gradientMin
         let closer = Self.decide(refined, min: minimum)
         let note = first.note + " detail " + closer.note
-        if closer.id != nil { return (closer.id, note) }
+        if closer.id != nil { return (closer.id, note, []) }
         // The first pick stands only when the sharper look still puts it first, clearly.
         if let id = first.id, let best = refined.first, best.id == top.id, best.score >= 0.5,
            best.score - (refined.count > 1 ? refined[1].score : -1) >= 0.05 {
-            return (id, note + " kept")
+            return (id, note + " kept", [])
         }
-        return (nil, note + (first.id != nil ? " unconfirmed" : ""))
+        let choices = closer.choices.isEmpty ? first.choices : closer.choices
+        return (nil, note + (first.id != nil ? " unconfirmed" : ""), choices)
     }
 
     private func matchPhotos(hash: UInt64, aspect: Double, thumb: [Double]?, detail: [Double]?) -> Match {
@@ -348,7 +375,8 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         if let id = verdict.id, let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject {
             return Match(asset: asset, closest: distances[position[id] ?? best], note: verdict.note)
         }
-        return Match(asset: nil, closest: bestDistance, note: verdict.note, debug: debug)
+        return Match(asset: nil, closest: bestDistance, note: verdict.note, debug: debug,
+                     choices: verdict.choices)
     }
 
     /// Candidates scored at every cut position in the ranking above.
@@ -378,7 +406,7 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
 
     /// Every library photo placed on the whole screen the way Photos shows it. A quick
     /// pass at 16 cells keeps the 300 closest; those are compared properly.
-    private func matchFitted(_ screen: Screen) -> (asset: PHAsset?, note: String) {
+    private func matchFitted(_ screen: Screen) -> (asset: PHAsset?, note: String, choices: [String]) {
         lock.lock()
         let items = photos
         let generation = photosGeneration
@@ -387,7 +415,7 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         let quickSide = PictureHash.videoSide
         guard !items.isEmpty, screen.thumb.count == PictureHash.thumbSide * PictureHash.thumbSide,
               let quick = PictureHash.FrameQuery(cells: PictureHash.shrink(screen.thumb, to: quickSide), side: quickSide)
-        else { return (nil, "none") }
+        else { return (nil, "none", []) }
         let background = PictureHash.background(screen.thumb, side: PictureHash.thumbSide)
         let key = String(format: "%d %.3f %d", generation, screen.aspect, Int(background / 24))
         if key != fitKey || fitCells.count != items.count {
@@ -421,8 +449,8 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         ranked.sort { $0.score > $1.score }
         let verdict = closerLook(ranked, items: items, at: position, placement: { _ in placement },
                                  detail: screen.detail.isEmpty ? nil : screen.detail, thumb: screen.thumb)
-        guard let id = verdict.id else { return (nil, verdict.note) }
-        return (PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject, verdict.note)
+        guard let id = verdict.id else { return (nil, verdict.note, verdict.choices) }
+        return (PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject, verdict.note, [])
     }
 
     private func matchVideos(placement: PictureHash.Placement, thumb: [Double], detail: [Double]?,
