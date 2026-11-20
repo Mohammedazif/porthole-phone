@@ -4,16 +4,24 @@ import Network
 import Photos
 import UIKit
 
+struct NearbyPC: Identifiable, Equatable {
+    let name: String
+    let address: String
+    var id: String { "\(name) \(address)" }
+}
+
 final class PullClient: ObservableObject {
     @Published var status = "Opening"
     @Published var address = ""
     @Published var code = ""
     @Published private(set) var linked = false
+    @Published private(set) var nearby: [NearbyPC] = []
     @Published private(set) var chosenOriginal = ""
     @Published private(set) var clipStatus = ""
     private let queue = DispatchQueue(label: "porthole.pull")
     private var connection: NWConnection?
     private var browser: NWBrowser?
+    private var finder: NWBrowser?
     private var announcer: NWListener?
     private var buffer = Data()
     private var greeted = false
@@ -72,6 +80,7 @@ final class PullClient: ObservableObject {
         }
         browser.start(queue: queue)
         self.browser = browser
+        startFinder()
         do {
             let listener = try NWListener(using: .tcp)
             listener.service = NWListener.Service(name: "Porthole", type: "_porthole._tcp")
@@ -142,6 +151,21 @@ final class PullClient: ObservableObject {
         status = "Enter the address and code shown on the PC."
     }
 
+    /// Fills the address from a PC found on this Wi-Fi. Connects when a code is already entered.
+    func selectNearby(address: String) -> Bool {
+        let previous = self.address.split(separator: ":").first.map(String.init) ?? self.address
+        if previous != address {
+            code = ""
+        }
+        self.address = address
+        if normalized() != nil {
+            connect()
+            return true
+        }
+        status = "Enter the code shown on the PC."
+        return false
+    }
+
     func connect() {
         guard let fields = normalized() else {
             show("Enter the address and code from F1 help")
@@ -191,6 +215,36 @@ final class PullClient: ObservableObject {
         }
         guard !raw.isEmpty, token.count == 8, token.allSatisfy(\.isHexDigit) else { return nil }
         return (raw, token)
+    }
+
+    private func startFinder() {
+        guard finder == nil else { return }
+        let finder = NWBrowser(for: .bonjour(type: "_porthole-pc._tcp", domain: nil), using: .tcp)
+        finder.browseResultsChangedHandler = { [weak self] results, _ in
+            var found: [NearbyPC] = []
+            for result in results {
+                guard case .service(let name, _, _, _) = result.endpoint else { continue }
+                guard case .bonjour(let txt) = result.metadata, let addr = txt["addr"], Self.isIPv4(addr) else { continue }
+                found.append(NearbyPC(name: name, address: addr))
+            }
+            found.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            DispatchQueue.main.async { self?.nearby = found }
+        }
+        finder.stateUpdateHandler = { [weak self] state in
+            DispatchQueue.main.async { self?.noteBrowse(state) }
+        }
+        finder.start(queue: queue)
+        self.finder = finder
+    }
+
+    private static func isIPv4(_ raw: String) -> Bool {
+        let parts = raw.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return false }
+        for part in parts {
+            if part.count > 1, part.hasPrefix("0") { return false }
+            if UInt8(part) == nil { return false }
+        }
+        return true
     }
 
     private func noteBrowse(_ state: NWBrowser.State) {

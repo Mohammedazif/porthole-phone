@@ -25,6 +25,7 @@
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_porthole._tcp</string>
+		<string>_porthole-pc._tcp</string>
 		<string>_porthole-screen._tcp</string>
 		<string>_porthole-share._tcp</string>
 	</array>

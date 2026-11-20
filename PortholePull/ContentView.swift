@@ -103,8 +103,35 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Find your PC")
                         .font(.largeTitle.bold())
-                    Text("Porthole on this Wi-Fi. Enter the address and code shown on the PC, or tap a PC you have used.")
+                    Text("Porthole on this Wi-Fi. Tap your PC, then enter the code shown on it.")
                         .foregroundStyle(.secondary)
+                }
+                if !client.nearby.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("On this Wi-Fi")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        ForEach(client.nearby) { pc in
+                            Button {
+                                if !client.selectNearby(address: pc.address) {
+                                    enteringPC = true
+                                }
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(pc.name).font(.headline)
+                                        Text(pc.address).font(.subheadline).foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Text("Use").font(.subheadline.weight(.semibold))
+                                }
+                                .padding(16)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(.background, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
                 }
                 if !client.address.isEmpty {
                     Button { client.connect() } label: {
