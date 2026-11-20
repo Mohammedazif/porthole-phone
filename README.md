@@ -2,7 +2,9 @@
 
 The iPhone side of Porthole. Dragging a fullscreen photo off the Porthole window on the PC takes that photo's original file.
 
-The PC listens on TCP port 47731. F1 help on the PC shows the address and the 8-character code. In the app, enter both and tap Connect. Wait until it says Ready and Connected, then open Photos. The app keeps the link in the background, so the mirror can show the photo while the original is sent. You can let go of the drag; the PC waits for the file. Drop it on a folder. The file keeps the camera's name and format.
+The PC listens on TCP port 47731. F1 help on the PC shows the address and the 8-character code. In the app, enter both and tap Connect. Wait until it says Ready and Connected, then open Photos.
+
+Copy and paste use the same connection. Copy on the PC, then paste on the iPhone with Ctrl+V. Copy on the iPhone, open this app, and paste on the PC. Set Settings → Apps → Porthole → Paste from Other Apps to Allow. The app keeps the link in the background, so the mirror can show the photo while the original is sent. You can let go of the drag; the PC waits for the file. Drop it on a folder. The file keeps the camera's name and format.
 
 Bundle id `local.porthole.pull`. The home screen name is Porthole.
 

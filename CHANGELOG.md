@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.16
+
+Copy and paste go both ways while this app is connected. A copy on the PC becomes the iPhone clipboard, and you paste it with Ctrl+V. A copy on the iPhone becomes the PC clipboard when you open Porthole, or when you tap Send clipboard. Text keeps accents and emoji. One picture moves too. Needs the PC build from the same day. Set Settings → Apps → Porthole → Paste from Other Apps to Allow.
+
 ## 2.15
 
 Share > Porthole says the items went to the PC's Downloads: the PC now saves shared items there straight away, and Ctrl+drag takes one item at a time. Includes 2.14's faster search.

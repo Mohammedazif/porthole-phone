@@ -9,6 +9,7 @@ final class PullClient: ObservableObject {
     @Published var address = ""
     @Published var code = ""
     @Published private(set) var chosenOriginal = ""
+    @Published private(set) var clipStatus = ""
     private let queue = DispatchQueue(label: "porthole.pull")
     private var connection: NWConnection?
     private var browser: NWBrowser?
@@ -21,6 +22,20 @@ final class PullClient: ObservableObject {
     private weak var index: PhotoIndex?
     // Accessed only on queue. Explicit selection bypasses visual matching once.
     private var chosenIdentifier: String?
+    private var syncReady = false
+    private var foreground = true
+    private var exporting = false
+    private var bodyLeft = 0
+    private var bodyKind: Character = "T"
+    private var body = Data()
+    private var pendingData: Data?
+    private var pendingKind: Character = "T"
+    private var deferred: (Character, Data)?
+    private var seenCount = -1
+    private var writingRemote = false
+    private var lastSent = ""
+    private var launchSend = true
+    private var pasteObserver: NSObjectProtocol?
 
     func chooseOriginal(_ identifier: String) {
         queue.async {
@@ -78,13 +93,31 @@ final class PullClient: ObservableObject {
     func cameForward() {
         // Silence uses a playback session, and iOS then disables Share screen
         // until mirroring takes the sound away. Play it only in the background.
+        foreground = true
         stay.stop()
+        let board = UIPasteboard.general
+        if let waiting = deferred, board.changeCount == seenCount {
+            deferred = nil
+            applyRemote(kind: waiting.0, data: waiting.1)
+        } else {
+            deferred = nil
+            considerLocal(force: launchSend)
+            launchSend = false
+        }
         guard !greeted, normalized() != nil else { return }
         connect()
     }
 
     func enteredBackground() {
+        foreground = false
+        seenCount = UIPasteboard.general.changeCount
         stay.start()
+    }
+
+    /// Reads the iPhone pasteboard from a tap, which iOS allows even when
+    /// Paste from Other Apps is still Ask.
+    func sendClipboardNow() {
+        considerLocal(force: true)
     }
 
     /// Drops the playback session so the system Share screen button will accept a tap.
@@ -104,6 +137,10 @@ final class PullClient: ObservableObject {
         reconnectWork?.cancel()
         connection?.cancel()
         buffer.removeAll()
+        body.removeAll()
+        bodyLeft = 0
+        syncReady = false
+        exporting = false
         greeted = false
         let link = NWConnection(host: NWEndpoint.Host(fields.host), port: 47731, using: .tcp)
         connection = link
@@ -240,10 +277,30 @@ final class PullClient: ObservableObject {
     }
 
     private func drain() {
+        if bodyLeft > 0 {
+            let take = min(bodyLeft, buffer.count)
+            if take > 0 {
+                body.append(buffer.prefix(take))
+                buffer.removeFirst(take)
+                bodyLeft -= take
+            }
+            if bodyLeft > 0 { return }
+            let payload = body
+            let kind = bodyKind
+            body.removeAll(keepingCapacity: false)
+            applyRemote(kind: kind, data: payload)
+        }
         while let newline = buffer.firstIndex(of: 10) {
             let line = buffer[..<newline]
             buffer.removeSubrange(...newline)
             guard let text = String(data: line, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) else { continue }
+            if let header = clipHeader(text) {
+                bodyKind = header.0
+                bodyLeft = header.1
+                body.removeAll(keepingCapacity: false)
+                drain()
+                return
+            }
             handle(text)
         }
     }
@@ -252,6 +309,18 @@ final class PullClient: ObservableObject {
         if line == "OK" {
             greeted = true
             DispatchQueue.main.async { self.status = "Connected. You can open Photos." }
+            return
+        }
+        if line == "SYNC" {
+            guard greeted else { return }
+            syncReady = true
+            send("SYNC\n")
+            startPasteWatch()
+            DispatchQueue.main.async {
+                self.clipStatus = "Clipboard connected. Paste on the iPhone with Ctrl+V."
+                self.sendLaunchClipboardIfNeeded()
+            }
+            flushClip()
             return
         }
         guard greeted, line.hasPrefix("PULL ") else { return }
@@ -344,15 +413,20 @@ final class PullClient: ObservableObject {
         }
         let kind = asset.mediaType == .video ? "video" : "photo"
         DispatchQueue.main.async { self.status = "Reading that \(kind)" }
+        exporting = true
         PHAssetResourceManager.default().writeData(for: resource, toFile: file, options: options) { [weak self] error in
             guard let self else { return }
-            if error != nil {
-                try? FileManager.default.removeItem(at: file)
-                self.send("MISS\n")
-                DispatchQueue.main.async { self.status = "Could not read that \(kind)" }
-                return
+            self.queue.async {
+                if error != nil {
+                    try? FileManager.default.removeItem(at: file)
+                    self.exporting = false
+                    self.send("MISS\n")
+                    self.flushClip()
+                    DispatchQueue.main.async { self.status = "Could not read that \(kind)" }
+                    return
+                }
+                self.stream(file, name: name)
             }
-            self.stream(file, name: name)
         }
     }
 
@@ -364,12 +438,16 @@ final class PullClient: ObservableObject {
         let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?.int64Value ?? 0
         guard size > 0, let handle = try? FileHandle(forReadingFrom: file), let link = connection else {
             try? FileManager.default.removeItem(at: file)
+            exporting = false
             send("MISS\n")
+            flushClip()
             return
         }
         func finish(_ text: String) {
             try? handle.close()
             try? FileManager.default.removeItem(at: file)
+            exporting = false
+            flushClip()
             DispatchQueue.main.async { self.status = text }
         }
         func next() {
@@ -405,6 +483,165 @@ final class PullClient: ObservableObject {
         }
         if out.isEmpty || out.hasPrefix(".") || !dotted { return nil }
         return out
+    }
+
+    private func sendLaunchClipboardIfNeeded() {
+        guard launchSend else { return }
+        launchSend = false
+        considerLocal(force: true)
+    }
+
+    private func startPasteWatch() {
+        guard pasteObserver == nil else { return }
+        pasteObserver = NotificationCenter.default.addObserver(
+            forName: UIPasteboard.changedNotification, object: UIPasteboard.general, queue: .main
+        ) { [weak self] _ in
+            guard let self, self.foreground else { return }
+            self.considerLocal(force: false)
+        }
+    }
+
+    private func clipHeader(_ line: String) -> (Character, Int)? {
+        let parts = line.split(separator: " ")
+        guard parts.count == 3, parts[0] == "CLIP", let kind = parts[1].first, parts[1].count == 1,
+              kind == "T" || kind == "P", let n = Int(parts[2]), n > 0 else { return nil }
+        let maxN = kind == "T" ? 256 * 1024 : 8 * 1024 * 1024
+        guard n <= maxN else { return nil }
+        return (kind, n)
+    }
+
+    private func considerLocal(force: Bool) {
+        if writingRemote { return }
+        let board = UIPasteboard.general
+        if !force && board.changeCount == seenCount { return }
+        if board.hasImages, let image = board.image, let png = pngData(from: image) {
+            let mark = fingerprint(png)
+            if !force && mark == lastSent {
+                seenCount = board.changeCount
+                return
+            }
+            lastSent = mark
+            seenCount = board.changeCount
+            queueClip(kind: "P", data: png)
+            clipStatus = "Sent the image to the PC"
+            return
+        }
+        if let text = board.string, !text.isEmpty {
+            if isPairingText(text) {
+                seenCount = board.changeCount
+                return
+            }
+            guard let data = text.data(using: .utf8) else { return }
+            if data.count > 256 * 1024 {
+                clipStatus = "That copy is too long to send"
+                seenCount = board.changeCount
+                return
+            }
+            let mark = fingerprint(data)
+            if !force && mark == lastSent {
+                seenCount = board.changeCount
+                return
+            }
+            lastSent = mark
+            seenCount = board.changeCount
+            queueClip(kind: "T", data: data)
+            clipStatus = "Sent the copy to the PC"
+            return
+        }
+        seenCount = board.changeCount
+        if force {
+            clipStatus = "Nothing to send. Settings → Apps → Porthole → Paste from Other Apps → Allow, then copy again."
+        }
+    }
+
+    private func isPairingText(_ text: String) -> Bool {
+        var raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var token = ""
+        let parts = raw.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        if parts.count >= 2 {
+            raw = parts[0]
+            let extra = parts[1].uppercased()
+            if extra.count == 8, extra.allSatisfy(\.isHexDigit) { token = extra }
+        }
+        if let colon = raw.lastIndex(of: ":"), raw.firstIndex(of: ":") == colon {
+            let suffix = raw[raw.index(after: colon)...]
+            if !suffix.isEmpty, suffix.allSatisfy(\.isNumber) {
+                raw = String(raw[..<colon])
+            }
+        }
+        if token.isEmpty { return false }
+        return raw == address && token.uppercased() == code.uppercased()
+    }
+
+    private func queueClip(kind: Character, data: Data) {
+        queue.async {
+            self.pendingKind = kind
+            self.pendingData = data
+            self.flushClip()
+        }
+    }
+
+    private func flushClip() {
+        guard syncReady, !exporting, let data = pendingData, let link = connection else { return }
+        pendingData = nil
+        var packet = Data("CLIP \(pendingKind) \(data.count)\n".utf8)
+        packet.append(data)
+        link.send(content: packet, completion: .contentProcessed { _ in })
+    }
+
+    private func applyRemote(kind: Character, data: Data) {
+        DispatchQueue.main.async {
+            let board = UIPasteboard.general
+            self.writingRemote = true
+            var wrote = false
+            if kind == "T", let text = String(data: data, encoding: .utf8), !text.isEmpty {
+                board.string = text
+                wrote = true
+                self.clipStatus = "PC clipboard is here. Paste with Ctrl+V."
+            } else if kind == "P", let image = UIImage(data: data) {
+                board.image = image
+                wrote = true
+                self.clipStatus = "PC image is here. Paste with Ctrl+V."
+            }
+            if wrote {
+                self.seenCount = board.changeCount
+                self.lastSent = self.fingerprint(data)
+            }
+            self.writingRemote = false
+            if self.foreground {
+                self.deferred = nil
+            } else if wrote {
+                self.deferred = (kind, data)
+            }
+        }
+    }
+
+    private func pngData(from image: UIImage) -> Data? {
+        let maxBytes = 8 * 1024 * 1024
+        var scale: CGFloat = 1
+        for _ in 0..<8 {
+            let current: UIImage
+            if scale < 1 {
+                let size = CGSize(width: max(1, image.size.width * scale),
+                                  height: max(1, image.size.height * scale))
+                let renderer = UIGraphicsImageRenderer(size: size)
+                current = renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: size)) }
+            } else {
+                current = image
+            }
+            if let data = current.pngData(), data.count <= maxBytes { return data }
+            scale *= 0.7
+        }
+        return nil
+    }
+
+    private func fingerprint(_ data: Data) -> String {
+        var hash: UInt64 = 14695981039346656037
+        for byte in data {
+            hash ^= UInt64(byte)
+            hash &*= 1099511628211
+        }
+        return "\(data.count):\(hash)"
     }
 
     private func loadSaved() {

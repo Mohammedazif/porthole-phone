@@ -110,6 +110,17 @@ struct ContentView: View {
                         client.connect()
                     }
                 }
+                Section("Clipboard") {
+                    Text("Copy on the PC, then paste here with Ctrl+V. Copy on this iPhone and it lands on the PC. Set Settings → Apps → Porthole → Paste from Other Apps to Allow.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    Button("Send clipboard to PC") { client.sendClipboardNow() }
+                    if !client.clipStatus.isEmpty {
+                        Text(client.clipStatus)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Section {
                     Text("Open this once, wait until it says Ready and Connected, then open the photo. Drag that picture off the Porthole window. The original file follows the cursor.")
                 }
