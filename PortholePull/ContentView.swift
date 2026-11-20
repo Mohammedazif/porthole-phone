@@ -11,9 +11,17 @@ final class BroadcastTrigger: ObservableObject {
 
     func press() {
         guard let picker else { return }
-        for case let button as UIButton in picker.subviews {
+        for button in Self.buttons(in: picker) {
             button.isEnabled = true
             button.sendActions(for: .touchUpInside)
+        }
+    }
+
+    /// The system button may sit deeper than the picker's first level of views.
+    static func buttons(in view: UIView) -> [UIButton] {
+        view.subviews.flatMap { sub -> [UIButton] in
+            if let button = sub as? UIButton { return [button] }
+            return buttons(in: sub)
         }
     }
 }
@@ -31,7 +39,7 @@ struct BroadcastPicker: UIViewRepresentable {
 
     func updateUIView(_ picker: RPSystemBroadcastPickerView, context: Context) {
         trigger.picker = picker
-        for case let button as UIButton in picker.subviews {
+        for button in BroadcastTrigger.buttons(in: picker) {
             button.isEnabled = true
         }
     }
@@ -44,7 +52,10 @@ struct ContentView: View {
     @StateObject private var broadcast = BroadcastTrigger()
     @State private var choosingOriginal = false
     @State private var enteringPC = false
-    @State private var sharing = false
+    /// iOS is broadcasting this screen (the Start Broadcast sheet was accepted).
+    @State private var captured = false
+    /// The user went Back from the Sharing screen while the broadcast goes on.
+    @State private var hideSharing = false
     @State private var shareStarted = Date()
     @State private var explainingSend = false
     @State private var scanning = false
@@ -59,7 +70,7 @@ struct ContentView: View {
         TabView {
             NavigationStack {
                 Group {
-                    if sharing && client.linked {
+                    if captured && !hideSharing && client.linked {
                         sharingScreen
                     } else if client.linked {
                         connected
@@ -82,11 +93,24 @@ struct ContentView: View {
             client.bind(index: index)
             client.prepare()
             index.requestAccessAndIndex()
+            updateCapture()
+        }
+        // The system broadcast button lives here, outside the screens that come and go:
+        // pressing it after its screen was swapped out showed no Start Broadcast sheet.
+        .background(alignment: .topLeading) {
+            BroadcastPicker(trigger: broadcast)
+                .frame(width: 44, height: 44)
+                .opacity(0.02)
+                .allowsHitTesting(false)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIScreen.capturedDidChangeNotification)) { _ in
+            updateCapture()
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 client.cameForward()
                 index.refreshIfNeeded()
+                updateCapture()
             }
             if phase == .background { client.enteredBackground() }
         }
@@ -218,12 +242,25 @@ struct ContentView: View {
         }
     }
 
+    /// Sharing is on only once iOS says this screen is being broadcast, not on the tap.
+    private func updateCapture() {
+        let now = UIScreen.main.isCaptured
+        if now && !captured {
+            shareStarted = Date()
+            hideSharing = false
+        }
+        captured = now
+    }
+
     private var shareLens: some View {
         Button {
-            client.pauseKeepAlive()
-            shareStarted = Date()
-            sharing = true
-            DispatchQueue.main.async { broadcast.press() }
+            if captured {
+                hideSharing = false
+            } else {
+                // Silent playback disables the system button; stop it, then open the sheet.
+                client.pauseKeepAlive()
+                broadcast.press()
+            }
         } label: {
             ZStack {
                 Circle()
@@ -236,19 +273,13 @@ struct ContentView: View {
                     .modifier(LensGlass())
                 VStack(spacing: 6) {
                     portholeMark
-                    Text("Share screen")
+                    Text(captured ? "Sharing" : "Share screen")
                         .font(.headline)
                         .foregroundStyle(.white)
                 }
             }
         }
         .buttonStyle(.plain)
-        .background {
-            BroadcastPicker(trigger: broadcast)
-                .frame(width: 44, height: 44)
-                .opacity(0.02)
-                .allowsHitTesting(false)
-        }
     }
 
     private var portholeMark: some View {
@@ -262,7 +293,7 @@ struct ContentView: View {
 
     private var sharingScreen: some View {
         VStack(alignment: .leading, spacing: 18) {
-            GlassIconButton(systemImage: "chevron.left", label: "Back") { sharing = false }
+            GlassIconButton(systemImage: "chevron.left", label: "Back") { hideSharing = true }
             Text("LIVE")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.red)
@@ -285,8 +316,8 @@ struct ContentView: View {
             .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
             Spacer()
             GlassCapsuleButton(title: "Stop sharing", systemImage: "stop.fill", prominent: true, tint: .red) {
+                // Opens the system sheet with Stop Broadcast; the screen follows iOS.
                 broadcast.press()
-                sharing = false
             }
         }
         .padding(20)
@@ -392,7 +423,6 @@ struct ContentView: View {
             }
             Section {
                 Button("Forget this PC", role: .destructive) {
-                    sharing = false
                     client.forgetPC()
                 }
             } footer: {
