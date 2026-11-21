@@ -4,6 +4,7 @@ import PhotosUI
 import ReplayKit
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 /// Holds the system broadcast button. iOS disables that button while this app's
 /// silent playback is running, which is the whole time mirroring is off.
@@ -50,6 +51,7 @@ struct BroadcastPicker: UIViewRepresentable {
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.colorScheme) private var colorScheme
     @StateObject private var index = PhotoIndex()
     @StateObject private var client = PullClient()
     @StateObject private var broadcast = BroadcastTrigger()
@@ -116,7 +118,6 @@ struct ContentView: View {
                 client.cameForward()
                 index.refreshIfNeeded()
                 updateCapture()
-                presentArrival()
             }
             if phase == .background { client.enteredBackground() }
         }
@@ -141,9 +142,6 @@ struct ContentView: View {
         .sheet(item: $received) { item in
             ReceivedFileSheet(item: item, client: client)
         }
-        .onChange(of: client.arrival?.id) { _, _ in
-            presentArrival()
-        }
         .onReceive(NotificationCenter.default.publisher(for: .portholeOpenReceived)) { _ in
             openPendingNotice()
         }
@@ -161,11 +159,9 @@ struct ContentView: View {
         received = ReceivedFile(url: url, name: name)
     }
 
-    /// Opens the file that just arrived, then drops the banner so it cannot stay up.
-    private func presentArrival() {
-        guard scenePhase == .active, let arrival = client.arrival, let file = arrival.file else { return }
+    private func openArrival() {
+        guard let arrival = client.arrival, let file = arrival.file else { return }
         received = ReceivedFile(url: file, name: arrival.name)
-        client.clearArrival()
     }
 
     private var findPC: some View {
@@ -208,7 +204,7 @@ struct ContentView: View {
                     Button { client.connect() } label: {
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("Porthole").font(.headline)
+                                Text(client.deviceName.isEmpty ? "Saved device" : client.deviceName).font(.headline)
                                 Text(client.address).font(.subheadline).foregroundStyle(.secondary)
                             }
                             Spacer()
@@ -235,40 +231,58 @@ struct ContentView: View {
         .navigationBarTitleDisplayMode(.inline)
     }
 
+    private var deviceTitle: String {
+        client.deviceName.isEmpty ? "This device" : client.deviceName
+    }
+
+    private var photosLine: String {
+        switch index.accessLabel {
+        case "Allowed": return "Full access, so originals can be sent"
+        case "Limited": return "Limited access. Only the photos you picked can be sent"
+        default: return index.accessLabel
+        }
+    }
+
     private var connected: some View {
         ScrollView {
-            VStack(spacing: 22) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Connected").font(.subheadline).foregroundStyle(.secondary)
-                        Text("Porthole").font(.title2.bold())
-                        Text(client.address).font(.footnote).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(alignment: .center) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            Circle().fill(Color(red: 0.09, green: 0.50, blue: 0.24)).frame(width: 7, height: 7)
+                            Text("Connected")
+                                .font(.subheadline.weight(.medium))
+                                .foregroundStyle(Color(red: 0.09, green: 0.50, blue: 0.24))
+                        }
+                        Text(deviceTitle)
+                            .font(.system(size: 32, weight: .bold))
                     }
                     Spacer()
                     GlassIconButton(systemImage: "arrow.left.arrow.right", label: "Switch PC") {
                         enteringPC = true
                     }
                 }
-                shareLens
-                Text("Tap, then Start Broadcast. Everything on screen, including sound, appears on the PC.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
+                shareStage
                 VStack(spacing: 0) {
-                    statusRow("Mouse and keyboard", client.status, false)
-                    statusRow("Photos", index.status, false)
-                    statusRow("Clipboard", client.clipStatus.isEmpty ? "On while this app is open" : client.clipStatus, true)
-                }
-                .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                HStack(spacing: 12) {
-                    GlassCapsuleButton(title: "Send files", systemImage: "doc") { explainingSend = true }
-                    GlassCapsuleButton(title: "Send clipboard", systemImage: "doc.on.clipboard") {
-                        client.sendClipboardNow()
+                    linkRow("Mouse and keyboard", "Pair in Settings › Bluetooth", green: false) {
+                        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+                        UIApplication.shared.open(url)
                     }
+                    linkRow("Photos", photosLine, green: false) { index.requestAccessAndIndex() }
+                    linkRow("Clipboard sync", client.clipStatus.isEmpty ? "On, both ways" : client.clipStatus, green: false, last: true) {}
+                }
+                .background(cardFill, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                HStack(spacing: 12) {
+                    actionCard("Send files", systemImage: "doc") { explainingSend = true }
+                    actionCard("Send clipboard", systemImage: "doc.on.clipboard") { client.sendClipboardNow() }
                 }
             }
             .padding(20)
         }
+    }
+
+    private var cardFill: Color {
+        Color(.secondarySystemGroupedBackground)
     }
 
     /// Sharing is on only once iOS says this screen is being broadcast, not on the tap.
@@ -279,119 +293,213 @@ struct ContentView: View {
             hideSharing = false
         }
         captured = now
+        client.setScreenCaptured(now)
     }
 
-    private var shareLens: some View {
+    private var shareStage: some View {
         Button {
             if captured {
                 hideSharing = false
             } else {
-                // Silent playback disables the system button; stop it, then open the sheet.
                 client.pauseKeepAlive()
                 broadcast.press()
             }
         } label: {
-            ZStack {
-                Circle()
-                    .fill(Ink.lens)
-                    .frame(width: 168, height: 168)
-                    .overlay {
-                        Circle().strokeBorder(.white.opacity(0.45), lineWidth: 1)
-                    }
-                    .shadow(color: .black.opacity(0.18), radius: 24, y: 10)
-                    .modifier(LensGlass())
-                VStack(spacing: 6) {
-                    portholeMark
-                    Text(captured ? "Sharing" : "Share screen")
-                        .font(.headline)
+            VStack(spacing: 16) {
+                ZStack {
+                    Circle()
+                        .fill(Color.white.opacity(colorScheme == .dark ? 0.08 : 0.06))
+                        .frame(width: 168, height: 168)
+                    Circle()
+                        .strokeBorder(Color.white.opacity(0.35), lineWidth: 1)
+                        .frame(width: 168, height: 168)
+                    ZStack {
+                        VStack(spacing: 10) {
+                            Image(systemName: "iphone")
+                                .font(.title2.weight(.semibold))
+                                .overlay {
+                                    Image(systemName: "arrow.up")
+                                        .font(.caption2.bold())
+                                        .offset(y: -1)
+                                }
+                            Text(captured ? "Sharing" : "Share screen")
+                                .font(.headline)
+                        }
                         .foregroundStyle(.white)
+                        portholeStroke(top: 34, right: 48, width: 4, height: 22, box: 176)
+                        portholeStroke(top: 44, right: 36, width: 4, height: 22, box: 176)
+                    }
+                    .frame(width: 176, height: 176)
                 }
+                Text("Tap, then Start Broadcast. Everything on screen, including sound, appears on the PC.")
+                    .font(.footnote)
+                    .foregroundStyle(Color.white.opacity(0.72))
+                    .multilineTextAlignment(.center)
+            }
+            .padding(.vertical, 28)
+            .padding(.horizontal, 18)
+            .frame(maxWidth: .infinity)
+            .background(Color.black, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var sharingScreen: some View {
+        VStack(spacing: 22) {
+            HStack {
+                GlassIconButton(systemImage: "chevron.left", label: "Back") { hideSharing = true }
+                Spacer()
+                HStack(spacing: 6) {
+                    Circle().fill(Color.red).frame(width: 7, height: 7)
+                    Text("LIVE").font(.caption.weight(.bold))
+                }
+                .foregroundStyle(.red)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(Color.red.opacity(colorScheme == .dark ? 0.22 : 0.12), in: Capsule())
+            }
+            VStack(spacing: 4) {
+                Text("Sharing to")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Text(deviceTitle)
+                    .font(.system(size: 32, weight: .bold))
+            }
+            TimelineView(.periodic(from: shareStarted, by: 1)) { context in
+                let elapsed = max(0, Int(context.date.timeIntervalSince(shareStarted)))
+                ZStack {
+                    Circle()
+                        .fill(colorScheme == .dark ? Color.white.opacity(0.04) : Color.black.opacity(0.04))
+                        .frame(width: 264, height: 264)
+                    Circle()
+                        .fill(colorScheme == .dark ? Color(red: 0.13, green: 0.145, blue: 0.165)
+                                                   : Color(red: 0.886, green: 0.894, blue: 0.910))
+                        .frame(width: 240, height: 240)
+                    ZStack {
+                        Circle()
+                            .fill(colorScheme == .dark ? Color(red: 0.09, green: 0.098, blue: 0.106) : Color.white)
+                        portholeStroke(top: 38, right: 62, width: 5, height: 28, box: 220)
+                        portholeStroke(top: 50, right: 46, width: 5, height: 28, box: 220)
+                        VStack(spacing: 4) {
+                            Text(String(format: "%d:%02d", elapsed / 60, elapsed % 60))
+                                .font(.system(size: 40, weight: .medium, design: .monospaced))
+                                .monospacedDigit()
+                            Text("minutes shared")
+                                .font(.system(size: 13))
+                                .foregroundStyle(Color(red: 0.64, green: 0.64, blue: 0.64))
+                        }
+                    }
+                    .frame(width: 220, height: 220)
+                }
+            }
+            HStack(spacing: 10) {
+                statCard("Picture", "60 fps")
+                statCard("Sound", "On PC")
+                statCard("Controls", "Paired")
+            }
+            Text("You can leave this app. Everything on screen, including notifications, shows on the PC until you stop.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Spacer()
+            Button {
+                broadcast.press()
+            } label: {
+                Text("Stop sharing")
+                    .font(.headline)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 16)
+                    .background(Color.red.opacity(colorScheme == .dark ? 0.22 : 0.12), in: Capsule())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    /// One stroke of the Porthole mark. Both strokes are the same length.
+    private func portholeStroke(top: CGFloat, right: CGFloat, width: CGFloat, height: CGFloat, box: CGFloat) -> some View {
+        Capsule()
+            .fill(Color(red: 0.639, green: 0.639, blue: 0.639))
+            .frame(width: width, height: height)
+            .rotationEffect(.degrees(40))
+            .position(x: box - right - width / 2, y: top + height / 2)
+    }
+
+    private func statCard(_ title: String, _ value: String) -> some View {
+        VStack(spacing: 4) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            Text(value).font(.subheadline.weight(.semibold))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 14)
+        .background(cardFill, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private func linkRow(_ title: String, _ detail: String, green: Bool, last: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 0) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(title).font(.body.weight(.semibold)).foregroundStyle(.primary)
+                        Text(detail)
+                            .font(.footnote)
+                            .foregroundStyle(green ? Color(red: 0.09, green: 0.50, blue: 0.24) : .secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                if !last { Divider().padding(.leading, 16) }
             }
         }
         .buttonStyle(.plain)
     }
 
-    private var portholeMark: some View {
-        ZStack {
-            Circle().stroke(.white.opacity(0.9), lineWidth: 2).frame(width: 36, height: 36)
-            Capsule().fill(.white.opacity(0.85)).frame(width: 16, height: 3).offset(y: -4)
-            Capsule().fill(.white.opacity(0.55)).frame(width: 12, height: 3)
-            Capsule().fill(.white.opacity(0.35)).frame(width: 8, height: 3).offset(y: 4)
+    private func actionCard(_ title: String, systemImage: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 8) {
+                Image(systemName: systemImage)
+                    .font(.title3)
+                Text(title).font(.subheadline.weight(.semibold))
+            }
+            .foregroundStyle(.primary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 18)
+            .background(cardFill, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         }
-    }
-
-    private var sharingScreen: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            GlassIconButton(systemImage: "chevron.left", label: "Back") { hideSharing = true }
-            Text("LIVE")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.red)
-            Text("Sharing to")
-                .foregroundStyle(.secondary)
-            Text("Porthole")
-                .font(.largeTitle.bold())
-            TimelineView(.periodic(from: shareStarted, by: 30)) { context in
-                let minutes = Int(context.date.timeIntervalSince(shareStarted) / 60)
-                Text("\(minutes) \(minutes == 1 ? "minute" : "minutes") shared")
-                    .font(.title3.weight(.semibold))
-            }
-            Text("You can leave this app. Everything on screen, including notifications, shows on the PC until you stop.")
-                .foregroundStyle(.secondary)
-            VStack(spacing: 0) {
-                statusRow("Picture", "Live", false)
-                statusRow("Sound", "On the PC", false)
-                statusRow("Controls", "Use the PC window", true)
-            }
-            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-            Spacer()
-            GlassCapsuleButton(title: "Stop sharing", systemImage: "stop.fill", prominent: true, tint: .red) {
-                // Opens the system sheet with Stop Broadcast; the screen follows iOS.
-                broadcast.press()
-            }
-        }
-        .padding(20)
+        .buttonStyle(.plain)
     }
 
     private var filteredHistory: [PullClient.ActivityItem] {
-        client.history.filter { activityFilter == 0 || (activityFilter == 1) == $0.isFile }
+        client.history.filter { item in
+            switch activityFilter {
+            case 0: return item.isFile && item.incoming
+            case 1: return item.isFile && !item.incoming
+            default: return !item.isFile
+            }
+        }
     }
 
     private var activity: some View {
         List {
             Picker("Show", selection: $activityFilter) {
-                Text("All").tag(0)
-                Text("Files").tag(1)
+                Text("Received").tag(0)
+                Text("Sent").tag(1)
                 Text("Clipboard").tag(2)
             }
             .pickerStyle(.segmented)
             .listRowBackground(Color.clear)
             .listRowInsets(EdgeInsets())
-            if activityFilter != 2 {
-                Section {
-                    if client.chosenOriginal.isEmpty {
-                        Text("If a photo you drag off the PC window isn't the only match, pick it here. Then drag again, and the PC takes the one you chose.")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Label(client.chosenOriginal, systemImage: "checkmark.circle.fill")
-                        Text("On the PC, drag the photo out of the Porthole window.")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                        Button("Cancel selection", role: .cancel) { client.clearChosenOriginal() }
-                    }
-                    GlassCapsuleButton(title: "Pick from library", systemImage: "photo.on.rectangle") {
-                        choosingOriginal = true
-                    }
-                    .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets())
-                } header: {
-                    Text("Photo for the PC")
-                }
-            }
             Section {
                 if filteredHistory.isEmpty {
                     Text(activityFilter == 2 ? "Copy something on either side and it shows here."
-                                             : "Files you send or receive show here.")
+                         : activityFilter == 0 ? "Files from \(client.deviceName.isEmpty ? "the other device" : client.deviceName) show here."
+                         : "Files you send show here.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -400,7 +508,7 @@ struct ContentView: View {
                         Button {
                             received = ReceivedFile(url: url, name: item.title)
                         } label: {
-                            ActivityRow(item: item, canOpen: true)
+                            ActivityRow(item: item, file: url, canOpen: true)
                         }
                         .buttonStyle(.plain)
                     } else {
@@ -418,7 +526,7 @@ struct ContentView: View {
                     }
                 }
             }
-            if activityFilter != 1 {
+            if activityFilter == 2 {
                 Section("Clipboard") {
                     Text(client.clipStatus.isEmpty ? "Copies move both ways while Porthole is open." : client.clipStatus)
                         .font(.footnote)
@@ -428,6 +536,10 @@ struct ContentView: View {
                     }
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets())
+                    PasteButton(supportedContentTypes: [.plainText, .utf8PlainText, .image, .url]) { providers in
+                        client.sendPasted(providers)
+                    }
+                    .listRowBackground(Color.clear)
                 }
             }
         }
@@ -453,14 +565,13 @@ struct ContentView: View {
             Section("Sharing") {
                 LabeledContent("Clipboard sync", value: client.clipStatus.isEmpty ? "On while connected" : "On")
                 LabeledContent("Photos", value: index.accessLabel)
-                LabeledContent("Files to the PC", value: "PC folder")
-                LabeledContent("Files from the PC", value: "In this app")
-                Text("The PC saves files in Downloads unless you choose another folder in its Settings. Files from the PC stay here so you can save or share them.")
+                LabeledContent("Files from \(client.deviceName.isEmpty ? "the device" : client.deviceName)", value: "In this app")
+                Text("Files from \(client.deviceName.isEmpty ? "the device" : client.deviceName) stay in this app so you can save or share them.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
             Section {
-                Button("Forget this PC", role: .destructive) {
+                Button("Forget \(client.deviceName.isEmpty ? "this device" : client.deviceName)", role: .destructive) {
                     client.forgetPC()
                 }
             } footer: {
@@ -480,9 +591,6 @@ struct ContentView: View {
                 TextField("Code from the PC", text: $client.code)
                     .textInputAutocapitalization(.characters)
                     .autocorrectionDisabled()
-                Text("You can paste the whole line from the PC into the address. Port 47731.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
             }
             .navigationTitle("This PC")
             .navigationBarTitleDisplayMode(.inline)
@@ -546,26 +654,22 @@ struct ContentView: View {
 
     private func arrivalBanner(_ arrival: PullClient.Arrival) -> some View {
         HStack(spacing: 12) {
-            Button {
-                presentArrival()
-            } label: {
-                HStack(spacing: 12) {
-                    Image(systemName: "doc.fill")
-                        .font(.title3)
-                        .frame(width: 40, height: 40)
-                        .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("\(arrival.name) received")
-                            .font(.subheadline.weight(.semibold))
-                            .lineLimit(1)
-                        Text("Tap to save or share")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-                }
+            FileMark(name: arrival.name, file: arrival.file)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(arrival.name) received")
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                Text("Saved to Files › Porthole")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
-            .buttonStyle(.plain)
             Spacer(minLength: 8)
+            if arrival.file != nil {
+                Button("Open", action: openArrival)
+                    .font(.subheadline.weight(.semibold))
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
             Button {
                 client.clearArrival()
             } label: {
@@ -578,16 +682,12 @@ struct ContentView: View {
             .accessibilityLabel("Close")
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 6)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .padding(.vertical, 10)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
         .padding(.horizontal, 12)
+        .padding(.top, 4)
+        .shadow(color: .black.opacity(0.12), radius: 16, y: 8)
         .transition(.move(edge: .top).combined(with: .opacity))
-        .task(id: arrival.id) {
-            try? await Task.sleep(nanoseconds: 4_000_000_000)
-            if scenePhase == .active, client.arrival?.id == arrival.id {
-                client.clearArrival()
-            }
-        }
     }
 
     private func applyScan(_ text: String) {
@@ -611,9 +711,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 16) {
                 Text("Share from any app")
                     .font(.title2.bold())
-                Text("In Files, Photos, Voice Memos, or Mail, select the items and tap Share, then Porthole. The PC keeps the original file. It goes to Downloads unless you choose another folder in the PC app's Settings.")
-                    .foregroundStyle(.secondary)
-                Text("To send one photo the PC could not match, use Activity › Pick from library, then drag that card out of the PC window.")
+                Text("In Files, Photos, Voice Memos, or Mail, select the items and tap Share, then Porthole. \(client.deviceName.isEmpty ? "The device" : client.deviceName) keeps the original file.")
                     .foregroundStyle(.secondary)
                 Spacer()
             }
@@ -627,22 +725,6 @@ struct ContentView: View {
             }
         }
         .presentationDetents([.medium])
-    }
-
-    private func statusRow(_ name: String, _ state: String, _ last: Bool) -> some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text(name)
-                Spacer()
-                Text(state)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.trailing)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-            if !last { Divider().padding(.leading, 16) }
-        }
     }
 
     private func check(_ name: String, _ help: String) -> some View {
@@ -831,18 +913,119 @@ struct OriginalPicker: UIViewControllerRepresentable {
     }
 }
 
+/// A picture when the file is one, otherwise the type (PDF, ZIP) on a page.
+private struct FileMark: View {
+    let name: String
+    var file: URL?
+    var glyph: String?
+    @State private var image: UIImage?
+
+    var body: some View {
+        ZStack {
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else if let glyph {
+                Text(glyph)
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.primary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.primary.opacity(0.06))
+            } else {
+                TypeChip(name: name)
+            }
+        }
+        .frame(width: 36, height: 44)
+        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+        .task(id: file?.path) {
+            image = file.flatMap { FileThumb.image(url: $0) }
+        }
+    }
+}
+
+private struct TypeChip: View {
+    let name: String
+
+    private var tag: String {
+        let ext = (name as NSString).pathExtension
+        if ext.isEmpty { return "FILE" }
+        return String(ext.prefix(4)).uppercased()
+    }
+
+    private var ink: Color {
+        switch (name as NSString).pathExtension.lowercased() {
+        case "pdf": return Color(red: 0.70, green: 0.14, blue: 0.09)
+        case "zip", "7z", "rar": return Color(red: 0.48, green: 0.35, blue: 0.07)
+        case "m4a", "mp3", "wav", "aac": return Color(red: 0.36, green: 0.24, blue: 0.54)
+        case "doc", "docx": return Color(red: 0.18, green: 0.37, blue: 0.54)
+        default: return Color(red: 0.29, green: 0.31, blue: 0.33)
+        }
+    }
+
+    var body: some View {
+        ZStack(alignment: .bottomLeading) {
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .fill(Color.white)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+                }
+            Text(tag)
+                .font(.system(size: 8, weight: .bold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 3)
+                .padding(.vertical, 1)
+                .background(ink, in: RoundedRectangle(cornerRadius: 2, style: .continuous))
+                .padding(.leading, 2)
+                .padding(.bottom, 5)
+        }
+    }
+}
+
+private enum FileThumb {
+    static func image(url: URL) -> UIImage? {
+        let ext = url.pathExtension.lowercased()
+        if ["jpg", "jpeg", "png", "heic", "heif", "gif", "tif", "tiff", "webp", "bmp"].contains(ext) {
+            let source = CGImageSourceCreateWithURL(url as CFURL, nil)
+            let options: [CFString: Any] = [
+                kCGImageSourceThumbnailMaxPixelSize: 160,
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true
+            ]
+            if let source, let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
+                return UIImage(cgImage: cg)
+            }
+            return UIImage(contentsOfFile: url.path)
+        }
+        guard ["mov", "mp4", "m4v"].contains(ext) else { return nil }
+        let asset = AVAsset(url: url)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 160, height: 160)
+        let time = CMTime(seconds: 0.2, preferredTimescale: 600)
+        guard let cg = try? generator.copyCGImage(at: time, actualTime: nil) else { return nil }
+        return UIImage(cgImage: cg)
+    }
+}
+
 /// One line of Activity: which way it went, what, and when.
 private struct ActivityRow: View {
     let item: PullClient.ActivityItem
+    var file: URL?
     var canOpen = false
+
+    private var glyph: String? {
+        guard !item.isFile else { return nil }
+        let title = item.title
+        if title == "Picture" { return "IMG" }
+        if title.hasPrefix("http://") || title.hasPrefix("https://") { return "↗" }
+        return "Aa"
+    }
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: item.isFile ? (item.incoming ? "arrow.down.doc" : "arrow.up.doc")
-                                          : "doc.on.clipboard")
-                .font(.body)
-                .frame(width: 36, height: 36)
-                .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            FileMark(name: item.title, file: item.isFile ? file : nil, glyph: glyph)
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.title)
                     .font(.subheadline.weight(.medium))

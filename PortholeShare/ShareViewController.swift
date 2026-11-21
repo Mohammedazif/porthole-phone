@@ -1,3 +1,5 @@
+import AVFoundation
+import ImageIO
 import Network
 import UIKit
 import UniformTypeIdentifiers
@@ -6,18 +8,16 @@ import UniformTypeIdentifiers
 /// files themselves to Porthole on the PC, which saves them in the folder set there. Nothing is
 /// matched: these are exactly the items picked.
 final class ShareViewController: UIViewController {
+    private let titleLabel = UILabel()
     private let status = UILabel()
     private let bar = UIProgressView(progressViewStyle: .bar)
     private let button = UIButton(type: .custom)
     private let fileStack = UIStackView()
-    private let sizeLabel = UILabel()
     private let pcName = UILabel()
     private let change = UIButton(type: .system)
     private var sheet: UIStackView?
     private var marks: [UIImageView] = []
     private var readyToSend = false
-    /// Folder name advertised by the PC. Nil until that record arrives.
-    private var savePlace: String?
 
     /// Everything below is touched only on this queue.
     private let queue = DispatchQueue(label: "porthole.share")
@@ -36,9 +36,8 @@ final class ShareViewController: UIViewController {
         view.backgroundColor = .systemBackground
         preferredContentSize = CGSize(width: 420, height: 320)
 
-        let title = UILabel()
-        title.text = "Send to PC"
-        title.font = .systemFont(ofSize: 22, weight: .bold)
+        titleLabel.text = "Send to this device"
+        titleLabel.font = .systemFont(ofSize: 22, weight: .bold)
         let closeButton = UIButton(type: .close)
         closeButton.addTarget(self, action: #selector(ShareViewController.close), for: .touchUpInside)
         #if compiler(>=6.2)
@@ -50,7 +49,7 @@ final class ShareViewController: UIViewController {
         #endif
 
         let pc = pcName
-        pc.text = "Looking for your PC"
+        pc.text = "Looking for this device"
         pc.font = .systemFont(ofSize: 17, weight: .semibold)
         var changeConfig = UIButton.Configuration.plain()
         changeConfig.title = "Change"
@@ -59,9 +58,9 @@ final class ShareViewController: UIViewController {
         change.showsMenuAsPrimaryAction = true
         change.isHidden = true
         status.font = .systemFont(ofSize: 14)
-        status.textColor = .secondaryLabel
+        status.textColor = UIColor(red: 0.09, green: 0.50, blue: 0.24, alpha: 1)
         status.numberOfLines = 2
-        status.text = "Getting the originals ready"
+        status.text = "Looking for this device"
         let pcText = UIStackView(arrangedSubviews: [pc, status])
         pcText.axis = .vertical
         pcText.spacing = 2
@@ -88,18 +87,16 @@ final class ShareViewController: UIViewController {
         button.isEnabled = false
         button.addTarget(self, action: #selector(sendTapped), for: .touchUpInside)
 
-        let header = UIStackView(arrangedSubviews: [title, closeButton])
+        let header = UIStackView(arrangedSubviews: [titleLabel, closeButton])
         header.axis = .horizontal
         header.alignment = .center
-        let body = UIStackView(arrangedSubviews: [header, pcColumn, filesCard, sizeLabel, bar, button])
+        let body = UIStackView(arrangedSubviews: [header, pcColumn, filesCard, bar, button])
         body.axis = .vertical
         body.spacing = 14
         body.translatesAutoresizingMaskIntoConstraints = false
         body.setContentHuggingPriority(.required, for: .vertical)
         sheet = body
         view.addSubview(body)
-        sizeLabel.font = .systemFont(ofSize: 13)
-        sizeLabel.textColor = .secondaryLabel
         let bottom = body.bottomAnchor.constraint(lessThanOrEqualTo: view.bottomAnchor, constant: -16)
         NSLayoutConstraint.activate([
             body.topAnchor.constraint(equalTo: view.topAnchor, constant: 18),
@@ -131,11 +128,25 @@ final class ShareViewController: UIViewController {
         return config
     }
 
-    private func placeLine() -> String {
-        if let savePlace, !savePlace.isEmpty {
-            return "Saves in \(savePlace)"
+    /// The Bonjour name is this PC's hostname.
+    private func deviceTitle(_ raw: String?) -> String? {
+        let name = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if name.isEmpty || name == "Looking for this device" {
+            return nil
         }
-        return "Saves in the folder set on this PC"
+        return name
+    }
+
+    private func showDestination() {
+        let device = deviceTitle(pcName.text)
+        titleLabel.text = device.map { "Send to \($0)" } ?? "Send to this device"
+        if device != nil {
+            status.text = "Connected"
+            status.textColor = UIColor(red: 0.09, green: 0.50, blue: 0.24, alpha: 1)
+        } else {
+            status.text = "Looking for this device"
+            status.textColor = .secondaryLabel
+        }
     }
 
     override func viewDidLayoutSubviews() {
@@ -174,22 +185,17 @@ final class ShareViewController: UIViewController {
         let found = NWBrowser(for: .bonjour(type: "_porthole-share._tcp", domain: nil), using: .tcp)
         found.browseResultsChangedHandler = { [weak self] results, _ in
             guard let self, !self.stopped else { return }
-            let pcs = results.compactMap { result -> (String, NWEndpoint, String?)? in
+            let pcs = results.compactMap { result -> (String, NWEndpoint)? in
                 guard case let .service(name, _, _, _) = result.endpoint else { return nil }
-                var folder: String?
-                if case let .bonjour(txt) = result.metadata {
-                    folder = txt["dir"]
-                }
-                return (name, result.endpoint, folder)
+                return (name, result.endpoint)
             }.sorted { $0.0 < $1.0 }
             if self.chosen == nil || !pcs.contains(where: { $0.1 == self.chosen }) {
                 self.chosen = pcs.first?.1
             }
             let current = pcs.first(where: { $0.1 == self.chosen })
             DispatchQueue.main.async {
-                self.pcName.text = current?.0 ?? "Looking for your PC"
-                self.savePlace = current?.2
-                if self.readyToSend { self.status.text = self.placeLine() }
+                self.pcName.text = current?.0 ?? "Looking for this device"
+                self.showDestination()
                 self.change.isHidden = pcs.count < 2
                 self.change.menu = UIMenu(children: pcs.map { pc in
                     UIAction(title: pc.0, state: pc.0 == current?.0 ? .on : .off) { [weak self] _ in
@@ -197,8 +203,7 @@ final class ShareViewController: UIViewController {
                             self?.chosen = pc.1
                             DispatchQueue.main.async {
                                 self?.pcName.text = pc.0
-                                self?.savePlace = pc.2
-                                if self?.readyToSend == true { self?.status.text = self?.placeLine() }
+                                self?.showDestination()
                             }
                         }
                     }
@@ -225,41 +230,40 @@ final class ShareViewController: UIViewController {
 
     /// Lists every file and waits for Send. Nothing goes to the PC until that tap.
     private func presentFile() {
-        let rows = files.map { file -> (String, Int64) in
+        let rows = files.map { file -> (URL, String, Int64) in
             let size = (try? FileManager.default.attributesOfItem(atPath: file.url.path)[.size] as? NSNumber)?.int64Value ?? 0
-            return (file.name, size)
+            return (file.url, file.name, size)
         }
-        let total = rows.reduce(Int64(0)) { $0 + $1.1 }
+        let total = rows.reduce(Int64(0)) { $0 + $1.2 }
         DispatchQueue.main.async {
             self.fileStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
             self.marks = []
             for (index, row) in rows.enumerated() {
-                let icon = UIImageView(image: UIImage(systemName: "doc.fill"))
-                icon.tintColor = .secondaryLabel
-                icon.contentMode = .scaleAspectFit
-                icon.setContentHuggingPriority(.required, for: .horizontal)
-                icon.widthAnchor.constraint(equalToConstant: 22).isActive = true
-                icon.heightAnchor.constraint(equalToConstant: 22).isActive = true
+                let icon = ShareViewController.fileMark(url: row.0, name: row.1)
+                let text = UIStackView()
+                text.axis = .vertical
+                text.spacing = 1
                 let name = UILabel()
-                name.text = row.0
+                name.text = row.1
                 name.font = .systemFont(ofSize: 15, weight: .medium)
                 name.lineBreakMode = .byTruncatingMiddle
                 name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
                 let bytes = UILabel()
-                bytes.text = ByteCountFormatter.string(fromByteCount: row.1, countStyle: .file)
+                bytes.text = ByteCountFormatter.string(fromByteCount: row.2, countStyle: .file)
                 bytes.font = .systemFont(ofSize: 13)
                 bytes.textColor = .secondaryLabel
-                bytes.setContentHuggingPriority(.required, for: .horizontal)
+                text.addArrangedSubview(name)
+                text.addArrangedSubview(bytes)
                 let mark = UIImageView(image: UIImage(systemName: "checkmark.circle.fill"))
                 mark.tintColor = .systemGreen
                 mark.alpha = 0
                 mark.setContentHuggingPriority(.required, for: .horizontal)
                 self.marks.append(mark)
-                let line = UIStackView(arrangedSubviews: [icon, name, bytes, mark])
+                let line = UIStackView(arrangedSubviews: [icon, text, mark])
                 line.axis = .horizontal
-                line.spacing = 8
+                line.spacing = 12
                 line.alignment = .center
-                line.layoutMargins = UIEdgeInsets(top: 10, left: 0, bottom: 10, right: 0)
+                line.layoutMargins = UIEdgeInsets(top: 8, left: 2, bottom: 8, right: 0)
                 line.isLayoutMarginsRelativeArrangement = true
                 if index < rows.count - 1 {
                     let wrap = UIStackView(arrangedSubviews: [line])
@@ -275,13 +279,92 @@ final class ShareViewController: UIViewController {
                 }
             }
             let count = rows.count
-            self.sizeLabel.text = count == 1 ? nil : ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
-            self.sizeLabel.isHidden = count < 2
-            self.status.text = self.placeLine()
-            self.setButton(count == 1 ? "Send" : "Send \(count) files")
+            let size = ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
             self.readyToSend = true
+            self.showDestination()
+            self.setButton(count == 1 ? "Send · \(size)" : "Send \(count) files · \(size)")
             self.button.isEnabled = true
         }
+    }
+
+    /// Photo and video rows show the picture. Everything else shows its type.
+    private static func fileMark(url: URL, name: String) -> UIView {
+        let box = UIView()
+        box.translatesAutoresizingMaskIntoConstraints = false
+        box.widthAnchor.constraint(equalToConstant: 36).isActive = true
+        box.heightAnchor.constraint(equalToConstant: 44).isActive = true
+        box.layer.cornerRadius = 5
+        box.layer.cornerCurve = .continuous
+        box.clipsToBounds = true
+        if let image = thumbnail(url: url) {
+            let view = UIImageView(image: image)
+            view.contentMode = .scaleAspectFill
+            view.translatesAutoresizingMaskIntoConstraints = false
+            box.addSubview(view)
+            NSLayoutConstraint.activate([
+                view.topAnchor.constraint(equalTo: box.topAnchor),
+                view.bottomAnchor.constraint(equalTo: box.bottomAnchor),
+                view.leadingAnchor.constraint(equalTo: box.leadingAnchor),
+                view.trailingAnchor.constraint(equalTo: box.trailingAnchor),
+            ])
+            return box
+        }
+        box.backgroundColor = .systemBackground
+        box.layer.borderWidth = 1.0 / UIScreen.main.scale
+        box.layer.borderColor = UIColor.separator.cgColor
+        let ext = (name as NSString).pathExtension
+        let tag = UILabel()
+        tag.text = ext.isEmpty ? "FILE" : String(ext.prefix(4)).uppercased()
+        tag.font = .systemFont(ofSize: 8, weight: .bold)
+        tag.textColor = .white
+        tag.backgroundColor = chipColor(ext)
+        tag.textAlignment = .center
+        tag.layer.cornerRadius = 2
+        tag.clipsToBounds = true
+        tag.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(tag)
+        NSLayoutConstraint.activate([
+            tag.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: -2),
+            tag.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -6),
+            tag.heightAnchor.constraint(equalToConstant: 12),
+            tag.widthAnchor.constraint(greaterThanOrEqualToConstant: 22),
+        ])
+        return box
+    }
+
+    private static func chipColor(_ ext: String) -> UIColor {
+        switch ext.lowercased() {
+        case "pdf": return UIColor(red: 0.70, green: 0.14, blue: 0.09, alpha: 1)
+        case "zip", "7z", "rar": return UIColor(red: 0.48, green: 0.35, blue: 0.07, alpha: 1)
+        case "m4a", "mp3", "wav", "aac": return UIColor(red: 0.36, green: 0.24, blue: 0.54, alpha: 1)
+        case "doc", "docx": return UIColor(red: 0.18, green: 0.37, blue: 0.54, alpha: 1)
+        default: return UIColor(red: 0.29, green: 0.31, blue: 0.33, alpha: 1)
+        }
+    }
+
+    private static func thumbnail(url: URL) -> UIImage? {
+        let ext = url.pathExtension.lowercased()
+        if ["jpg", "jpeg", "png", "heic", "heif", "gif", "tif", "tiff", "webp", "bmp"].contains(ext) {
+            let source = CGImageSourceCreateWithURL(url as CFURL, nil)
+            let options: [CFString: Any] = [
+                kCGImageSourceThumbnailMaxPixelSize: 160,
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true
+            ]
+            if let source, let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
+                return UIImage(cgImage: cg)
+            }
+            return UIImage(contentsOfFile: url.path)
+        }
+        guard ["mov", "mp4", "m4v"].contains(ext) else { return nil }
+        let asset = AVAsset(url: url)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 160, height: 160)
+        guard let cg = try? generator.copyCGImage(at: CMTime(seconds: 0.2, preferredTimescale: 600), actualTime: nil) else {
+            return nil
+        }
+        return UIImage(cgImage: cg)
     }
 
     private func pulse(_ on: Bool) {
@@ -309,6 +392,7 @@ final class ShareViewController: UIViewController {
     private func say(_ text: String, progress: Float? = nil) {
         DispatchQueue.main.async {
             self.status.text = text
+            self.status.textColor = .secondaryLabel
             if let progress {
                 self.bar.isHidden = false
                 self.bar.setProgress(progress, animated: true)
@@ -544,7 +628,9 @@ final class ShareViewController: UIViewController {
         let count = files.count
         stop()
         DispatchQueue.main.async {
-            self.status.text = count == 1 ? "Sent to Porthole" : "Sent \(count) files to Porthole"
+            let device = self.deviceTitle(self.pcName.text) ?? "this device"
+            self.status.textColor = UIColor(red: 0.09, green: 0.50, blue: 0.24, alpha: 1)
+            self.status.text = count == 1 ? "Sent to \(device)" : "Sent \(count) files to \(device)"
             self.bar.isHidden = false
             self.bar.setProgress(1, animated: true)
             self.readyToSend = false

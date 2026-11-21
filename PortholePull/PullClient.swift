@@ -3,6 +3,7 @@ import Foundation
 import Network
 import Photos
 import UIKit
+import UniformTypeIdentifiers
 import UserNotifications
 
 extension Notification.Name {
@@ -13,14 +14,15 @@ enum PhoneNotice {
     static func arm() {
         let center = UNUserNotificationCenter.current()
         center.delegate = NoticeDelegate.shared
-        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        center.requestAuthorization(options: [.alert, .sound, .timeSensitive]) { _, _ in }
     }
 
-    static func fileArrived(_ name: String) {
+    static func fileArrived(_ name: String, from device: String) {
         let content = UNMutableNotificationContent()
-        content.title = "File from your PC"
+        content.title = device.isEmpty ? "File received" : "File from \(device)"
         content.body = name
         content.sound = .default
+        content.interruptionLevel = .timeSensitive
         content.userInfo = ["file": name]
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
@@ -60,6 +62,8 @@ final class PullClient: ObservableObject {
     @Published var address = ""
     @Published var code = ""
     @Published private(set) var linked = false
+    /// The PC's hostname, as advertised on this Wi-Fi.
+    @Published private(set) var deviceName = ""
     @Published private(set) var nearby: [NearbyPC] = []
     @Published private(set) var chosenOriginal = ""
     @Published private(set) var clipStatus = ""
@@ -173,9 +177,25 @@ final class PullClient: ObservableObject {
     }
 
     /// Callable from any queue; the list lives on the main thread.
+    private func deviceTitle() -> String {
+        let name = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if name.isEmpty { return "this device" }
+        return name
+    }
+
+    private func adoptDeviceName() {
+        let host = address.split(separator: ":").first.map(String.init) ?? address
+        guard let match = nearby.first(where: { $0.address == host }) else { return }
+        let name = match.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        deviceName = name
+        UserDefaults.standard.set(name, forKey: "porthole.device")
+    }
+
     private func note(_ title: String, _ detail: String, file: Bool, incoming: Bool, path: String? = nil) {
         DispatchQueue.main.async {
-            self.history.insert(ActivityItem(title: title, detail: detail, isFile: file, incoming: incoming, path: path), at: 0)
+            let shown = detail.replacingOccurrences(of: "the PC", with: self.deviceTitle())
+            self.history.insert(ActivityItem(title: title, detail: shown, isFile: file, incoming: incoming, path: path), at: 0)
             if self.history.count > PullClient.historyLimit {
                 self.history.removeLast(self.history.count - PullClient.historyLimit)
             }
@@ -234,17 +254,59 @@ final class PullClient: ObservableObject {
             applyRemote(kind: waiting.0, data: waiting.1)
         } else {
             deferred = nil
-            considerLocal(force: launchSend)
+            considerLocal(force: false, announceEmpty: false)
             launchSend = false
         }
         guard !greeted, normalized() != nil else { return }
         connect()
     }
 
+    private var screenCaptured = false
+
+    /// A playback session hides the banners a broadcast is supposed to show.
+    /// While the screen is shared, stay quiet so those notices appear on the PC.
+    func setScreenCaptured(_ on: Bool) {
+        screenCaptured = on
+        if on {
+            stay.stop()
+        } else if !foreground {
+            stay.start()
+        }
+    }
+
     func enteredBackground() {
         foreground = false
-        seenCount = UIPasteboard.general.changeCount
-        stay.start()
+        if !screenCaptured { stay.start() }
+    }
+
+    /// A Paste button handed over text or a picture. iOS only reveals another
+    /// app's copy through that button, so this is what puts it on the PC.
+    func sendPasted(_ providers: [NSItemProvider]) {
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                provider.loadObject(ofClass: UIImage.self) { object, _ in
+                    guard let image = object as? UIImage else { return }
+                    DispatchQueue.main.async { self.deliverImage(image) }
+                }
+                return
+            }
+            if provider.hasItemConformingToTypeIdentifier(UTType.url.identifier) {
+                provider.loadObject(ofClass: URL.self) { object, _ in
+                    guard let url = object as? URL else { return }
+                    DispatchQueue.main.async { self.deliverText(url.absoluteString) }
+                }
+                return
+            }
+            if provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier)
+                || provider.hasItemConformingToTypeIdentifier(UTType.utf8PlainText.identifier) {
+                provider.loadObject(ofClass: NSString.self) { object, _ in
+                    guard let text = object as? String, !text.isEmpty else { return }
+                    DispatchQueue.main.async { self.deliverText(text) }
+                }
+                return
+            }
+        }
+        clipStatus = "Tap Paste to send what you copied to \(deviceTitle())."
     }
 
     /// Reads the iPhone pasteboard from a tap, which iOS allows even when
@@ -271,13 +333,15 @@ final class PullClient: ObservableObject {
         clipStatus = ""
         arrival = nil
         choiceIDs = []
+        deviceName = ""
+        UserDefaults.standard.removeObject(forKey: "porthole.device")
         queue.async {
             self.choicePending = false
             self.abortPush()
         }
         UserDefaults.standard.removeObject(forKey: "porthole.host")
         UserDefaults.standard.removeObject(forKey: "porthole.code")
-        status = "Enter the address and code shown on the PC."
+        status = "Enter the address and code shown on the device."
     }
 
     /// Fills the address from a PC found on this Wi-Fi. Connects when a code is already entered.
@@ -287,11 +351,12 @@ final class PullClient: ObservableObject {
             code = ""
         }
         self.address = address
+        adoptDeviceName()
         if normalized() != nil {
             connect()
             return true
         }
-        status = "Enter the code shown on the PC."
+        status = "Enter the code shown on the device."
         return false
     }
 
@@ -359,7 +424,10 @@ final class PullClient: ObservableObject {
                 found.append(NearbyPC(name: name, address: addr))
             }
             found.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-            DispatchQueue.main.async { self?.nearby = found }
+            DispatchQueue.main.async {
+                self?.nearby = found
+                self?.adoptDeviceName()
+            }
         }
         finder.stateUpdateHandler = { [weak self] state in
             DispatchQueue.main.async { self?.noteBrowse(state) }
@@ -536,6 +604,12 @@ final class PullClient: ObservableObject {
             syncReady = true
             send("SYNC\n")
             send("FILES\n")
+            let device = UIDevice.current.name
+                .replacingOccurrences(of: "\n", with: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !device.isEmpty {
+                send("NAME \(String(device.prefix(40)))\n")
+            }
             startPasteWatch()
             DispatchQueue.main.async {
                 self.clipStatus = "Clipboard connected. Paste on the iPhone with Ctrl+V."
@@ -869,7 +943,7 @@ final class PullClient: ObservableObject {
         DispatchQueue.main.async {
             self.arrival = Arrival(name: name, file: file)
             self.status = "\(name) received"
-            PhoneNotice.fileArrived(name)
+            PhoneNotice.fileArrived(name, from: self.deviceTitle())
         }
     }
 
@@ -930,6 +1004,11 @@ final class PullClient: ObservableObject {
         if writingRemote { return }
         let board = UIPasteboard.general
         if !force && board.changeCount == seenCount { return }
+        if let url = board.url, board.string == nil, !board.hasImages {
+            deliverText(url.absoluteString)
+            seenCount = board.changeCount
+            return
+        }
         if board.hasImages, let image = board.image, let png = pngData(from: image) {
             let mark = fingerprint(png)
             if !force && mark == lastSent {
@@ -939,7 +1018,7 @@ final class PullClient: ObservableObject {
             lastSent = mark
             seenCount = board.changeCount
             queueClip(kind: "P", data: png)
-            clipStatus = "Sent the image to the PC"
+            clipStatus = "Sent the image to \(deviceTitle())"
             note("Picture", "Copied to the PC", file: false, incoming: false)
             return
         }
@@ -962,14 +1041,50 @@ final class PullClient: ObservableObject {
             lastSent = mark
             seenCount = board.changeCount
             queueClip(kind: "T", data: data)
-            clipStatus = "Sent the copy to the PC"
+            clipStatus = "Sent the copy to \(deviceTitle())"
             note(PullClient.preview(text), "Copied to the PC", file: false, incoming: false)
+            return
+        }
+        // Another app's copy stays hidden until the user taps Paste. Do not
+        // mark it seen, or the next open gives up on it.
+        if board.hasStrings || board.hasImages || board.hasURLs {
+            clipStatus = "Tap Paste to send this copy to \(deviceTitle())."
             return
         }
         seenCount = board.changeCount
         if force && announceEmpty {
-            clipStatus = "Nothing to send. Settings → Apps → Porthole → Paste from Other Apps → Allow, then copy again."
+            clipStatus = "Nothing to send. Copy on this iPhone, then tap Paste."
         }
+    }
+
+    private func deliverText(_ text: String) {
+        guard let data = text.data(using: .utf8), !data.isEmpty else { return }
+        if isPairingText(text) {
+            seenCount = UIPasteboard.general.changeCount
+            return
+        }
+        if data.count > 256 * 1024 {
+            clipStatus = "That copy is too long to send"
+            seenCount = UIPasteboard.general.changeCount
+            return
+        }
+        lastSent = fingerprint(data)
+        seenCount = UIPasteboard.general.changeCount
+        queueClip(kind: "T", data: data)
+        clipStatus = "Sent the copy to \(deviceTitle())"
+        note(PullClient.preview(text), "Copied to the PC", file: false, incoming: false)
+    }
+
+    private func deliverImage(_ image: UIImage) {
+        guard let png = pngData(from: image) else {
+            clipStatus = "That picture could not be sent"
+            return
+        }
+        lastSent = fingerprint(png)
+        seenCount = UIPasteboard.general.changeCount
+        queueClip(kind: "P", data: png)
+        clipStatus = "Sent the image to \(deviceTitle())"
+        note("Picture", "Copied to the PC", file: false, incoming: false)
     }
 
     private func isPairingText(_ text: String) -> Bool {
@@ -1015,12 +1130,12 @@ final class PullClient: ObservableObject {
             if kind == "T", let text = String(data: data, encoding: .utf8), !text.isEmpty {
                 board.string = text
                 wrote = true
-                self.clipStatus = "PC clipboard is here. Paste with Ctrl+V."
+                self.clipStatus = "\(self.deviceTitle()) clipboard is here. Paste with Ctrl+V."
                 self.note(PullClient.preview(text), "Copied from the PC", file: false, incoming: true)
             } else if kind == "P", let image = UIImage(data: data) {
                 board.image = image
                 wrote = true
-                self.clipStatus = "PC image is here. Paste with Ctrl+V."
+                self.clipStatus = "\(self.deviceTitle()) image is here. Paste with Ctrl+V."
                 self.note("Picture", "Copied from the PC", file: false, incoming: true)
             }
             if wrote {
@@ -1071,6 +1186,9 @@ final class PullClient: ObservableObject {
         }
         if code.isEmpty, let token = defaults.string(forKey: "porthole.code") {
             code = token
+        }
+        if deviceName.isEmpty, let saved = defaults.string(forKey: "porthole.device"), !saved.isEmpty {
+            deviceName = saved
         }
         guard normalized() == nil, let pasted = UIPasteboard.general.string else { return }
         let savedAddress = address
