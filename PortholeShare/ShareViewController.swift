@@ -100,10 +100,18 @@ final class ShareViewController: UIViewController {
             return
         }
         guard let peer = TrustedPeerStore.load() else {
-            status.text = "Pair a PC in Porthole, then open Share again."
+            status.text = "Pair a PC in Porthole first."
+            finished = true
+            configureButton("Done", enabled: true)
             return
         }
         destinationLabel.text = peer.name
+        guard peer.channelTicket != nil else {
+            status.text = "Open Porthole to reconnect, then share again."
+            finished = true
+            configureButton("Done", enabled: true)
+            return
+        }
         status.text = "Preparing selected files for this PC…"
         let transfer = ShareTransfer(peer: peer, onFiles: { [weak self] in self?.presentFiles($0) },
                                      onStatus: { [weak self] in self?.updateStatus($0, progress: $1, announce: $2) },

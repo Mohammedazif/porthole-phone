@@ -223,26 +223,28 @@ struct ClipboardHistorySettings: View {
                 set: { client.setClipboardHistoryEnabled($0) }
             ))
         } footer: {
-            Text("Keep shared text and images for up to 7 days.")
+            Text("Keep items for up to 7 days. Turning this off clears history.")
         }
     }
 }
 
 struct ClipboardActions: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @ObservedObject var client: PullClient
 
     private var enabled: Bool { client.linked && client.clipboardSyncEnabled && client.clipboardLinkReady }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 10) {
-                    sendButton
-                    pasteButton.frame(width: 94)
-                }
+            if dynamicTypeSize.isAccessibilitySize {
                 VStack(spacing: 10) {
                     sendButton
                     pasteButton.frame(maxWidth: .infinity)
+                }
+            } else {
+                HStack(spacing: 10) {
+                    sendButton
+                    pasteButton.frame(width: 94)
                 }
             }
             Text(client.clipStatus.isEmpty ? "Share text and images with your PC." : client.clipStatus)

@@ -39,6 +39,7 @@ struct ContentView: View {
     @State private var pendingFiles: [ReceivedFileReference] = []
     @State private var openingFile: ReceivedFileReference?
     @State private var pendingSend: SendSelection?
+    @State private var sendBackgroundTask: UIBackgroundTaskIdentifier = .invalid
     @State private var pendingWidgetDestination: WidgetOpenRequest?
     @State private var pendingWidgetShortcut: WidgetOpenRequest?
     @State private var connectionJump: ConnectionJump?
@@ -157,6 +158,17 @@ struct ContentView: View {
         .sheet(item: $activeSheet, onDismiss: sheetDidDismiss) { sheet in
             sheetContent(sheet)
         }
+        .onChange(of: fileSender.phase) { _, phase in
+            if phase == .sending {
+                guard sendBackgroundTask == .invalid else { return }
+                sendBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Finish sending files") {
+                    fileSender.cancel()
+                    endSendBackgroundTask()
+                }
+            } else {
+                endSendBackgroundTask()
+            }
+        }
         .onChange(of: client.fileSendPeer) { _, peer in
             fileSender.refreshPending(for: peer)
             if pendingWidgetShortcut != nil { presentNextSheet() }
@@ -201,6 +213,12 @@ struct ContentView: View {
                 arrivalBanner(arrival)
             }
         }
+    }
+
+    private func endSendBackgroundTask() {
+        guard sendBackgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(sendBackgroundTask)
+        sendBackgroundTask = .invalid
     }
 
     @ViewBuilder
@@ -505,11 +523,11 @@ struct ContentView: View {
 
             VStack(spacing: 0) {
                 if let saved {
-                    pcRow(saved.name, detail: saved.host) { client.connect() }
+                    pcRow(displayPCName(saved.name), detail: saved.host) { client.connect() }
                 }
                 ForEach(nearby) { pc in
                     if saved != nil || pc.id != nearby.first?.id { Divider().padding(.leading, 52) }
-                    pcRow(pc.name, detail: pc.address) { prepareManualEntry(host: pc.address) }
+                    pcRow(displayPCName(pc.name), detail: pc.address) { prepareManualEntry(host: pc.address) }
                 }
                 if saved == nil && nearby.isEmpty {
                     Label("Looking for nearby PCs…", systemImage: "wifi")
@@ -544,16 +562,22 @@ struct ContentView: View {
     }
 
     private var deviceTitle: String {
-        client.deviceName.isEmpty ? client.savedPC?.name ?? "Your PC" : client.deviceName
+        displayPCName(client.deviceName.isEmpty ? client.savedPC?.name ?? "" : client.deviceName)
+    }
+
+    private func displayPCName(_ name: String) -> String {
+        let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return ["", "unknown", "localhost"].contains(clean.lowercased()) ? "Your PC" : clean
     }
 
     private var connected: some View {
         GeometryReader { geometry in
             let compact = geometry.size.height < 650
-            let stageHeight = min(340, max(180, geometry.size.height - (compact ? 304 : 322)))
+            let stageHeight = min(340, max(180, geometry.size.height - (compact ? 324 : 340)))
             ScrollViewReader { proxy in
                 ViewThatFits(in: .vertical) {
                     connectedContent(stageHeight: stageHeight, compact: compact)
+                    connectedContent(stageHeight: max(162, stageHeight - 44), compact: true)
                     ScrollView { connectedContent(stageHeight: stageHeight, compact: compact) }
                 }
                 .frame(maxHeight: .infinity, alignment: .top)
@@ -1154,7 +1178,7 @@ struct ContentView: View {
                         .font(.system(.footnote, design: .monospaced))
                         .lineLimit(2...4)
                 } footer: {
-                    Text("Enter the eight-character code and SHA-256 fingerprint shown by Porthole on your PC. Use the saved PC entry to reconnect to an already verified PC.")
+                    Text("Use the code and fingerprint shown on your PC.")
                 }
                 if let manualError {
                     Section { Text(manualError).foregroundStyle(.red) }
