@@ -253,7 +253,7 @@ final class OutboundFileSender: ObservableObject {
         awaitingReceipt = false
         try? handle?.close(); handle = nil
         let index = batch[cursor], file = files[index]
-        guard let batch = journalBatch, var manifest, let journal = ShareReceiptJournal.shared() else {
+        guard let journalBatch, var manifest, let journal = ShareReceiptJournal.shared() else {
             fail("The PC saved this file. Porthole could not record the receipt. Retry to check it again.")
             return
         }
@@ -262,7 +262,7 @@ final class OutboundFileSender: ObservableObject {
                                             name: file.name, bytes: file.bytes,
                                             pairingID: manifest.destination.stableID))
             manifest.files[index].sent = true
-            try batch.save(manifest)
+            try journalBatch.save(manifest)
         } catch {
             fail("The PC saved this file. Porthole could not record the receipt. Retry to check it again.")
             return
