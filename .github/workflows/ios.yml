@@ -80,6 +80,48 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
+      - name: Package the iLoader IPA
+        env:
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import plistlib
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          version = os.environ["VERSION"]
+          source = root / "porthole-package" / f"porthole-{version}.ipa"
+          target = root / f"porthole-iloader-{version}.ipa"
+          app = "Payload/Porthole.app"
+          widget = f"{app}/PlugIns/PortholeWidgets.appex"
+          plists = {f"{app}/Info.plist",
+                    f"{app}/PlugIns/PortholeBroadcast.appex/Info.plist",
+                    f"{app}/PlugIns/PortholeShare.appex/Info.plist"}
+          with ZipFile(source) as original, ZipFile(target, "w") as package:
+              assert plists <= set(original.namelist())
+              for entry in original.infolist():
+                  if entry.filename == widget or entry.filename.startswith(widget + "/"):
+                      continue
+                  data = original.read(entry)
+                  if entry.filename in plists:
+                      info = plistlib.loads(data)
+                      info["PortholeUseInstallerAppGroup"] = True
+                      info.pop("PortholeWidgetAppGroup", None)
+                      data = plistlib.dumps(info, fmt=plistlib.FMT_BINARY)
+                  package.writestr(entry, data)
+          with ZipFile(target) as package:
+              assert package.testzip() is None
+              assert not any(entry.startswith(widget + "/") for entry in package.namelist())
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: porthole-iloader-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/porthole-iloader-*.ipa
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
 
   publish:
     needs: build

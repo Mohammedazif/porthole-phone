@@ -43,6 +43,8 @@ On a Mac, install XcodeGen, run `xcodegen generate`, and open `PortholePull.xcod
 
 For a device install, select the same Apple Developer team under Signing & Capabilities for all four targets. Register two distinct App Groups under that team and configure them in the generated project. Set `PORTHOLE_APP_GROUP` to the companion group on the app, Broadcast, and Share. Set `PORTHOLE_WIDGET_APP_GROUP` to the widget group on the app and Widgets. Include the corresponding groups in each provisioning profile. Use a signing method that preserves these entitlements and the embedded extensions. Development installs may also require Developer Mode on the iPhone. [Apple App Groups](https://developer.apple.com/documentation/xcode/configuring-app-groups), [Apple Developer Mode](https://developer.apple.com/documentation/xcode/enabling-developer-mode-on-a-device)
 
+For a direct iLoader install, use the unsigned `porthole-iloader-*.ipa` from the separate Actions artifact. Keep the Broadcast and Share extensions when installing. This package uses the single companion App Group registered by iLoader and omits Widgets. Open Porthole and connect to the PC before testing screen sharing or Share from Files. The full package uses two separately provisioned groups. [iLoader signing details](https://iloader.app/#technical-details)
+
 Run `bash scripts/test-settings.sh` with Swift for the portable checks. A signed device install and end-to-end checks against the matching PC build are required before distribution. See the [native validation checklist](NATIVE-VALIDATION.md).
 
 The desktop project is [Porthole](https://github.com/Mohammedazif/porthole). This app is GPL-3.0.
