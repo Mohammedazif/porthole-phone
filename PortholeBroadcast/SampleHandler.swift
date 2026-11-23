@@ -85,6 +85,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         queue.sync {
             guard active, !deliveryStopped else { return }
             paused = true
+            encoding.removeAll()
             if !ready { disconnect() }
             report(.reconnecting, message: "Screen sharing paused.")
         }
@@ -193,7 +194,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
                 self.attempts = 0
                 self.firstFrameDeadline = nil
                 self.lastAcknowledgedFrame = .now()
-                self.report(.live)
+                if !self.paused { self.report(.live) }
             }
             if complete || error != nil {
                 self.retry("The PC closed the screen connection.")
