@@ -72,8 +72,7 @@ struct ContentView: View {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
     }
 
-    var body: some View {
-        let visibleRecords = visibleUnreadRecordIDs
+    private var tabs: some View {
         TabView(selection: $selectedTab) {
             NavigationStack {
                 Group {
@@ -107,6 +106,11 @@ struct ContentView: View {
         }
         .tint(.primary)
         .toggleStyle(SwitchToggleStyle(tint: Color(red: 0.14, green: 0.58, blue: 0.32)))
+    }
+
+    private var activeTabs: some View {
+        let visibleRecords = visibleUnreadRecordIDs
+        return tabs
         .task(id: visibleRecords) { @MainActor in
             guard !visibleRecords.isEmpty else { return }
             // A notification response can arrive just after the scene becomes active.
@@ -157,6 +161,10 @@ struct ContentView: View {
                 if pendingWidgetShortcut != nil { presentNextSheet() }
             }
         }
+    }
+
+    private var workflowTabs: some View {
+        activeTabs
         .sheet(item: $activeSheet, onDismiss: sheetDidDismiss) { sheet in
             sheetContent(sheet)
         }
@@ -189,6 +197,10 @@ struct ContentView: View {
         .onChange(of: confirmingClearHistory) { _, confirming in
             if !confirming { presentNextSheet() }
         }
+    }
+
+    var body: some View {
+        workflowTabs
         .confirmationDialog(activityFilter == 2 ? "Clear clipboard history?" : "Clear transfer history for this view?", isPresented: $confirmingClearHistory, titleVisibility: .visible) {
             Button("Clear history", role: .destructive) { client.removeActivity(Set(filteredHistory.map(\.id))); selectedHistory.removeAll() }
             Button("Cancel", role: .cancel) { }
@@ -945,87 +957,102 @@ struct ContentView: View {
         }
     }
 
-    private var activity: some View {
-        let items = filteredHistory
+    @ViewBuilder
+    private var activityPicker: some View {
         let picker = Picker("Show", selection: $activityFilter) {
             Text("Received").tag(0)
             Text("Sent").tag(1)
             Text("Clipboard").tag(2)
         }
-        return List {
-            if dynamicTypeSize.isAccessibilitySize {
-                picker.pickerStyle(.menu)
-            } else {
-                picker.pickerStyle(.segmented)
-                    .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets())
+        if dynamicTypeSize.isAccessibilitySize {
+            picker.pickerStyle(.menu)
+        } else {
+            picker.pickerStyle(.segmented)
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets())
+        }
+    }
+
+    private func activitySelection(_ items: [ActivityRecord]) -> some View {
+        Section {
+            HStack {
+                Button("Select all") { selectedHistory = Set(items.map(\.id)) }
+                    .disabled(items.isEmpty || selectedHistory.count == items.count)
+                Spacer()
+                Button("Delete (\(selectedHistory.count))", role: .destructive) {
+                    client.removeActivity(selectedHistory)
+                    selectedHistory.removeAll()
+                    selectingHistory = false
+                }
+                .foregroundStyle(.red)
+                .disabled(selectedHistory.isEmpty)
             }
-            if selectingHistory {
-                Section {
-                    HStack {
-                        Button("Select all") { selectedHistory = Set(items.map(\.id)) }
-                            .disabled(items.isEmpty || selectedHistory.count == items.count)
-                        Spacer()
-                        Button("Delete (\(selectedHistory.count))", role: .destructive) {
-                            client.removeActivity(selectedHistory)
-                            selectedHistory.removeAll()
-                            selectingHistory = false
-                        }
-                        .foregroundStyle(.red)
-                        .disabled(selectedHistory.isEmpty)
-                    }
-                    .buttonStyle(.borderless)
+            .buttonStyle(.borderless)
+        }
+    }
+
+    @ViewBuilder
+    private func historyRow(_ item: ActivityRecord) -> some View {
+        if selectingHistory {
+            let isSelected = selectedHistory.contains(item.id)
+            Button {
+                if !selectedHistory.insert(item.id).inserted { selectedHistory.remove(item.id) }
+            } label: {
+                HStack {
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                        .accessibilityHidden(true)
+                    ActivityRow(item: item, canOpen: false)
                 }
             }
-            Section {
-                if items.isEmpty {
-                    Text(emptyHistoryMessage)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+            .accessibilityAddTraits(isSelected ? .isSelected : [])
+        } else if let reference = item.fileReference {
+            Button { openReceived(reference) } label: {
+                ActivityRow(item: item, canOpen: true)
+            }
+            .buttonStyle(.plain)
+        } else if !item.isFile {
+            HStack(spacing: 8) {
+                Button { showSheet(.clipboard(item)) } label: {
+                    ActivityRow(item: item, file: client.clipboardPreviewURL(item), canOpen: false)
                 }
-                ForEach(items) { item in
-                    if selectingHistory {
-                        Button {
-                            if !selectedHistory.insert(item.id).inserted { selectedHistory.remove(item.id) }
-                        } label: {
-                            HStack {
-                                Image(systemName: selectedHistory.contains(item.id) ? "checkmark.circle.fill" : "circle")
-                                    .accessibilityHidden(true)
-                                ActivityRow(item: item, canOpen: false)
-                            }
-                        }
-                        .accessibilityAddTraits(selectedHistory.contains(item.id) ? .isSelected : [])
-                    } else if let reference = item.fileReference {
-                        Button { openReceived(reference) } label: {
-                            ActivityRow(item: item, canOpen: true)
-                        }
-                        .buttonStyle(.plain)
-                    } else if !item.isFile {
-                        HStack(spacing: 8) {
-                            Button { showSheet(.clipboard(item)) } label: { ActivityRow(item: item, file: client.clipboardPreviewURL(item), canOpen: false) }
-                                .buttonStyle(.plain)
-                            if client.canCopy(item) {
-                                clipboardCopyButton(for: item)
-                            }
-                        }
-                    } else {
-                        ActivityRow(item: item, canOpen: false)
-                    }
-                }
+                .buttonStyle(.plain)
+                if client.canCopy(item) { clipboardCopyButton(for: item) }
+            }
+        } else {
+            ActivityRow(item: item, canOpen: false)
+        }
+    }
+
+    private func recentActivity(_ items: [ActivityRecord]) -> some View {
+        Section {
+            if items.isEmpty {
+                Text(emptyHistoryMessage)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(items) { item in historyRow(item) }
                 .onDelete { offsets in
                     client.removeActivity(Set(offsets.map { items[$0].id }))
                 }
-            } header: {
-                HStack {
-                    Text("Recent")
-                    Spacer()
-                    if !items.isEmpty {
-                        Button("Clear history") { confirmingClearHistory = true }
-                            .font(.footnote)
-                            .textCase(nil)
-                    }
+        } header: {
+            HStack {
+                Text("Recent")
+                Spacer()
+                if !items.isEmpty {
+                    Button("Clear history") { confirmingClearHistory = true }
+                        .font(.footnote)
+                        .textCase(nil)
                 }
             }
+        }
+    }
+
+    private var activity: some View {
+        let items = filteredHistory
+        return List {
+            activityPicker
+            if selectingHistory { activitySelection(items) }
+            recentActivity(items)
             if activityFilter == 2, !selectingHistory {
                 Section {
                     ClipboardActions(client: client)

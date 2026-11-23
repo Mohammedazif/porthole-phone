@@ -105,6 +105,9 @@ struct WidgetInboxStore {
 
     static func shared() -> Self? {
         #if os(iOS)
+        if PortholeAppGroup.usesInstallerGroup {
+            return PortholeAppGroup.containerURL.map(Self.init(container:))
+        }
         guard let identifier = Bundle.main.object(forInfoDictionaryKey: "PortholeWidgetAppGroup") as? String,
               let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: identifier)
         else { return nil }

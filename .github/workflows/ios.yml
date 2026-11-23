@@ -96,24 +96,29 @@ jobs:
           target = root / f"porthole-iloader-{version}.ipa"
           app = "Payload/Porthole.app"
           widget = f"{app}/PlugIns/PortholeWidgets.appex"
-          plists = {f"{app}/Info.plist",
+          plists = {f"{app}/Info.plist", f"{widget}/Info.plist",
                     f"{app}/PlugIns/PortholeBroadcast.appex/Info.plist",
                     f"{app}/PlugIns/PortholeShare.appex/Info.plist"}
           with ZipFile(source) as original, ZipFile(target, "w") as package:
               assert plists <= set(original.namelist())
+              companion_group = plistlib.loads(original.read(f"{app}/Info.plist"))["PortholeAppGroup"]
               for entry in original.infolist():
-                  if entry.filename == widget or entry.filename.startswith(widget + "/"):
-                      continue
                   data = original.read(entry)
                   if entry.filename in plists:
                       info = plistlib.loads(data)
                       info["PortholeUseInstallerAppGroup"] = True
+                      info["PortholeAppGroup"] = companion_group
                       info.pop("PortholeWidgetAppGroup", None)
                       data = plistlib.dumps(info, fmt=plistlib.FMT_BINARY)
                   package.writestr(entry, data)
           with ZipFile(target) as package:
               assert package.testzip() is None
-              assert not any(entry.startswith(widget + "/") for entry in package.namelist())
+              for name in plists:
+                  info = plistlib.loads(package.read(name))
+                  assert info["PortholeUseInstallerAppGroup"] is True
+                  assert info["PortholeAppGroup"] == companion_group
+              widget_info = plistlib.loads(package.read(f"{widget}/Info.plist"))
+              assert widget_info["NSExtension"]["NSExtensionPointIdentifier"] == "com.apple.widgetkit-extension"
           PY
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

@@ -10,11 +10,11 @@ func require(_ condition: Bool, _ message: String) {
 let pin = String(repeating: "a1", count: 32)
 let standardGroup = "group.local.porthole.pull"
 let installerApp = "local.porthole.pull.A1B2C3D4E5"
-for bundleID in [installerApp, installerApp + ".broadcast", installerApp + ".share"] {
+for bundleID in [installerApp, installerApp + ".broadcast", installerApp + ".share", installerApp + ".widgets"] {
     require(PortholeAppGroup.installerGroup(for: bundleID, configuredGroup: standardGroup) == "group." + installerApp,
             "iLoader's app and companion extensions use the same provisioned group")
 }
-for bundleID in ["local.porthole.pull", installerApp + ".widgets", "local.porthole.pull.custom",
+for bundleID in ["local.porthole.pull", installerApp + ".unrelated", "local.porthole.pull.custom",
                  "local.other.app.A1B2C3D4E5"] {
     require(PortholeAppGroup.installerGroup(for: bundleID, configuredGroup: standardGroup) == nil,
             "Only the expected team-suffixed companion bundles use the installer group")

@@ -80,6 +80,7 @@ targets:
       - path: PortholeWidgets
         excludes: [PortholeWidgets.entitlements]
       - Shared/WidgetInbox.swift
+      - Shared/PortholeAppGroup.swift
     settings:
       base:
         PRODUCT_NAME: PortholeWidgets
