@@ -85,7 +85,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         queue.sync {
             guard active, !deliveryStopped else { return }
             paused = true
-            disconnect()
+            if !ready { disconnect() }
             report(.reconnecting, message: "Screen sharing paused.")
         }
         resetEncoder()
@@ -97,8 +97,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
             guard self.active, !self.deliveryStopped else { return }
             self.paused = false
             self.attempts = 0
+            self.needKey = true
             self.report(.reconnecting)
-            self.connect()
+            if self.ready {
+                self.firstFrameDeadline = nil
+            } else {
+                self.connect()
+            }
         }
     }
 
@@ -252,23 +257,20 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private func checkHealth() {
         guard active, let peer else { return }
         if TrustedPeerStore.shouldStopBroadcast(peer: peer) || deliveryStopped {
-            if !deliveryStopped {
-                deliveryStopped = true
-                disconnect()
-            }
-            report(.deliveryStopped, message: "Delivery to the PC has stopped. End Screen Recording in Control Center to finish the broadcast.")
+            stopRequestedBroadcast()
             return
         }
         guard let current = TrustedPeerStore.load(), current.samePairing(as: peer) else {
             fail("The trusted PC changed. Start sharing again from Porthole.")
             return
         }
-        if current.channelTicket == nil {
+        // A verified screen connection is independent of the foreground companion socket.
+        if !ready, current.channelTicket == nil {
             if link != nil { disconnect() }
             waitForTicket()
             return
         }
-        if current.id != peer.id {
+        if !ready, current.id != peer.id {
             disconnect()
             attempts = 0
             report(.reconnecting)
@@ -293,7 +295,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         } else if lostFrames >= frameRate {
             fail("The video encoder could not deliver screen frames.")
         } else if let lastAcknowledgedFrame, now >= lastAcknowledgedFrame + .seconds(5) {
-            retry("No new screen frames reached the PC.")
+            report(.waitingForFrames, message: "Waiting for screen changes.")
         } else if let when = reconnectAt, now >= when {
             connect()
         } else if let status = lastReport, status.phase == .connecting || status.phase == .reconnecting {
@@ -307,6 +309,19 @@ final class SampleHandler: RPBroadcastSampleHandler {
            now < lastReport.time + .seconds(2) { return }
         lastReport = (phase, message, now)
         TrustedPeerStore.publishBroadcast(peer: peer, phase: phase, message: message)
+    }
+
+    private func stopRequestedBroadcast() {
+        deliveryStopped = true
+        active = false
+        stopWatchdog()
+        disconnect()
+        report(.ended)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.finishBroadcastWithError(NSError(domain: RPRecordingErrorDomain,
+                                                    code: RPRecordingErrorCode.userDeclined.rawValue,
+                                                    userInfo: [NSLocalizedDescriptionKey: "Screen sharing stopped."]))
+        }
     }
 
     private func fail(_ message: String) {

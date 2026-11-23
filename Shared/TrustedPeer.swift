@@ -75,7 +75,7 @@ struct TrustedPeer: Codable, Equatable {
     }
 }
 
-enum BroadcastPhase: String, Codable { case connecting, live, reconnecting, deliveryStopped, ended, failed }
+enum BroadcastPhase: String, Codable { case connecting, live, waitingForFrames, reconnecting, deliveryStopped, ended, failed }
 
 struct TrustedBroadcastStatus: Codable, Equatable {
     let peerID: UUID?

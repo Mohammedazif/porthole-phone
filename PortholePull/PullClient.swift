@@ -195,7 +195,8 @@ final class PullClient: ObservableObject {
     private let fileQueue = DispatchQueue(label: "porthole.files")
     private let fileStorage: ReceivedFileStorage = {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        return ReceivedFileStorage(defaultFolder: docs.appendingPathComponent("Porthole", isDirectory: true),
+        return ReceivedFileStorage(defaultFolder: docs,
+                                   legacyDefaultFolder: docs.appendingPathComponent("Porthole", isDirectory: true),
                                    previewFolder: FileManager.default.temporaryDirectory.appendingPathComponent("PortholePreviews", isDirectory: true))
     }()
     private let historyStore: ActivityHistoryStore = {
@@ -836,7 +837,7 @@ final class PullClient: ObservableObject {
               let snapshot = TrustedPeerStore.broadcastStatus(), snapshot.peerID == peer.stableID,
               Date().timeIntervalSince(snapshot.updatedAt) < 8 else { return false }
         switch snapshot.phase {
-        case .connecting, .live, .reconnecting: break
+        case .connecting, .live, .waitingForFrames, .reconnecting: break
         default: return false
         }
         return TrustedPeerStore.requestBroadcastStop(peer: peer)
@@ -844,18 +845,22 @@ final class PullClient: ObservableObject {
 
 
 
-    /// Callable from any queue; the list lives on the main thread.
-    private func deviceTitle() -> String {
-        let name = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
-        if name.isEmpty { return "your PC" }
-        return name
+    var computerName: String {
+        let peer = fileSendPeer ?? savedPC
+        let fallbacks = ["", "your pc", "unknown", "localhost"]
+        for name in [deviceName, peer?.name, peer?.host].compactMap({ $0 }) {
+            let label = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !fallbacks.contains(label.lowercased()) { return label }
+        }
+        return "the computer"
     }
 
+    /// Callable from any queue; the list lives on the main thread.
     private func note(_ title: String, _ detail: String, file: Bool, incoming: Bool,
                       path: String? = nil, receivedFile: ReceivedFileReference? = nil,
                       clipboardText: String? = nil, clipboardImage: Data? = nil, bytes: Int64? = nil) {
         DispatchQueue.main.async {
-            let shown = detail.replacingOccurrences(of: "the PC", with: self.deviceTitle())
+            let shown = detail.replacingOccurrences(of: "the PC", with: self.computerName)
             self.historyQueue.async {
                 guard file || self.historyAllowsClipboard else { return }
                 let record = ActivityItem(title: title, detail: shown, isFile: file, incoming: incoming,
@@ -1004,14 +1009,7 @@ final class PullClient: ObservableObject {
                 return
             }
         }
-        clipStatus = "Use Paste to transfer clipboard content to \(deviceTitle())."
-    }
-
-    /// Reads the iPhone pasteboard from a tap, which iOS allows even when
-    /// Paste from Other Apps is still Ask.
-    func sendClipboardNow() {
-        guard canSendClipboard() else { return }
-        considerLocal()
+        clipStatus = "Use Paste to transfer clipboard content to \(computerName)."
     }
 
     private static func discardPendingSends(for peer: TrustedPeer) {
@@ -2283,7 +2281,7 @@ final class PullClient: ObservableObject {
         guard text.utf8.count <= 256 * 1024 else { clipStatus = "Clipboard text exceeds the 256 KB limit."; return }
         if isPairingText(text) { clipStatus = "Pairing details stay on this iPhone."; return }
         queueClip(kind: "T", data: Data(text.utf8))
-        clipStatus = "Clipboard queued for \(deviceTitle())."
+        clipStatus = "Clipboard queued for \(computerName)."
     }
 
     private func deliverPreparedClipboardImage(_ data: Data?, peer: TrustedPeer, generation: Int) {
@@ -2337,7 +2335,7 @@ final class PullClient: ObservableObject {
                         self.clipStatus = "Clipboard transfer failed. Try again."
                         return
                     }
-                    self.clipStatus = "Clipboard sent to \(self.deviceTitle())."
+                    self.clipStatus = "Clipboard sent to \(self.computerName)."
                     let title = kind == "P" ? "Image" : Self.preview(String(data: data, encoding: .utf8) ?? "Text")
                     self.note(title, "Sent to the PC", file: false, incoming: false,
                               clipboardText: kind == "T" ? String(data: data, encoding: .utf8) : nil,

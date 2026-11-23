@@ -12,6 +12,8 @@ struct ReceivedFileReference: Codable, Equatable {
     var folderBookmark: Data? = nil
     var bytes: Int64? = nil
     var identity: ReceivedFileIdentity? = nil
+    // Older local receipts point into the original nested Porthole folder.
+    var usesDocumentsRoot: Bool? = nil
 }
 
 /// Local filesystem identity supplements the path in new receipts. Providers
@@ -141,13 +143,16 @@ final class ReceivedFileStorage {
     }
     private let defaults: UserDefaults
     private let defaultFolder: URL
+    private let legacyDefaultFolder: URL?
     private let previewFolder: URL
     private let lock = NSLock()
     private var cleanedPreviews = false
     private let preferenceKey = "porthole.receivedSaveFolder"
 
-    init(defaultFolder: URL, previewFolder: URL, defaults: UserDefaults = .standard) {
+    init(defaultFolder: URL, legacyDefaultFolder: URL? = nil,
+         previewFolder: URL, defaults: UserDefaults = .standard) {
         self.defaultFolder = defaultFolder
+        self.legacyDefaultFolder = legacyDefaultFolder
         self.previewFolder = previewFolder
         self.defaults = defaults
     }
@@ -162,6 +167,10 @@ final class ReceivedFileStorage {
     var folderName: String { selection()?.name ?? "On My iPhone › Porthole" }
     var usesCustomFolder: Bool { selection() != nil }
 
+    private func localFolder(usesDocumentsRoot: Bool?) -> URL {
+        usesDocumentsRoot == true ? defaultFolder : legacyDefaultFolder ?? defaultFolder
+    }
+
     func resetFolder() {
         lock.lock()
         defer { lock.unlock() }
@@ -170,7 +179,7 @@ final class ReceivedFileStorage {
 
     #if os(iOS) || os(macOS)
     private func ownsDirectory(_ url: URL) -> Bool {
-        let root = defaultFolder.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path
+        let root = defaultFolder.resolvingSymlinksInPath().standardizedFileURL.path
         let path = url.resolvingSymlinksInPath().standardizedFileURL.path
         return path == root || path.hasPrefix(root + "/")
     }
@@ -228,7 +237,8 @@ final class ReceivedFileStorage {
         let values = try regularFileAttributes(url)
         return ReceivedFileReference(name: url.lastPathComponent, folderName: folderName, folderBookmark: bookmark,
                                      bytes: (values[.size] as? NSNumber)?.int64Value,
-                                     identity: ReceivedFileIdentity(attributes: values))
+                                     identity: ReceivedFileIdentity(attributes: values),
+                                     usesDocumentsRoot: bookmark == nil ? true : nil)
     }
 
     private func regularFileAttributes(_ url: URL) throws -> [FileAttributeKey: Any] {
@@ -266,6 +276,7 @@ final class ReceivedFileStorage {
         let id: UUID
         let bookmark: Data?
         let token: UUID
+        var usesDocumentsRoot: Bool? = nil
     }
 
     private func publish(_ source: URL, named name: String, in folder: URL,
@@ -277,7 +288,8 @@ final class ReceivedFileStorage {
         let url: URL
         do {
             url = try ReceivedFileWriter.save(source, named: name, in: folder, willStage: { id, token in
-                try planStage?(StagingIntent(id: id, bookmark: bookmark, token: token))
+                try planStage?(StagingIntent(id: id, bookmark: bookmark, token: token,
+                                             usesDocumentsRoot: bookmark == nil ? true : nil))
             }, didRemoveStage: clearStage) { staged, destination in
                 guard let plan else { return }
                 var reference = try self.makeReference(staged, folderName: folderName, bookmark: bookmark)
@@ -305,7 +317,10 @@ final class ReceivedFileStorage {
             try ReceivedFileWriter.removeStagingFolder(ReceivedFileWriter.stagingFolder(intent.id, in: folder),
                                                        token: intent.token)
         }
-        guard let bookmark = intent.bookmark else { try remove(in: defaultFolder); return }
+        guard let bookmark = intent.bookmark else {
+            try remove(in: localFolder(usesDocumentsRoot: intent.usesDocumentsRoot))
+            return
+        }
         #if os(iOS) || os(macOS)
         try withFolder(bookmark) { folder, _ in
             var coordinatorError: NSError?
@@ -343,6 +358,7 @@ final class ReceivedFileStorage {
             if matchesPlan(candidate), validates(candidate),
                var recovered = try? makeReference(candidate, folderName: reference.folderName, bookmark: bookmark) {
                 recovered.id = reference.id
+                recovered.usesDocumentsRoot = reference.usesDocumentsRoot
                 return (candidate, recovered)
             }
             let staging = intent.stagingName
@@ -368,7 +384,8 @@ final class ReceivedFileStorage {
             return nil
             #endif
         }
-        guard let (url, recovered) = recoverInFolder(defaultFolder, bookmark: nil) else { return nil }
+        let folder = localFolder(usesDocumentsRoot: reference.usesDocumentsRoot)
+        guard let (url, recovered) = recoverInFolder(folder, bookmark: nil) else { return nil }
         return SavedFile(reference: recovered, localURL: url, warning: nil)
     }
 
@@ -449,8 +466,9 @@ final class ReceivedFileStorage {
             throw ReceivedStorageError.folderUnavailable
             #endif
         }
-        let url = defaultFolder.appendingPathComponent(file.name)
-        guard (try? FileManager.default.attributesOfItem(atPath: defaultFolder.path)[.type]) as? FileAttributeType == .typeDirectory else {
+        let folder = localFolder(usesDocumentsRoot: file.usesDocumentsRoot)
+        let url = folder.appendingPathComponent(file.name)
+        guard (try? FileManager.default.attributesOfItem(atPath: folder.path)[.type]) as? FileAttributeType == .typeDirectory else {
             throw ReceivedStorageError.fileUnavailable
         }
         try verify(file, at: url)

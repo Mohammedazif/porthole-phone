@@ -11,13 +11,12 @@ import UniformTypeIdentifiers
 
 private struct BroadcastPicker: UIViewRepresentable {
     func makeUIView(context: Context) -> RPSystemBroadcastPickerView {
-        let picker = RPSystemBroadcastPickerView(frame: CGRect(x: 0, y: 0, width: 54, height: 54))
+        let picker = RPSystemBroadcastPickerView(frame: CGRect(x: 0, y: 0, width: 88, height: 52))
         // The broadcast extension uses the containing app's bundle identifier plus this suffix.
         picker.preferredExtension = (Bundle.main.bundleIdentifier ?? "local.porthole.pull") + ".broadcast"
         picker.showsMicrophoneButton = false
         picker.overrideUserInterfaceStyle = .dark
         picker.tintColor = .white
-        picker.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         return picker
     }
 
@@ -32,6 +31,7 @@ struct ContentView: View {
     @StateObject private var fileSender = OutboundFileSender()
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(PhoneAppearance.preferenceKey) private var appearance: PhoneAppearance = .system
     @State private var activeSheet: PhoneSheet?
     @State private var lastSheet: PhoneSheet?
     @State private var offeredChoiceIDs: [String]?
@@ -52,6 +52,7 @@ struct ContentView: View {
     @State private var hideSharing = false
     @State private var shareStarted: Date?
     @State private var broadcastStopRequestedAt: Date?
+    @State private var confirmingStopBroadcast = false
     @State private var activityFilter = 0
     @State private var selectingHistory = false
     @State private var selectedHistory = Set<UUID>()
@@ -105,6 +106,7 @@ struct ContentView: View {
                 .tag(2)
         }
         .tint(.primary)
+        .toggleStyle(SwitchToggleStyle(tint: Color(red: 0.14, green: 0.58, blue: 0.32)))
         .task(id: visibleRecords) { @MainActor in
             guard !visibleRecords.isEmpty else { return }
             // A notification response can arrive just after the scene becomes active.
@@ -142,14 +144,14 @@ struct ContentView: View {
                 client.cameForward()
                 fileSender.refreshPending(for: client.fileSendPeer)
                 index.refreshAuthorization()
-                    input.refresh()
+                input.refresh()
                 updateCapture()
                 refreshBroadcast()
                 presentNextSheet()
             }
             if phase == .background { client.enteredBackground() }
         }
-        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+        .onReceive(Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()) { _ in
             if scenePhase != .background {
                 refreshBroadcast()
                 if pendingWidgetShortcut != nil { presentNextSheet() }
@@ -194,6 +196,10 @@ struct ContentView: View {
             Text(activityFilter == 2
                  ? "This removes saved clipboard items from Porthole on this iPhone."
                  : "This removes activity records. You can still find received files in their saved folders.")
+        }
+        .alert("Stop screen sharing?", isPresented: $confirmingStopBroadcast) {
+            Button("Stop sharing", role: .destructive, action: stopBroadcast)
+            Button("Cancel", role: .cancel) { }
         }
         .alert("Porthole", isPresented: Binding(get: { actionError != nil }, set: { if !$0 { actionError = nil } })) {
             Button("OK", role: .cancel) { actionError = nil }
@@ -632,8 +638,7 @@ struct ContentView: View {
             let actions = dynamicTypeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 10)) : AnyLayout(HStackLayout(spacing: 10))
             actions {
                 actionCard("Send files", systemImage: "doc") { openSendPicker() }
-                actionCard("Send clipboard", systemImage: "clipboard") { client.sendClipboardNow() }
-                    .disabled(!client.clipboardSyncEnabled)
+                ClipboardSendButton(client: client)
             }
         }
         .padding(.horizontal, 20)
@@ -693,7 +698,7 @@ struct ContentView: View {
 
     private var isPortholeBroadcasting: Bool {
         switch client.broadcastStatus?.phase {
-        case .connecting, .live, .reconnecting, .deliveryStopped: true
+        case .connecting, .live, .waitingForFrames, .reconnecting, .deliveryStopped: true
         default: false
         }
     }
@@ -749,7 +754,7 @@ struct ContentView: View {
                     .accessibilityHint(isPortholeBroadcasting ? "" : broadcastHelp)
                 } else {
                     VStack(spacing: 1) {
-                        BroadcastPicker().frame(width: 54, height: 44)
+                        BroadcastPicker().frame(width: 88, height: 52)
                         Text("Share screen").font(.subheadline.weight(.semibold))
                             .accessibilityHidden(true)
                     }
@@ -800,6 +805,7 @@ struct ContentView: View {
         if stoppingBroadcast { return "Stopping" }
         switch client.broadcastStatus?.phase {
         case .live: return "Live"
+        case .waitingForFrames: return "Waiting for frames"
         case .reconnecting: return "Reconnecting"
         case .deliveryStopped: return "Delivery stopped"
         default: return "Connecting"
@@ -864,10 +870,10 @@ struct ContentView: View {
                 if deliveryStopped {
                     actionError = "Open Control Center, then tap the active Screen Recording control to finish the broadcast."
                 } else {
-                    stopBroadcast()
+                    confirmingStopBroadcast = true
                 }
             }) {
-                Text(deliveryStopped ? "End in Control Center" : stoppingBroadcast ? "Stopping…" : "Stop delivery")
+                Text(deliveryStopped ? "End in Control Center" : stoppingBroadcast ? "Stopping…" : "Stop sharing")
                     .font(.headline)
                     .frame(maxWidth: .infinity, minHeight: 44)
             }
@@ -954,6 +960,23 @@ struct ContentView: View {
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets())
             }
+            if selectingHistory {
+                Section {
+                    HStack {
+                        Button("Select all") { selectedHistory = Set(items.map(\.id)) }
+                            .disabled(items.isEmpty || selectedHistory.count == items.count)
+                        Spacer()
+                        Button("Delete (\(selectedHistory.count))", role: .destructive) {
+                            client.removeActivity(selectedHistory)
+                            selectedHistory.removeAll()
+                            selectingHistory = false
+                        }
+                        .foregroundStyle(.red)
+                        .disabled(selectedHistory.isEmpty)
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
             Section {
                 if items.isEmpty {
                     Text(emptyHistoryMessage)
@@ -1003,7 +1026,7 @@ struct ContentView: View {
                     }
                 }
             }
-            if activityFilter == 2 {
+            if activityFilter == 2, !selectingHistory {
                 Section {
                     ClipboardActions(client: client)
                         .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
@@ -1033,15 +1056,7 @@ struct ContentView: View {
                     }
                 }
             }
-            if selectingHistory {
-                ToolbarItemGroup(placement: .bottomBar) {
-                    Button("Select all") { selectedHistory = Set(items.map(\.id)) }
-                    Spacer()
-                    Button("Delete", role: .destructive) {
-                        client.removeActivity(selectedHistory); selectedHistory.removeAll(); selectingHistory = false
-                    }.disabled(selectedHistory.isEmpty)
-                }
-            }
+
         }
     }
 
@@ -1051,20 +1066,17 @@ struct ContentView: View {
             client.copyActivity(item) { success in
                 if success {
                     copiedItemID = item.id
+                    client.activityMessage = ""
                     AccessibilityNotification.Announcement("Copied").post()
                 } else {
                     actionError = client.activityMessage
                 }
             }
         } label: {
-            VStack(spacing: 3) {
-                Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                Text(copied ? "Copied" : "Copy").font(.caption2.weight(.semibold))
-            }
-            .frame(minWidth: 44, minHeight: 44)
-            .padding(.horizontal, 3)
-            .glassPanel(RoundedRectangle(cornerRadius: 14))
-            .contentShape(Rectangle())
+            Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                .font(.subheadline.weight(.medium))
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(copied ? "Copied" : "Copy clipboard item")
@@ -1088,6 +1100,16 @@ struct ContentView: View {
                 }
                 .listRowInsets(EdgeInsets())
                 .listRowBackground(Color.clear)
+            }
+
+            Section {
+                Picker(selection: $appearance) {
+                    ForEach(PhoneAppearance.allCases, id: \.self) { option in
+                        Text(option.label).tag(option)
+                    }
+                } label: {
+                    Label("Appearance", systemImage: "circle.lefthalf.filled")
+                }
             }
 
             Section("Connection features") {

@@ -238,8 +238,24 @@ func testShareReceipts() throws {
     require(try journal.pending() == [second], "receipt consumption removed another transfer")
 }
 
+func testDefaultFolderUpgrade() throws {
+    let documents = root.appendingPathComponent("Documents", isDirectory: true)
+    let oldFolder = documents.appendingPathComponent("Porthole", isDirectory: true)
+    let storage = ReceivedFileStorage(defaultFolder: documents, legacyDefaultFolder: oldFolder,
+                                      previewFolder: root.appendingPathComponent("migration-previews"), defaults: defaults)
+    try FileManager.default.createDirectory(at: oldFolder, withIntermediateDirectories: true)
+    let oldFile = oldFolder.appendingPathComponent("Invoice.pdf")
+    try Data("old document".utf8).write(to: oldFile)
+    let legacy = ReceivedFileReference(name: oldFile.lastPathComponent)
+    let saved = try storage.save(write("migration.tmp", "new document"), named: legacy.name)
+    require(saved.localURL == documents.appendingPathComponent(legacy.name), "New files must save in the visible Porthole root")
+    require(try storage.prepareForReading(saved.reference) == saved.localURL, "New history must open the root file")
+    require(try storage.prepareForReading(legacy) == oldFile, "Old history must still open the same nested file")
+}
+
 try testCollisionAndFailures()
 try testStorageReferences()
+try testDefaultFolderUpgrade()
 try testLegacyAndClipboardHistory()
 testProtocolNames()
 try testTransferStaging()

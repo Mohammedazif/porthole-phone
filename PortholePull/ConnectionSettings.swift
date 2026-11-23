@@ -88,11 +88,14 @@ struct ConnectionSettings: View {
                 ))
                 .disabled(!client.inputControlsEnabled)
                 LabeledContent("Status", value: client.inputControlSummary)
+                if client.canVerifyInput {
+                    Button("Verify Bluetooth") { showingBluetoothVerification = true }
+                }
             } header: {
                 Text("PC controls")
             } footer: {
                 if client.linked && (!client.inputControlSupported || !client.inputVerificationSupported) {
-                    Text("Update Porthole on your PC to apply these preferences.")
+                    Text("Update Porthole on \(client.computerName) to apply these preferences.")
                 }
             }
             Section("Input devices on iPhone") {
@@ -101,11 +104,7 @@ struct ConnectionSettings: View {
                 Button("Refresh device status") { input.refresh() }
             }
             Section {
-                Text("Set up controls on your PC, then pair it in Bluetooth.")
-                if client.inputVerificationStatus != .verified {
-                    Button("Verify Bluetooth") { showingBluetoothVerification = true }
-                        .disabled(!client.canVerifyInput)
-                }
+                Text("Select Set up controls in Porthole on \(client.computerName), then pair in Bluetooth settings.")
             } header: {
                 Text("Bluetooth pairing")
             } footer: {
@@ -229,43 +228,29 @@ struct ClipboardHistorySettings: View {
 }
 
 struct ClipboardActions: View {
-    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @ObservedObject var client: PullClient
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ClipboardSendButton(client: client)
+            Text(client.clipStatus.isEmpty ? "Paste to send to your PC." : client.clipStatus)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+        }
+    }
+}
+
+struct ClipboardSendButton: View {
     @ObservedObject var client: PullClient
 
     private var enabled: Bool { client.linked && client.clipboardSyncEnabled && client.clipboardLinkReady }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if dynamicTypeSize.isAccessibilitySize {
-                VStack(spacing: 10) {
-                    sendButton
-                    pasteButton.frame(maxWidth: .infinity)
-                }
-            } else {
-                HStack(spacing: 10) {
-                    sendButton
-                    pasteButton.frame(width: 94)
-                }
-            }
-            Text(client.clipStatus.isEmpty ? "Share text and images with your PC." : client.clipStatus)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 12)
-        }
-        .disabled(!enabled)
-    }
-
-    private var sendButton: some View {
-        GlassCapsuleButton(title: "Send clipboard", systemImage: "clipboard", compact: true) {
-            client.sendClipboardNow()
-        }
-        .fixedSize(horizontal: false, vertical: true)
-    }
-
-    private var pasteButton: some View {
         ClipboardPasteControl(enabled: enabled, onPaste: client.sendPasted)
-            .frame(minWidth: 86, minHeight: 48, maxHeight: 48)
+            .frame(maxWidth: .infinity, minHeight: 48, maxHeight: 48)
             .glassPanel(Capsule())
+            .accessibilityHint("Sends the clipboard to your PC.")
     }
 }
 
