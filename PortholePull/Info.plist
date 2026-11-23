@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>PortholeAppGroup</key>
+	<string>$(PORTHOLE_APP_GROUP)</string>
+	<key>PortholeWidgetAppGroup</key>
+	<string>$(PORTHOLE_WIDGET_APP_GROUP)</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
@@ -16,6 +20,19 @@
 	<string>$(PRODUCT_NAME)</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>CFBundleURLName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER).widget</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>porthole-widget</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
@@ -26,25 +43,21 @@
 	<array>
 		<string>_porthole._tcp</string>
 		<string>_porthole-pc._tcp</string>
-		<string>_porthole-screen._tcp</string>
-		<string>_porthole-share._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Porthole sends photos, the screen, and the clipboard to your PC on this Wi-Fi.</string>
+	<string>Porthole uses your local network to connect to your PC for screen sharing, file transfers, and clipboard synchronization.</string>
 	<key>NSCameraUsageDescription</key>
-	<string>Porthole reads the code on the PC so this iPhone can connect.</string>
+	<string>Porthole uses the camera to scan the connection QR code displayed on your PC.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>Porthole saves photos and videos sent from the PC into Photos.</string>
+	<string>Porthole saves received photos and videos to your photo library when you select Save to Photos.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>Porthole matches the photo on the PC window and sends that original file.</string>
+	<string>Porthole accesses your photo library to identify photos and videos displayed on your PC and transfer their original files.</string>
+	<key>PHPhotoLibraryPreventAutomaticLimitedAccessAlert</key>
+	<true/>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
-	<key>UIBackgroundModes</key>
-	<array>
-		<string>audio</string>
-	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

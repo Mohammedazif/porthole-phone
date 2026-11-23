@@ -1,180 +1,417 @@
+import CoreImage
+import CoreMedia
+import CoreVideo
+import Foundation
+import ImageIO
 import Network
 import ReplayKit
 import VideoToolbox
 
-/// Sends this iPhone's own screen to Porthole on the PC. Unlike AirPlay mirroring,
-/// a broadcast is always what the phone shows: Photos keeps its bars, and share
-/// sheets and alerts appear. Frames are encoded on the hardware H.264 encoder and
-/// streamed as Annex-B after a "PSCR 1" line, each frame as a 4-byte big-endian
-/// length, a type byte (1 video, 2 keyframe) and the bytes.
+/// Supplies H.264 Annex-B frames to the paired PC over its verified transport.
 final class SampleHandler: RPBroadcastSampleHandler {
+    private struct FrameTicket {
+        let id = UUID()
+        let connectionID: UUID
+        let forceKey: Bool
+    }
+
+    // Connection state and frame reservations belong to this queue. ReplayKit
+    // invokes its handler methods serially, so it owns the encoder and pixel pool.
     private let queue = DispatchQueue(label: "porthole.broadcast")
-    private let lock = NSLock()
-    private var browser: NWBrowser?
+    private var peer: TrustedPeer?
     private var link: NWConnection?
+    private var connectionID = UUID()
+    private var active = false
+    private var paused = false
     private var ready = false
-    /// Frames sent that the PC has not yet answered with its one-byte 'A'.
-    private var unacked = 0
+    private var failed = false
     private var needKey = true
+    private var attempts = 0
+    private var connectDeadline: DispatchTime?
+    private var reconnectAt: DispatchTime?
+    private var watchdog: DispatchSourceTimer?
+    private var encoding: [UUID: DispatchTime] = [:]
+    private var awaitingACK: [DispatchTime] = []
+    private var lastReport: (phase: BroadcastPhase, message: String?, time: DispatchTime)?
+    private var lastAcknowledgedFrame: DispatchTime?
+    private var firstFrameDeadline: DispatchTime?
+    private var ticketDeadline: DispatchTime?
+    private var deliveryStopped = false
+    private var lostFrames = 0
+
     private var session: VTCompressionSession?
     private var sessionWidth = 0
     private var sessionHeight = 0
+    private var lastTimestamp: Double?
+    private var lastOrientation: CGImagePropertyOrientation?
     private var transfer: VTPixelTransferSession?
     private var pool: CVPixelBufferPool?
     private var poolWidth = 0
     private var poolHeight = 0
-    private var lastFrame = CMTime.invalid
-    private var stopped = false
+    private var poolFormat: OSType = 0
+    private lazy var imageContext = CIContext(options: [.cacheIntermediates: false])
 
-    /// About 24 frames a second. A frame is skipped, not queued, while this many are
-    /// still unanswered, so a slow moment on Wi-Fi drops frames instead of adding lag.
     private let minInterval = 1.0 / 24.0
-    private let maxUnacked = 2
-    /// The PC draws this at 1080 on the long side, so a larger encode only heats the phone.
+    private let maxOutstanding = 2
     private let longEdge = 1080
     private let frameRate = 24
     private let bitrate = 3_500_000
+    // Match PH_SCREEN_FRAME_MAX in the PC receiver.
+    private static let maxFrameBytes = 8 * 1024 * 1024
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
-        queue.async { self.browse() }
+        queue.async {
+            self.active = true
+            self.paused = false
+            self.failed = false
+            self.deliveryStopped = false
+            self.lastReport = nil
+            self.ticketDeadline = nil
+            self.attempts = 0
+            guard let peer = TrustedPeerStore.load(), let ticket = peer.channelTicket,
+                  TrustedPeer.isChannelTicket(ticket) else {
+                self.fail("Pair with a trusted PC in Porthole before sharing your screen.")
+                return
+            }
+            self.peer = peer
+            TrustedPeerStore.clearBroadcastStop(peer: peer)
+            self.report(.connecting)
+            self.startWatchdog()
+            self.connect()
+        }
+    }
+
+    override func broadcastPaused() {
+        queue.sync {
+            guard active, !deliveryStopped else { return }
+            paused = true
+            disconnect()
+            report(.reconnecting, message: "Screen sharing paused.")
+        }
+        resetEncoder()
+    }
+
+    override func broadcastResumed() {
+        resetEncoder()
+        queue.async {
+            guard self.active, !self.deliveryStopped else { return }
+            self.paused = false
+            self.attempts = 0
+            self.report(.reconnecting)
+            self.connect()
+        }
     }
 
     override func broadcastFinished() {
-        lock.lock()
-        stopped = true
-        ready = false
-        lock.unlock()
         queue.sync {
-            browser?.cancel()
-            browser = nil
-            link?.cancel()
-            link = nil
+            active = false
+            stopWatchdog()
+            disconnect()
+            if !failed { report(.ended) }
+            peer = nil
         }
-        if let session {
-            VTCompressionSessionInvalidate(session)
-        }
+        resetEncoder()
+    }
+
+    private func resetEncoder() {
+        if let session { VTCompressionSessionInvalidate(session) }
         session = nil
+        pool = nil
+        transfer = nil
+        lastTimestamp = nil
+        lastOrientation = nil
     }
 
-    // MARK: Finding and reaching Porthole
-
-    private func browse() {
-        browser?.cancel()
-        let found = NWBrowser(for: .bonjour(type: "_porthole-screen._tcp", domain: nil), using: .tcp)
-        found.browseResultsChangedHandler = { [weak self] results, _ in
-            guard let self, self.link == nil, let first = results.first else { return }
-            self.connect(to: first.endpoint)
+    private func connect() {
+        guard active, !paused, !deliveryStopped, link == nil, let peer else { return }
+        guard let current = TrustedPeerStore.load(), current.samePairing(as: peer) else {
+            fail("The trusted PC changed. Start sharing again from Porthole.")
+            return
         }
-        found.start(queue: queue)
-        browser = found
-    }
-
-    private func connect(to endpoint: NWEndpoint) {
-        let parameters = NWParameters.tcp
-        // Porthole listens on IPv4, and only accepts the phone whose photo link it knows.
-        if let ip = parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
-            ip.version = .v4
+        guard current.channelTicket != nil else {
+            waitForTicket()
+            return
         }
-        if let tcp = parameters.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
-            tcp.noDelay = true
-        }
-        let connection = NWConnection(to: endpoint, using: parameters)
+        self.peer = current
+        ticketDeadline = nil
+        attempts += 1
+        reconnectAt = nil
+        connectDeadline = .now() + .seconds(8)
+        let id = connectionID
+        let connection = TrustedPeerTransport.connection(to: current, port: 47732)
+        link = connection
         connection.stateUpdateHandler = { [weak self, weak connection] state in
-            guard let self, let connection, self.link === connection else { return }
+            guard let self, let connection, self.active, self.link === connection,
+                  self.connectionID == id else { return }
             switch state {
             case .ready:
-                connection.send(content: Data("PSCR 1\n".utf8), completion: .contentProcessed { _ in })
-                self.lock.lock()
-                self.ready = true
-                self.needKey = true
-                self.unacked = 0
-                self.lock.unlock()
-                self.watch(connection)
+                TrustedPeerTransport.authenticate(connection: connection, peer: current) { [weak self, weak connection] authenticated in
+                    guard let self, let connection, self.active, self.link === connection,
+                          self.connectionID == id else { return }
+                    guard authenticated, TrustedPeerStore.load()?.id == current.id,
+                          !TrustedPeerStore.shouldStopBroadcast(peer: peer) else {
+                        self.retry("The PC did not authenticate the screen connection.")
+                        return
+                    }
+                    connection.send(content: Data("PSCR 1\n".utf8), completion: .contentProcessed { [weak self, weak connection] error in
+                        guard let self, let connection, self.active, self.link === connection,
+                              self.connectionID == id else { return }
+                        if error != nil {
+                            self.retry("The PC did not accept the screen connection.")
+                            return
+                        }
+                        self.connectDeadline = nil
+                        self.firstFrameDeadline = .now() + .seconds(10)
+                        self.ready = true
+                        self.watch(connection, id: id)
+                    })
+                }
             case .failed, .cancelled:
-                self.dropLink()
-            case .waiting:
-                break /* the path comes up after mirroring is off; cancelling here drops the share */
+                self.retry("Could not verify or reach the paired PC.")
             default:
                 break
             }
         }
-        link = connection
         connection.start(queue: queue)
     }
 
-    /// Porthole answers every frame with one byte; a finished receive means it closed.
-    private func watch(_ connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 64) { [weak self] data, _, complete, error in
-            guard let self else { return }
+    private func watch(_ connection: NWConnection, id: UUID) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 64) { [weak self, weak connection] data, _, complete, error in
+            guard let self, let connection, self.active, self.link === connection,
+                  self.connectionID == id else { return }
             if let data, !data.isEmpty {
-                self.lock.lock()
-                self.unacked = max(0, self.unacked - data.count)
-                self.lock.unlock()
+                guard data.allSatisfy({ $0 == 0x41 }), data.count <= self.awaitingACK.count else {
+                    self.retry("The PC sent an invalid screen acknowledgement.")
+                    return
+                }
+                self.awaitingACK.removeFirst(data.count)
+                self.attempts = 0
+                self.firstFrameDeadline = nil
+                self.lastAcknowledgedFrame = .now()
+                self.report(.live)
             }
             if complete || error != nil {
-                connection.cancel()
-                self.dropLink()
+                self.retry("The PC closed the screen connection.")
                 return
             }
-            self.watch(connection)
+            self.watch(connection, id: id)
         }
     }
 
-    private func dropLink() {
-        lock.lock()
-        ready = false
-        let finished = stopped
-        lock.unlock()
+    private func disconnect() {
+        let old = link
         link = nil
-        if finished { return }
-        queue.asyncAfter(deadline: .now() + 2) { [weak self] in
-            guard let self, self.link == nil else { return }
-            self.browse()
+        ready = false
+        needKey = true
+        connectionID = UUID()
+        connectDeadline = nil
+        firstFrameDeadline = nil
+        reconnectAt = nil
+        lastAcknowledgedFrame = nil
+        lostFrames = 0
+        encoding.removeAll()
+        awaitingACK.removeAll()
+        old?.stateUpdateHandler = nil
+        old?.cancel()
+    }
+
+    private func retry(_ reason: String) {
+        disconnect()
+        guard active, !paused else { return }
+        guard attempts < 4 else {
+            fail(reason)
+            return
+        }
+        report(.reconnecting, message: reason)
+        reconnectAt = .now() + .seconds(max(1, attempts))
+    }
+
+    private func startWatchdog() {
+        stopWatchdog()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + .milliseconds(500), repeating: .milliseconds(500))
+        timer.setEventHandler { [weak self] in self?.checkHealth() }
+        watchdog = timer
+        timer.resume()
+    }
+
+    private func stopWatchdog() {
+        watchdog?.cancel()
+        watchdog = nil
+    }
+
+    private func waitForTicket() {
+        if ticketDeadline == nil { ticketDeadline = .now() + .seconds(60) }
+        if let deadline = ticketDeadline, DispatchTime.now() >= deadline {
+            fail("Reconnect your PC in Porthole to resume sharing.")
+        } else {
+            report(.reconnecting, message: "Waiting for the same PC to reconnect.")
         }
     }
 
-    // MARK: Frames
+    private func checkHealth() {
+        guard active, let peer else { return }
+        if TrustedPeerStore.shouldStopBroadcast(peer: peer) || deliveryStopped {
+            if !deliveryStopped {
+                deliveryStopped = true
+                disconnect()
+            }
+            report(.deliveryStopped, message: "Delivery to the PC has stopped. End Screen Recording in Control Center to finish the broadcast.")
+            return
+        }
+        guard let current = TrustedPeerStore.load(), current.samePairing(as: peer) else {
+            fail("The trusted PC changed. Start sharing again from Porthole.")
+            return
+        }
+        if current.channelTicket == nil {
+            if link != nil { disconnect() }
+            waitForTicket()
+            return
+        }
+        if current.id != peer.id {
+            disconnect()
+            attempts = 0
+            report(.reconnecting)
+            connect()
+            return
+        }
+        if paused {
+            report(.reconnecting, message: "Screen sharing paused.")
+            return
+        }
+        let now = DispatchTime.now()
+        if let deadline = connectDeadline, now >= deadline {
+            retry("Timed out connecting to the paired PC.")
+        } else if let expiry = awaitingACK.first, now >= expiry {
+            retry("The PC stopped acknowledging screen frames.")
+        } else if let expiry = firstFrameDeadline, now >= expiry {
+            retry("The PC did not acknowledge the first screen frame.")
+        } else if encoding.values.contains(where: { now >= $0 }) {
+            // ReplayKit owns the encoder. End the broadcast rather than leaving
+            // a stuck compression callback attached across reconnect attempts.
+            fail("The video encoder stopped returning frames.")
+        } else if lostFrames >= frameRate {
+            fail("The video encoder could not deliver screen frames.")
+        } else if let lastAcknowledgedFrame, now >= lastAcknowledgedFrame + .seconds(5) {
+            retry("No new screen frames reached the PC.")
+        } else if let when = reconnectAt, now >= when {
+            connect()
+        } else if let status = lastReport, status.phase == .connecting || status.phase == .reconnecting {
+            report(status.phase, message: status.message)
+        }
+    }
+
+    private func report(_ phase: BroadcastPhase, message: String? = nil) {
+        let now = DispatchTime.now()
+        if let lastReport, lastReport.phase == phase, lastReport.message == message,
+           now < lastReport.time + .seconds(2) { return }
+        lastReport = (phase, message, now)
+        TrustedPeerStore.publishBroadcast(peer: peer, phase: phase, message: message)
+    }
+
+    private func fail(_ message: String) {
+        guard active else { return }
+        active = false
+        failed = true
+        stopWatchdog()
+        disconnect()
+        report(.failed, message: message)
+        // A ReplayKit finish callback may call back into our queue.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.finishBroadcastWithError(NSError(domain: "Porthole Broadcast", code: 1,
+                                                    userInfo: [NSLocalizedDescriptionKey: message]))
+        }
+    }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with type: RPSampleBufferType) {
         guard type == .video, let image = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        lock.lock()
-        let go = ready && unacked < maxUnacked
-            && (!lastFrame.isValid || CMTimeGetSeconds(CMTimeSubtract(time, lastFrame)) >= minInterval)
-        let key = needKey
-        if go {
-            lastFrame = time
-            needKey = false
-            unacked += 1 /* counted now: the encoder is asynchronous */
-        }
-        lock.unlock()
-        guard go else { return }
+        let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let seconds = CMTimeGetSeconds(timestamp)
+        guard seconds.isFinite else { return }
+        if let lastTimestamp, seconds >= lastTimestamp, seconds - lastTimestamp < minInterval { return }
 
-        let width = CVPixelBufferGetWidth(image)
-        let height = CVPixelBufferGetHeight(image)
-        let fitted = Self.fit(width: width, height: height, longEdge: longEdge)
-        let source = fitted.w == width && fitted.h == height ? image : scale(image, to: fitted)
-        let encW = CVPixelBufferGetWidth(source)
-        let encH = CVPixelBufferGetHeight(source)
-        if session == nil || encW != sessionWidth || encH != sessionHeight {
-            makeSession(width: encW, height: encH)
-        }
-        guard let session else {
-            unsent()
+        let orientation = Self.orientation(sampleBuffer)
+        let reset = lastOrientation != orientation || lastTimestamp.map { seconds < $0 || seconds - $0 > 2 } == true
+        guard let ticket = queue.sync(execute: { reserveFrame(forceKey: reset) }) else { return }
+        lastTimestamp = seconds
+        lastOrientation = orientation
+
+        guard let source = makeSource(image, orientation: orientation) else {
+            loseFrame(ticket)
             return
         }
-        let properties: CFDictionary? = key
-            ? [kVTEncodeFrameOptionKey_ForceKeyFrame as String: true] as CFDictionary : nil
-        VTCompressionSessionEncodeFrame(session, imageBuffer: source, presentationTimeStamp: time,
-                                        duration: .invalid, frameProperties: properties,
-                                        infoFlagsOut: nil) { [weak self] status, _, sample in
+        let width = CVPixelBufferGetWidth(source)
+        let height = CVPixelBufferGetHeight(source)
+        let newSession = session == nil || reset || width != sessionWidth || height != sessionHeight
+        if newSession { makeSession(width: width, height: height) }
+        guard let session else {
+            loseFrame(ticket)
+            return
+        }
+
+        let force = ticket.forceKey || newSession
+        let properties: CFDictionary? = force ? [kVTEncodeFrameOptionKey_ForceKeyFrame as String: true] as CFDictionary : nil
+        var flags = VTEncodeInfoFlags()
+        let status = VTCompressionSessionEncodeFrame(session, imageBuffer: source, presentationTimeStamp: timestamp,
+                                                     duration: .invalid, frameProperties: properties,
+                                                     infoFlagsOut: &flags) { [weak self] result, flags, sample in
             guard let self else { return }
-            guard status == noErr, let sample, let encoded = Self.annexB(sample) else {
-                self.unsent() /* dropped by the encoder: nothing for the PC to answer */
+            guard result == noErr, !flags.contains(.frameDropped), let sample, let encoded = Self.annexB(sample) else {
+                self.loseFrame(ticket)
                 return
             }
-            self.send(encoded.0, keyframe: encoded.1)
+            self.queue.async { self.send(encoded.bytes, keyframe: encoded.keyframe, ticket: ticket) }
         }
+        if status != noErr || flags.contains(.frameDropped) { loseFrame(ticket) }
+    }
+
+    private func reserveFrame(forceKey: Bool) -> FrameTicket? {
+        // Keep ACKs in flight concurrently, but serialize compression output so
+        // asynchronously delivered callbacks cannot reorder H.264 frames.
+        guard active, ready, !paused, encoding.isEmpty, awaitingACK.count < maxOutstanding else { return nil }
+        let force = forceKey || needKey
+        if force { needKey = true }
+        let ticket = FrameTicket(connectionID: connectionID, forceKey: force)
+        encoding[ticket.id] = .now() + .seconds(5)
+        return ticket
+    }
+
+    private func loseFrame(_ ticket: FrameTicket) {
+        queue.async {
+            guard self.connectionID == ticket.connectionID,
+                  self.encoding.removeValue(forKey: ticket.id) != nil else { return }
+            self.needKey = true
+            self.lostFrames += 1
+        }
+    }
+
+    private func send(_ bytes: Data, keyframe: Bool, ticket: FrameTicket) {
+        guard active, ready, !paused, ticket.connectionID == connectionID,
+              encoding.removeValue(forKey: ticket.id) != nil, let link else { return }
+        guard !bytes.isEmpty, bytes.count <= Self.maxFrameBytes, (!needKey && !ticket.forceKey) || keyframe else {
+            needKey = true
+            lostFrames += 1
+            return
+        }
+        lostFrames = 0
+        if keyframe { needKey = false }
+        var frame = Data(capacity: bytes.count + 5)
+        let length = UInt32(bytes.count).bigEndian
+        withUnsafeBytes(of: length) { frame.append(contentsOf: $0) }
+        frame.append(keyframe ? 2 : 1)
+        frame.append(bytes)
+        awaitingACK.append(.now() + .seconds(5))
+        link.send(content: frame, completion: .contentProcessed { [weak self, weak link] error in
+            guard let self, let link, self.link === link, self.connectionID == ticket.connectionID,
+                  error != nil else { return }
+            self.retry("Could not send screen video to the paired PC.")
+        })
+    }
+
+    private static func orientation(_ sample: CMSampleBuffer) -> CGImagePropertyOrientation {
+        let attachment = CMGetAttachment(sample, key: RPVideoSampleOrientationKey as CFString, attachmentModeOut: nil)
+        guard let raw = attachment as? NSNumber else { return .up }
+        return CGImagePropertyOrientation(rawValue: raw.uint32Value) ?? .up
     }
 
     private func makeSession(width: Int, height: Int) {
@@ -206,46 +443,20 @@ final class SampleHandler: RPBroadcastSampleHandler {
                              value: NSNumber(value: frameRate))
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
                              value: NSNumber(value: 2))
-        VTCompressionSessionPrepareToEncodeFrames(made)
+        guard VTCompressionSessionPrepareToEncodeFrames(made) == noErr else {
+            VTCompressionSessionInvalidate(made)
+            return
+        }
         session = made
         sessionWidth = width
         sessionHeight = height
-        lock.lock()
-        needKey = true
-        lock.unlock()
-    }
-
-    private func send(_ bytes: Data, keyframe: Bool) {
-        var frame = Data(capacity: bytes.count + 5)
-        let length = UInt32(bytes.count).bigEndian
-        withUnsafeBytes(of: length) { frame.append(contentsOf: $0) }
-        frame.append(keyframe ? 2 : 1)
-        frame.append(bytes)
-        queue.async {
-            guard let link = self.link else {
-                self.unsent()
-                return
-            }
-            link.send(content: frame, completion: .contentProcessed { [weak self] error in
-                guard let self, error != nil else { return }
-                self.lock.lock()
-                self.needKey = true
-                self.lock.unlock()
-            })
-        }
-    }
-
-    private func unsent() {
-        lock.lock()
-        unacked = max(0, unacked - 1)
-        lock.unlock()
     }
 
     /// Longer side at most `longEdge`, both sides even, so the PC draws the same size it
     /// already handles for AirPlay.
     private static func fit(width: Int, height: Int, longEdge: Int) -> (w: Int, h: Int) {
         let long = max(width, height)
-        if long <= longEdge || width < 2 || height < 2 { return (width, height) }
+        if long <= longEdge { return (max(2, width & ~1), max(2, height & ~1)) }
         if width >= height {
             let w = longEdge & ~1
             let h = max(2, ((height * w + width / 2) / width) & ~1)
@@ -256,85 +467,125 @@ final class SampleHandler: RPBroadcastSampleHandler {
         return (w, h)
     }
 
-    /// The original buffer when it already fits, otherwise a scaled copy. A failed scale
-    /// keeps the original so the broadcast continues.
-    private func scale(_ image: CVImageBuffer, to size: (w: Int, h: Int)) -> CVImageBuffer {
+    private func makeSource(_ image: CVImageBuffer, orientation: CGImagePropertyOrientation) -> CVPixelBuffer? {
+        let inputWidth = CVPixelBufferGetWidth(image)
+        let inputHeight = CVPixelBufferGetHeight(image)
+        guard inputWidth >= 2, inputHeight >= 2 else { return nil }
+        if orientation != .up {
+            let rotated = CIImage(cvPixelBuffer: image).oriented(orientation)
+            let bounds = rotated.extent
+            let size = Self.fit(width: Int(bounds.width), height: Int(bounds.height), longEdge: longEdge)
+            guard let target = allocate(size, format: kCVPixelFormatType_32BGRA) else { return nil }
+            let normalized = rotated.transformed(by: .init(translationX: -bounds.minX, y: -bounds.minY))
+            let scaled = normalized.transformed(by: .init(scaleX: CGFloat(size.w) / bounds.width,
+                                                          y: CGFloat(size.h) / bounds.height))
+            imageContext.render(scaled, to: target, bounds: CGRect(x: 0, y: 0, width: size.w, height: size.h),
+                                colorSpace: CGColorSpaceCreateDeviceRGB())
+            return target
+        }
+        let size = Self.fit(width: inputWidth, height: inputHeight, longEdge: longEdge)
+        if size.w == inputWidth, size.h == inputHeight { return image }
         if transfer == nil {
             var made: VTPixelTransferSession?
-            guard VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &made) == noErr,
-                  let made else { return image }
+            guard VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &made) == noErr else { return nil }
             transfer = made
         }
-        if pool == nil || poolWidth != size.w || poolHeight != size.h {
-            let attrs: [CFString: Any] = [
-                kCVPixelBufferWidthKey: size.w,
-                kCVPixelBufferHeightKey: size.h,
-                kCVPixelBufferPixelFormatTypeKey: CVPixelBufferGetPixelFormatType(image),
-                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary
-            ]
-            var made: CVPixelBufferPool?
-            guard CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &made) == kCVReturnSuccess,
-                  let made else { return image }
-            pool = made
-            poolWidth = size.w
-            poolHeight = size.h
-        }
-        var dst: CVPixelBuffer?
-        guard let pool, let transfer,
-              CVPixelBufferPoolCreatePixelBuffer(nil, pool, &dst) == kCVReturnSuccess, let dst,
-              VTPixelTransferSessionTransferImage(transfer, from: image, to: dst) == noErr else {
-            return image
-        }
-        return dst
+        guard let transfer, let target = allocate(size, format: CVPixelBufferGetPixelFormatType(image)),
+              VTPixelTransferSessionTransferImage(transfer, from: image, to: target) == noErr else { return nil }
+        return target
     }
 
-    /// Length-prefixed NAL units to start codes, with SPS and PPS before a keyframe.
-    private static func annexB(_ sample: CMSampleBuffer) -> (Data, Bool)? {
-        guard let block = CMSampleBufferGetDataBuffer(sample) else { return nil }
-        var key = true
+    private func allocate(_ size: (w: Int, h: Int), format: OSType) -> CVPixelBuffer? {
+        if pool == nil || poolWidth != size.w || poolHeight != size.h || poolFormat != format {
+            let attributes: [CFString: Any] = [
+                kCVPixelBufferWidthKey: size.w,
+                kCVPixelBufferHeightKey: size.h,
+                kCVPixelBufferPixelFormatTypeKey: format,
+                kCVPixelBufferMetalCompatibilityKey: true,
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary
+            ]
+            var created: CVPixelBufferPool?
+            guard CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &created) == kCVReturnSuccess else { return nil }
+            pool = created
+            poolWidth = size.w
+            poolHeight = size.h
+            poolFormat = format
+        }
+        let limit = [kCVPixelBufferPoolAllocationThresholdKey as String: maxOutstanding + 1] as CFDictionary
+        var result: CVPixelBuffer?
+        guard let pool, CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, pool, limit, &result) == kCVReturnSuccess else { return nil }
+        return result
+    }
+
+    private static func annexB(_ sample: CMSampleBuffer) -> (bytes: Data, keyframe: Bool)? {
+        guard let block = CMSampleBufferGetDataBuffer(sample),
+              let format = CMSampleBufferGetFormatDescription(sample) else { return nil }
+        let length = CMBlockBufferGetDataLength(block)
+        guard length > 0, length <= maxFrameBytes else { return nil }
+        var parameterCount = 0
+        var headerWidth: Int32 = 0
+        guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: 0,
+                                                                parameterSetPointerOut: nil,
+                                                                parameterSetSizeOut: nil,
+                                                                parameterSetCountOut: &parameterCount,
+                                                                nalUnitHeaderLengthOut: &headerWidth) == noErr,
+              [1, 2, 4].contains(headerWidth), (2...32).contains(parameterCount) else { return nil }
+
+        var input = Data(count: length)
+        let copied = input.withUnsafeMutableBytes { (destination: UnsafeMutableRawBufferPointer) -> OSStatus in
+            guard let base = destination.baseAddress else { return -1 }
+            return CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: base)
+        }
+        guard copied == noErr else { return nil }
+
+        var keyframe = true
         if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
             as? [[CFString: Any]], let first = attachments.first {
-            key = !((first[kCMSampleAttachmentKey_NotSync] as? Bool) ?? false)
+            keyframe = !((first[kCMSampleAttachmentKey_NotSync] as? Bool) ?? false)
         }
+
         let start: [UInt8] = [0, 0, 0, 1]
-        var out = Data()
-        if key, let format = CMSampleBufferGetFormatDescription(sample) {
-            var count = 0
-            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: 0,
-                                                               parameterSetPointerOut: nil,
-                                                               parameterSetSizeOut: nil,
-                                                               parameterSetCountOut: &count,
-                                                               nalUnitHeaderLengthOut: nil)
-            for index in 0..<count {
+        var output = Data(capacity: min(maxFrameBytes, length + 256))
+        if keyframe {
+            var hasSPS = false
+            var hasPPS = false
+            for index in 0..<parameterCount {
                 var pointer: UnsafePointer<UInt8>?
                 var size = 0
-                if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: index,
-                                                                      parameterSetPointerOut: &pointer,
-                                                                      parameterSetSizeOut: &size,
-                                                                      parameterSetCountOut: nil,
-                                                                      nalUnitHeaderLengthOut: nil) == noErr,
-                   let pointer {
-                    out.append(contentsOf: start)
-                    out.append(pointer, count: size)
-                }
+                guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: index,
+                                                                        parameterSetPointerOut: &pointer,
+                                                                        parameterSetSizeOut: &size,
+                                                                        parameterSetCountOut: nil,
+                                                                        nalUnitHeaderLengthOut: nil) == noErr,
+                      let pointer, size > 0, size <= maxFrameBytes - output.count - start.count else { return nil }
+                hasSPS = hasSPS || pointer.pointee & 0x1f == 7
+                hasPPS = hasPPS || pointer.pointee & 0x1f == 8
+                output.append(contentsOf: start)
+                output.append(pointer, count: size)
             }
+            guard hasSPS, hasPPS else { return nil }
         }
-        var total = 0
-        var base: UnsafeMutablePointer<Int8>?
-        guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil,
-                                          totalLengthOut: &total, dataPointerOut: &base) == noErr,
-              let base else { return nil }
-        let bytes = UnsafeRawPointer(base).assumingMemoryBound(to: UInt8.self)
-        var offset = 0
-        while offset + 4 <= total {
-            let nal = Int(bytes[offset]) << 24 | Int(bytes[offset + 1]) << 16
-                | Int(bytes[offset + 2]) << 8 | Int(bytes[offset + 3])
-            offset += 4
-            if nal <= 0 || offset + nal > total { break }
-            out.append(contentsOf: start)
-            out.append(bytes + offset, count: nal)
-            offset += nal
+        guard appendAnnexB(input, prefixWidth: Int(headerWidth), into: &output) else { return nil }
+        return (output, keyframe)
+    }
+
+    /// AVCC permits one-, two-, and four-byte length fields. Convert complete units.
+    private static func appendAnnexB(_ input: Data, prefixWidth: Int, into output: inout Data) -> Bool {
+        guard [1, 2, 4].contains(prefixWidth), input.count <= maxFrameBytes else { return false }
+        let start: [UInt8] = [0, 0, 0, 1]
+        let payloadStart = output.count
+        var offset = input.startIndex
+        while offset < input.endIndex {
+            guard prefixWidth <= input.endIndex - offset else { return false }
+            var size = 0
+            for byte in input[offset..<(offset + prefixWidth)] { size = (size << 8) | Int(byte) }
+            offset += prefixWidth
+            guard size > 0, size <= input.endIndex - offset,
+                  size <= maxFrameBytes - output.count - start.count else { return false }
+            output.append(contentsOf: start)
+            output.append(contentsOf: input[offset..<(offset + size)])
+            offset += size
         }
-        return out.isEmpty ? nil : (out, key)
+        return output.count > payloadStart
     }
 }

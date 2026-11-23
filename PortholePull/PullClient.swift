@@ -1,5 +1,7 @@
-import AVFoundation
+import Combine
 import Foundation
+import ImageIO
+import CryptoKit
 import Network
 import Photos
 import UIKit
@@ -11,43 +13,91 @@ extension Notification.Name {
 }
 
 enum PhoneNotice {
-    static func arm() {
-        let center = UNUserNotificationCenter.current()
-        center.delegate = NoticeDelegate.shared
-        center.requestAuthorization(options: [.alert, .sound, .timeSensitive]) { _, _ in }
+    static let previewPrivacyKey = "porthole.hideLockScreenDetails"
+    private static let privateBody = "A received file is ready."
+    static var hidesLockScreenDetails: Bool {
+        UserDefaults.standard.object(forKey: previewPrivacyKey) as? Bool ?? true
     }
 
-    static func fileArrived(_ name: String, from device: String) {
+    static func arm(completion: @escaping () -> Void) {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = NoticeDelegate.shared
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in DispatchQueue.main.async(execute: completion) }
+    }
+
+    static func fileArrived(_ file: ReceivedFileReference, from device: String, privatePreview: Bool) {
+        let name = file.name
         let content = UNMutableNotificationContent()
-        content.title = device.isEmpty ? "File received" : "File from \(device)"
-        content.body = name
+        if privatePreview {
+            content.title = "Porthole"
+            content.body = privateBody
+        } else {
+            content.title = device.isEmpty ? "File received" : "File received from \(device)"
+            content.body = name
+        }
         content.sound = .default
-        content.interruptionLevel = .timeSensitive
         content.userInfo = ["file": name]
+        if let reference = try? JSONEncoder().encode(file) { content.userInfo["reference"] = reference }
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
+        let center = UNUserNotificationCenter.current()
+        center.add(request) { error in
+            // The setting can change while the notification service is accepting the request.
+            guard error == nil, !privatePreview, hidesLockScreenDetails else { return }
+            center.removePendingNotificationRequests(withIdentifiers: [request.identifier])
+            center.removeDeliveredNotifications(withIdentifiers: [request.identifier])
+        }
+    }
+
+    static func isDetailedFilePreview(_ content: UNNotificationContent) -> Bool {
+        content.userInfo["file"] is String && (content.title != "Porthole" || content.body != privateBody)
+    }
+
+    static func removeDetailedPreviews() {
+        let center = UNUserNotificationCenter.current()
+        center.getPendingNotificationRequests { requests in
+            guard hidesLockScreenDetails else { return }
+            center.removePendingNotificationRequests(withIdentifiers: requests
+                .filter { isDetailedFilePreview($0.content) }.map(\.identifier))
+            center.getDeliveredNotifications { notifications in
+                guard hidesLockScreenDetails else { return }
+                center.removeDeliveredNotifications(withIdentifiers: notifications.map(\.request)
+                    .filter { isDetailedFilePreview($0.content) }.map(\.identifier))
+            }
+        }
     }
 }
 
 final class NoticeDelegate: NSObject, UNUserNotificationCenterDelegate {
     static let shared = NoticeDelegate()
-    static var pendingName: String?
+    private static var pendingFiles: [ReceivedFileReference] = []
+
+    static func takePendingFiles() -> [ReceivedFileReference] {
+        defer { pendingFiles.removeAll() }
+        return pendingFiles
+    }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        completionHandler([.banner, .list, .sound])
+        // The in-app glass arrival banner is the foreground presentation.
+        completionHandler(PhoneNotice.hidesLockScreenDetails && PhoneNotice.isDetailedFilePreview(notification.request.content) ? [] : [.list])
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
-        let name = response.notification.request.content.userInfo["file"] as? String ?? ""
+        guard response.actionIdentifier == UNNotificationDefaultActionIdentifier else { completionHandler(); return }
+        let payload = response.notification.request.content.userInfo
+        let reference = (payload["reference"] as? Data)
+            .flatMap { try? JSONDecoder().decode(ReceivedFileReference.self, from: $0) }
+            ?? (payload["file"] as? String).flatMap { ReceivedFileWriter.validName($0) ? ReceivedFileReference(name: $0) : nil }
         DispatchQueue.main.async {
-            Self.pendingName = name
-            NotificationCenter.default.post(name: .portholeOpenReceived, object: name)
+            if let reference {
+                Self.pendingFiles.append(reference)
+                NotificationCenter.default.post(name: .portholeOpenReceived, object: nil)
+            }
+            completionHandler()
         }
-        completionHandler()
     }
 }
 
@@ -58,36 +108,114 @@ struct NearbyPC: Identifiable, Equatable {
 }
 
 final class PullClient: ObservableObject {
-    @Published var status = "Opening"
+    @Published var status = "Choose a PC or scan its secure connection QR code."
     @Published var address = ""
-    @Published var code = ""
     @Published private(set) var linked = false
     /// The PC's hostname, as advertised on this Wi-Fi.
     @Published private(set) var deviceName = ""
     @Published private(set) var nearby: [NearbyPC] = []
     @Published private(set) var chosenOriginal = ""
     @Published private(set) var clipStatus = ""
+    @Published private(set) var clipboardSyncEnabled = true
+    private let clipboardPreference = ClipboardSyncPreference()
+    private var inputPreference = InputControlPreference()
+    private var expectedInputReceipt: String?
+    private var requestedInputID: String?
+    private var inputVerification: InputVerificationAttempt?
+    private var inputVerificationTimer: DispatchWorkItem?
+    private var expectedClipboardReceipt: String?
+    private var proposedClipboardGeneration: Int?
+    private var acceptedClipboardGeneration: Int?
+    private var clipboardReceiptTimer: DispatchWorkItem?
+    private var pairingKey: String?
+    private var pairingCommitted = false
+    private var enrolling = false
+    private var pendingPairingCapabilities: [String] = []
+    private var originalReceipt: (id: UUID, name: String, bytes: Int64)?
+    private var originalTimer: DispatchWorkItem?
+    private var sendingOriginal = false
+    private var originalBodyQueued = false
+    private var originalEarlyReceipt: Bool?
+    private var originalDownload: PhotoExportStaging?
+    private var originalAccessMonitor: DispatchSourceTimer?
+    private var choiceTimer: DispatchWorkItem?
+    private final class MatchCancellation {
+        private let lock = NSLock()
+        private var stopped = false
+        func cancel() { lock.lock(); stopped = true; lock.unlock() }
+        var cancelled: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return stopped
+        }
+    }
+    private var matchCancellation: MatchCancellation?
+    private struct DeferredLine {
+        let text: String
+        let queued: (() -> Void)?
+    }
+    private var deferredLines: [DeferredLine] = []
+    @Published private(set) var phoneAlias = UserDefaults.standard.string(forKey: "porthole.phoneAlias") ?? "iPhone"
+    @Published private(set) var clipboardLinkReady = false
+    @Published private(set) var inputControlsEnabled = true
+    @Published private(set) var inputScreenSharingOnly = true
+    @Published private(set) var inputControlSupported = false
+    @Published private(set) var inputSettingsApplied = false
+    @Published private(set) var inputVerificationSupported = false
+    @Published private(set) var inputVerificationStatus: InputVerificationStatus = .required
     struct Arrival: Equatable {
         var id = UUID()
         var name: String
         var file: URL?
+        var reference: ReceivedFileReference? = nil
+        var warning: String? = nil
     }
     @Published var arrival: Arrival?
+    struct ReceiveProgress: Equatable {
+        typealias Phase = WidgetInboxSnapshot.ReceivePhase
+        let transferID: String
+        let name: String
+        let bytes: Int
+        let received: Int
+        let phase: Phase
+
+        var message: String {
+            switch phase {
+            case .receiving: return "Receiving from PC"
+            case .saving: return "Saving to Files"
+            case .interrupted: return "Transfer interrupted. Retry from your PC to resume."
+            case .failed: return "Unable to save the file. Check available storage and retry from your PC."
+            }
+        }
+    }
+    @Published private(set) var receiveProgress: ReceiveProgress?
     @Published private(set) var choiceIDs: [String] = []
     /// Files and copies that moved between this iPhone and the PC, newest first.
-    struct ActivityItem: Identifiable, Codable, Equatable {
-        var id = UUID()
-        var date = Date()
-        var title: String
-        var detail: String
-        var isFile: Bool
-        var incoming: Bool
-        /// File name inside Files › Porthole, when this row can be opened again.
-        var path: String? = nil
-    }
+    typealias ActivityItem = ActivityRecord
     @Published private(set) var history: [ActivityItem] = []
-    private static let historyKey = "porthole.activity"
-    private static let historyLimit = 60
+    @Published private(set) var saveFolderName = "On My iPhone › Porthole"
+    @Published private(set) var usesCustomSaveFolder = false
+    @Published private(set) var unreadReceived = 0
+    @Published private(set) var hideLockScreenDetails = PhoneNotice.hidesLockScreenDetails
+    private let widgetInbox = WidgetInboxPublisher()
+    private var hasReceivedFiles = UserDefaults.standard.bool(forKey: "porthole.hasReceivedFiles")
+    @Published var activityMessage = ""
+    @Published var storageMessage = ""
+    @Published private(set) var clipboardHistoryEnabled = UserDefaults.standard.bool(forKey: "porthole.clipboardHistory")
+    // Access historyRecords and its load state only on historyQueue.
+    private var historyLoaded = false
+    private var historyRecords: [ActivityItem] = []
+    private var historyAllowsClipboard = UserDefaults.standard.bool(forKey: "porthole.clipboardHistory")
+    private let fileQueue = DispatchQueue(label: "porthole.files")
+    private let fileStorage: ReceivedFileStorage = {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        return ReceivedFileStorage(defaultFolder: docs.appendingPathComponent("Porthole", isDirectory: true),
+                                   previewFolder: FileManager.default.temporaryDirectory.appendingPathComponent("PortholePreviews", isDirectory: true))
+    }()
+    private let historyStore: ActivityHistoryStore = {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return ActivityHistoryStore(root: support.appendingPathComponent("PortholeActivity", isDirectory: true))
+    }()
     private let queue = DispatchQueue(label: "porthole.pull")
     private var connection: NWConnection?
     private var browser: NWBrowser?
@@ -95,42 +223,269 @@ final class PullClient: ObservableObject {
     private var announcer: NWListener?
     private var buffer = Data()
     private var greeted = false
+    private var transportPeer: TrustedPeer?
+    private var handshakeTimer: DispatchWorkItem?
+    private var frameTimer: DispatchWorkItem?
+    private var inputReceiptTimer: DispatchWorkItem?
+    private var matching = false
+    private let matchQueue = DispatchQueue(label: "porthole.match", qos: .userInitiated)
+    private let clipboardImageQueue = DispatchQueue(label: "porthole.clipboard.images", qos: .userInitiated)
+    private let historyQueue = DispatchQueue(label: "porthole.history", qos: .utility)
+    private var requestedPeer: TrustedPeer?
+    private var disconnectedByPC = false
+    private var connecting = false
+    @Published private(set) var fileSendPeer: TrustedPeer?
+    @Published private(set) var broadcastStatus: TrustedBroadcastStatus?
+    @Published private(set) var sharedPairingReady = false
+    private let savedPeerKey = "porthole.secure-peer"
+    private let lineLimit = 24 * 1024
     private var reconnectAttempt = 0
     private var reconnectWork: DispatchWorkItem?
-    private let stay = SilentKeepAlive()
     private weak var index: PhotoIndex?
     // Accessed only on queue. Explicit selection bypasses visual matching once.
     private var chosenIdentifier: String?
     private var syncReady = false
+    private var didReclaimStaging = false
+    private var receivingRecoveryScheduled = false
     private var foreground = true
     private var exporting = false
     private var bodyLeft = 0
     private var bodyKind: Character = "T"
+    private var bodyClipboardGeneration: Int?
     private var body = Data()
     private var pendingData: Data?
+    private var pendingClipboardGeneration: Int?
     private var pendingKind: Character = "T"
-    private var deferred: (Character, Data)?
     private var seenCount = -1
     private var writingRemote = false
-    private var lastSent = ""
-    private var launchSend = true
-    private var pasteObserver: NSObjectProtocol?
+    private var lastRemoteClipboardAt: DispatchTime?
+    private var decodingRemoteClipboard = false
     private var choicePending = false
     private var pushLeft = 0
-    private var pushHandle: FileHandle?
-    private var pushURL: URL?
-    private var pushName = ""
-    private var pushFailed = false
+    private var pushChunkLeft = 0
+    private var chunkedPush = false
+    private var lastReceiveProgressAt = DispatchTime(uptimeNanoseconds: 0)
+    private var pushStage: IncomingTransferStore.Stage?
+    private var pushTransfer: IncomingTransfer?
+    private var incomingOperation: UUID?
+    private var incomingHeartbeat: DispatchWorkItem?
+    // Only the main queue touches UIKit background task identifiers.
+    private var receiveBackgroundTasks: [UUID: UIBackgroundTaskIdentifier] = [:]
+    private let incomingQueue = DispatchQueue(label: "porthole.incoming", qos: .utility)
+    private let incomingStore = IncomingTransferStore(root: FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("PortholeIncoming", isDirectory: true))
+
+    init() {
+        saveFolderName = fileStorage.folderName
+        usesCustomSaveFolder = fileStorage.usesCustomFolder
+        clipboardSyncEnabled = clipboardPreference.generation != nil
+        inputControlsEnabled = inputPreference.enabled
+        inputScreenSharingOnly = inputPreference.screenSharingOnly
+    }
+
+    var inputControlSummary: String {
+        if !linked { return "Disconnected" }
+        if !inputControlsEnabled { return "Disabled" }
+        if !inputControlSupported || !inputVerificationSupported { return "PC update required" }
+        if !inputSettingsApplied { return "Applying settings" }
+        if inputVerificationStatus.inProgress { return "Verifying Bluetooth" }
+        return inputVerificationStatus == .verified ? "Bluetooth verified" : "Verification required"
+    }
+
+    var canVerifyInput: Bool {
+        linked && inputControlsEnabled && inputSettingsApplied && inputVerificationSupported &&
+            !inputVerificationStatus.inProgress && inputVerificationStatus != .verified
+    }
+
+    func beginInputVerification() {
+        guard canVerifyInput, let peer = fileSendPeer else { return }
+        let attempt = InputVerificationAttempt()
+        let id = attempt.id
+        inputVerification = attempt
+        inputVerificationStatus = .waiting
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self, self.inputVerification?.id == id else { return }
+            self.cancelInputVerification(message: "Bluetooth verification timed out.")
+        }
+        inputVerificationTimer = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 45, execute: timeout)
+        queue.async {
+            guard self.greeted, self.transportPeer?.id == peer.id else { return }
+            guard !self.sendingOriginal else {
+                DispatchQueue.main.async {
+                    guard self.inputVerification?.id == id else { return }
+                    self.endInputVerification(.failed("Try again after the Photos transfer finishes."))
+                }
+                return
+            }
+            self.send("IV BEGIN \(id)\n")
+        }
+    }
+
+    func captureInputVerificationKey(_ usage: Int) {
+        guard inputVerificationStatus == .waiting, let id = inputVerification?.id,
+              let proof = inputVerification?.acceptKeypadUsage(usage), let peer = fileSendPeer else { return }
+        inputVerificationStatus = .confirming
+        queue.async {
+            guard self.greeted, self.transportPeer?.id == peer.id else { return }
+            self.send("IV PROOF \(id) \(proof)\n")
+        }
+    }
+
+    func cancelInputVerification(message: String? = nil) {
+        guard let id = inputVerification?.id else { return }
+        if let peer = fileSendPeer {
+            queue.async {
+                guard self.greeted, self.transportPeer?.id == peer.id else { return }
+                self.send("IV CANCEL \(id)\n")
+            }
+        }
+        endInputVerification(message.map(InputVerificationStatus.failed) ?? .required)
+    }
+
+    private func endInputVerification(_ status: InputVerificationStatus) {
+        inputVerificationTimer?.cancel()
+        inputVerificationTimer = nil
+        inputVerification = nil
+        inputVerificationStatus = status
+    }
+
+    func setInputControlsEnabled(_ enabled: Bool) {
+        if !enabled {
+            cancelInputVerification()
+            endInputVerification(.required)
+        }
+        inputControlsEnabled = enabled
+        inputPreference.enabled = enabled
+        inputPreference.save()
+        sendInputPreferences(restricting: !enabled)
+    }
+
+    func setInputScreenSharingOnly(_ enabled: Bool) {
+        inputScreenSharingOnly = enabled
+        inputPreference.screenSharingOnly = enabled
+        inputPreference.save()
+        sendInputPreferences(restricting: enabled)
+    }
+
+    private func sendInputPreferences(restricting: Bool = false) {
+        inputSettingsApplied = false
+        guard let peer = fileSendPeer, inputControlSupported else { return }
+        let update = inputPreference.update(verificationAvailable: inputVerificationSupported)
+        requestedInputID = update.id
+        queue.async {
+            guard self.greeted, self.transportPeer?.id == peer.id else { return }
+            if restricting, self.sendingOriginal {
+                self.disconnect(peer, message: "Photos transfer stopped to apply mouse and keyboard settings. Reconnecting…")
+                return
+            }
+            self.expectedInputReceipt = update.receipt
+            self.inputReceiptTimer?.cancel()
+            self.send(update.command) { [weak self] in
+                guard let self, self.expectedInputReceipt == update.receipt else { return }
+                self.inputReceiptTimer = self.receiptTimeout(for: peer, message: "The PC did not confirm mouse and keyboard preferences.")
+            }
+        }
+    }
+
+    private func receiptTimeout(for peer: TrustedPeer, message: String) -> DispatchWorkItem {
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self, self.transportPeer?.id == peer.id else { return }
+            self.disconnect(peer, message: message)
+        }
+        queue.asyncAfter(deadline: .now() + 5, execute: timeout)
+        return timeout
+    }
+
+    var clipboardSummary: String {
+        if !clipboardSyncEnabled { return "Disabled" }
+        if !linked { return "Waiting for connection" }
+        return clipboardLinkReady ? "Enabled · Bidirectional" : "Waiting for PC confirmation"
+    }
+
+    func setClipboardSyncEnabled(_ enabled: Bool) {
+        guard clipboardSyncEnabled != enabled else { return }
+        clipboardPreference.setEnabled(enabled)
+        clipboardSyncEnabled = enabled
+        clipboardLinkReady = false
+        clipStatus = enabled ? "Waiting for PC confirmation." : "Clipboard sync disabled."
+        let peerID = fileSendPeer?.id
+        queue.async {
+            guard let peer = self.transportPeer, peer.id == peerID else { return }
+            if !enabled, self.sendingOriginal {
+                self.disconnect(peer, message: "Photos transfer stopped to disable clipboard sync. Reconnecting…")
+                return
+            }
+            self.pendingData = nil
+            self.pendingClipboardGeneration = nil
+            if self.syncReady { self.negotiateClipboard(peer) }
+        }
+    }
+
+    private func negotiateClipboard(_ peer: TrustedPeer) {
+        acceptedClipboardGeneration = nil
+        let id = UUID().uuidString.lowercased()
+        proposedClipboardGeneration = clipboardPreference.generation
+        let value = proposedClipboardGeneration == nil ? 0 : 1
+        expectedClipboardReceipt = "SYNC OK \(id) \(value)"
+        clipboardReceiptTimer?.cancel()
+        send("SYNC \(id) \(value)\n") { [weak self] in
+            guard let self, self.expectedClipboardReceipt == "SYNC OK \(id) \(value)" else { return }
+            self.clipboardReceiptTimer = self.receiptTimeout(for: peer, message: "The PC did not confirm the clipboard setting.")
+        }
+    }
+
+    func setPhoneAlias(_ raw: String) {
+        let name = Self.displayName(raw, maxBytes: 63) ?? "iPhone"
+        phoneAlias = name
+        UserDefaults.standard.set(name, forKey: "porthole.phoneAlias")
+        guard let peer = fileSendPeer else { return }
+        queue.async {
+            if self.transportPeer?.id == peer.id { self.send("NAME \(name)\n") }
+        }
+    }
+
+    private static func displayName(_ raw: String, maxBytes: Int) -> String? {
+        let clean = raw.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }
+        let name = String(String.UnicodeScalarView(clean)).trimmingCharacters(in: .whitespacesAndNewlines)
+        var result = ""
+        var remaining = maxBytes
+        for character in name.prefix(40) {
+            let length = String(character).utf8.count
+            guard length <= remaining else { break }
+            result.append(character)
+            remaining -= length
+        }
+        return result.isEmpty ? nil : result
+    }
+
+    private func canSendClipboard() -> Bool {
+        guard clipboardPreference.generation != nil else {
+            clipStatus = "Clipboard sync is disabled."
+            return false
+        }
+        guard linked else {
+            clipStatus = "Connect to a PC to transfer clipboard content."
+            return false
+        }
+        guard clipboardLinkReady else { clipStatus = "Waiting for PC confirmation."; return false }
+        return true
+    }
 
     func chooseOriginal(_ identifier: String) {
+        guard let peer = fileSendPeer else { return }
         queue.async {
+            guard self.transportPeer?.id == peer.id else { return }
             guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject else {
-                DispatchQueue.main.async { self.status = "Allow access to that item in Settings → Porthole → Photos" }
+                DispatchQueue.main.async {
+                    if self.fileSendPeer?.id == peer.id { self.status = "Photo access required for the selected item. Review Settings › Porthole › Photos." }
+                }
                 return
             }
             self.chosenIdentifier = identifier
             let name = PHAssetResource.assetResources(for: asset).first?.originalFilename ?? "Selected original"
-            DispatchQueue.main.async { self.chosenOriginal = name }
+            DispatchQueue.main.async { if self.fileSendPeer?.id == peer.id { self.chosenOriginal = name } }
         }
     }
 
@@ -138,6 +493,7 @@ final class PullClient: ObservableObject {
     func pickChoice(_ id: String?) {
         queue.async {
             guard self.choicePending else { return }
+            self.choiceTimer?.cancel()
             self.choicePending = false
             DispatchQueue.main.async { self.choiceIDs = [] }
             guard let id,
@@ -146,7 +502,43 @@ final class PullClient: ObservableObject {
                 DispatchQueue.main.async { self.status = "No file sent" }
                 return
             }
-            self.export(asset, note: "picked")
+            self.export(asset, approved: true)
+        }
+    }
+
+    var widgetReceiveAttention: ReceiveProgress.Phase? {
+        guard let phase = widgetInbox.snapshot.transfer?.phase, !phase.inProgress else { return nil }
+        return phase
+    }
+
+    func dismissReceiveStatus() {
+        if widgetReceiveAttention != nil { setReceiveProgress(nil) }
+    }
+
+    private func setReceiveProgress(_ progress: ReceiveProgress?) {
+        if let phase = progress?.phase {
+            let now = Date()
+            if widgetInbox.snapshot.transfer?.shouldRefresh(for: phase, at: now) ?? true {
+                widgetInbox.update { $0.transfer = .init(phase: phase, reportedAt: now) }
+            }
+        } else if widgetInbox.snapshot.transfer != nil {
+            widgetInbox.update { $0.transfer = nil }
+        }
+        receiveProgress = progress
+    }
+
+    func setHideLockScreenDetails(_ hidden: Bool) {
+        hideLockScreenDetails = hidden
+        UserDefaults.standard.set(hidden, forKey: PhoneNotice.previewPrivacyKey)
+        widgetInbox.updatePrivacy(hidden)
+        if hidden { PhoneNotice.removeDetailedPreviews() }
+    }
+
+    private func publishWidgetPairing() {
+        let pairing: WidgetInboxSnapshot.Pairing = linked ? .paired : savedPeer() == nil ? .unpaired : .disconnected
+        widgetInbox.update {
+            $0.pairing = pairing
+            $0.hideLockScreenDetails = hideLockScreenDetails
         }
     }
 
@@ -162,45 +554,302 @@ final class PullClient: ObservableObject {
     }
 
     func bind(index: PhotoIndex) {
-        self.index = index
+        queue.async { [weak index] in self.index = index }
     }
 
     func clearHistory() {
-        history = []
-        UserDefaults.standard.removeObject(forKey: PullClient.historyKey)
+        historyQueue.async {
+            do {
+                if !self.historyLoaded { _ = try? self.historyStore.load() }
+                if let journal = ShareReceiptJournal.shared() {
+                    for receipt in try journal.pending() { try journal.remove(receipt.id) }
+                }
+                try self.historyStore.clear()
+                self.historyRecords = []
+                self.historyLoaded = true
+                self.publishHistory()
+                self.reportHistory("History cleared. Received files are still in Files.")
+            } catch { self.reportHistory("Unable to clear history. Try again.") }
+        }
     }
 
-    private func loadHistory() {
-        guard history.isEmpty, let data = UserDefaults.standard.data(forKey: PullClient.historyKey),
-              let saved = try? JSONDecoder().decode([ActivityItem].self, from: data) else { return }
-        history = saved
+    func removeActivity(_ ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        historyQueue.async {
+            guard self.historyLoaded else { return }
+            let kept = self.historyRecords.filter { !ids.contains($0.id) }
+            do {
+                self.historyRecords = try self.historyStore.save(kept)
+                self.publishHistory()
+            } catch { self.reportHistory("Unable to update activity history.") }
+        }
     }
+
+    func setClipboardHistoryEnabled(_ enabled: Bool) {
+        clipboardHistoryEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "porthole.clipboardHistory")
+        historyQueue.async {
+            self.historyAllowsClipboard = enabled
+            if !enabled { self.loadAndTrimHistory(force: true) }
+        }
+    }
+
+    func sendActivity(_ item: ActivityItem) {
+        guard canSendClipboard(), let peer = fileSendPeer, let revision = clipboardPreference.generation else { return }
+        if let text = item.clipboardText { deliverText(text) }
+        else if let url = clipboardPreviewURL(item) {
+            clipboardImageQueue.async {
+                guard let data = try? Data(contentsOf: url), !data.isEmpty, data.count <= 8 * 1024 * 1024 else { return }
+                DispatchQueue.main.async {
+                    guard self.fileSendPeer?.id == peer.id, self.clipboardPreference.allows(revision) else { return }
+                    self.queueClip(kind: "P", data: data)
+                    self.clipStatus = "Image queued for transfer."
+                }
+            }
+        }
+    }
+
+    /// A notification or file preview can mark just its own receipt.
+    func markReceivedRead(_ referenceID: UUID) {
+        markReceivedRead { $0.fileReference?.id == referenceID }
+    }
+
+    func markReceivedRecordsRead(_ recordIDs: Set<UUID>) {
+        markReceivedRead { recordIDs.contains($0.id) }
+    }
+
+    private func markReceivedRead(where matches: @escaping (ActivityItem) -> Bool) {
+        historyQueue.async {
+            var records = self.historyRecords
+            let changed = records.indices.filter { records[$0].isUnreadReceivedFile && matches(records[$0]) }
+            guard !changed.isEmpty else { return }
+            for offset in changed { records[offset].isUnread = false }
+            do {
+                self.historyRecords = self.historyLoaded ? try self.historyStore.save(records) : records
+                self.publishHistory()
+            } catch { self.reportHistory("Unable to mark received files as read.") }
+        }
+    }
+
+    private func publishHistory() {
+        let records = historyRecords
+        let received = records.filter(\.isReceivedFile)
+        let unread = received.filter(\.isUnreadReceivedFile).count
+        DispatchQueue.main.async {
+            self.history = self.clipboardHistoryEnabled ? records : records.filter(\.isFile)
+            self.unreadReceived = unread
+            if !received.isEmpty { self.rememberReceivedFiles() }
+            self.widgetInbox.update {
+                $0.unreadCount = unread
+                $0.hasReceivedFiles = self.hasReceivedFiles
+            }
+        }
+    }
+
+    private func rememberReceivedFiles() {
+        guard !hasReceivedFiles else { return }
+        hasReceivedFiles = true
+        UserDefaults.standard.set(true, forKey: "porthole.hasReceivedFiles")
+    }
+
+    private func reportHistory(_ message: String) {
+        DispatchQueue.main.async { self.activityMessage = message }
+    }
+
+    private func loadAndTrimHistory(force: Bool = false) {
+        do {
+            if !historyLoaded {
+                historyRecords = try historyStore.load()
+                historyLoaded = true
+            }
+            let kept = ActivityHistoryStore.retained(historyAllowsClipboard ? historyRecords : historyRecords.filter(\.isFile))
+            historyRecords = force || kept != historyRecords ? try historyStore.save(kept) : kept
+            publishHistory()
+        } catch { reportHistory("Saved activity could not be updated. Existing received files are unchanged.") }
+    }
+
+    private func loadHistory() { historyQueue.async { self.loadAndTrimHistory() } }
+
+    func importSentReceipts() {
+        historyQueue.async {
+            guard self.historyLoaded, let journal = ShareReceiptJournal.shared() else { return }
+            do {
+                journal.pruneImported()
+                let receipts = try journal.pending()
+                guard !receipts.isEmpty else { return }
+                let existing = Set(self.historyRecords.map(\.id))
+                var merged = self.historyRecords
+                for receipt in receipts where !existing.contains(receipt.id) {
+                    merged.append(ActivityItem(id: receipt.id, date: receipt.date, title: receipt.name,
+                                               detail: "Sent to \(receipt.peerName)", isFile: true, incoming: false, bytes: receipt.bytes))
+                }
+                merged.sort { $0.date > $1.date }
+                try self.historyStore.save(merged)
+                self.historyRecords = merged
+                self.publishHistory()
+                for receipt in receipts { try journal.markImported(receipt.id) }
+            } catch { self.reportHistory("Share activity could not be imported. Porthole will try again when you reopen it.") }
+        }
+    }
+
+    func chooseSaveFolder(_ url: URL) {
+        fileQueue.async {
+            do {
+                try self.fileStorage.chooseFolder(url)
+                self.reportSaveFolder("Save folder updated. Existing files stay in their original folders.")
+            } catch {
+                DispatchQueue.main.async { self.storageMessage = error.localizedDescription }
+            }
+        }
+    }
+
+    func resetSaveFolder() {
+        fileQueue.async {
+            self.fileStorage.resetFolder()
+            self.reportSaveFolder("New received files will be saved in Porthole.")
+        }
+    }
+
+    private func reportSaveFolder(_ message: String) {
+        let name = fileStorage.folderName
+        let custom = fileStorage.usesCustomFolder
+        DispatchQueue.main.async {
+            self.saveFolderName = name
+            self.usesCustomSaveFolder = custom
+            self.storageMessage = message
+        }
+    }
+
+    func openReceived(_ reference: ReceivedFileReference, completion: @escaping (Result<URL, Error>) -> Void) {
+        fileQueue.async {
+            let result = Result { try self.fileStorage.prepareForReading(reference) }
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
+    func releaseReceivedPreview(_ url: URL) { fileQueue.async { self.fileStorage.releasePreview(url) } }
+
+    func canCopy(_ item: ActivityItem) -> Bool {
+        item.clipboardText != nil || item.clipboardImage.flatMap(historyStore.clipboardImageURL) != nil
+    }
+
+    func clipboardPreviewURL(_ item: ActivityItem) -> URL? {
+        item.clipboardImage.flatMap(historyStore.clipboardImageURL)
+    }
+
+    func copyActivity(_ item: ActivityItem, completion: @escaping (Bool) -> Void) {
+        guard clipboardHistoryEnabled else {
+            activityMessage = "Clipboard history is disabled."
+            completion(false)
+            return
+        }
+        if let text = item.clipboardText {
+            writeLocalClipboard(type: .utf8PlainText, value: text)
+            activityMessage = "Copied to this iPhone. Ready to paste."
+            completion(true)
+            return
+        }
+        guard let name = item.clipboardImage, let url = historyStore.clipboardImageURL(name) else {
+            activityMessage = "The full content of this clipboard item is unavailable."
+            completion(false)
+            return
+        }
+        clipboardImageQueue.async {
+            let data = try? Data(contentsOf: url)
+            DispatchQueue.main.async {
+                guard self.clipboardHistoryEnabled, self.history.contains(where: { $0.id == item.id }),
+                      let data, (1...8 * 1024 * 1024).contains(data.count) else {
+                    self.activityMessage = "The clipboard image is unavailable."
+                    completion(false)
+                    return
+                }
+                self.writeLocalClipboard(type: .png, value: data)
+                self.activityMessage = "Copied to this iPhone. Ready to paste."
+                completion(true)
+            }
+        }
+    }
+
+    var canStartBroadcast: Bool { fileSendPeer != nil && sharedPairingReady }
+
+    func matchesReviewedPairing(_ peer: TrustedPeer) -> Bool {
+        requestedPeer?.samePairing(as: peer) == true
+    }
+
+    var widgetShortcutPairing: TrustedPeer? { fileSendPeer?.remembered ?? savedPeer() }
+
+    func reconnectForWidgetShortcut(_ peer: TrustedPeer) -> Bool {
+        guard !disconnectedByPC, savedPeer()?.samePairing(as: peer) == true else { return false }
+        loadSaved()
+        guard matchesReviewedPairing(peer) else { return false }
+        if !linked && !connecting { connect() }
+        return connecting
+    }
+
+    var sharedPairingIssue: String? {
+        guard fileSendPeer != nil, !sharedPairingReady else { return nil }
+        return "Sign Porthole, Broadcast, and Share with the same companion App Group to enable transfers and screen sharing."
+    }
+
+    private func publishSharedPeer(_ peer: TrustedPeer) {
+        sharedPairingReady = TrustedPeerStore.save(peer) && TrustedPeerStore.load() == peer
+    }
+
+    func requestNotificationPermission(completion: @escaping () -> Void = {}) { PhoneNotice.arm(completion: completion) }
+
+    func refreshBroadcastStatus() {
+        guard let snapshot = TrustedPeerStore.broadcastStatus(),
+              snapshot.peerID == requestedPeer?.stableID,
+              Date().timeIntervalSince(snapshot.updatedAt) < 8 else {
+            if broadcastStatus != nil { broadcastStatus = nil }
+            return
+        }
+        if broadcastStatus != snapshot { broadcastStatus = snapshot }
+    }
+
+    func requestBroadcastStop() -> Bool {
+        guard let peer = requestedPeer,
+              let snapshot = TrustedPeerStore.broadcastStatus(), snapshot.peerID == peer.stableID,
+              Date().timeIntervalSince(snapshot.updatedAt) < 8 else { return false }
+        switch snapshot.phase {
+        case .connecting, .live, .reconnecting: break
+        default: return false
+        }
+        return TrustedPeerStore.requestBroadcastStop(peer: peer)
+    }
+
+
 
     /// Callable from any queue; the list lives on the main thread.
     private func deviceTitle() -> String {
         let name = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
-        if name.isEmpty { return "this device" }
+        if name.isEmpty { return "your PC" }
         return name
     }
 
-    private func adoptDeviceName() {
-        let host = address.split(separator: ":").first.map(String.init) ?? address
-        guard let match = nearby.first(where: { $0.address == host }) else { return }
-        let name = match.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else { return }
-        deviceName = name
-        UserDefaults.standard.set(name, forKey: "porthole.device")
-    }
-
-    private func note(_ title: String, _ detail: String, file: Bool, incoming: Bool, path: String? = nil) {
+    private func note(_ title: String, _ detail: String, file: Bool, incoming: Bool,
+                      path: String? = nil, receivedFile: ReceivedFileReference? = nil,
+                      clipboardText: String? = nil, clipboardImage: Data? = nil, bytes: Int64? = nil) {
         DispatchQueue.main.async {
             let shown = detail.replacingOccurrences(of: "the PC", with: self.deviceTitle())
-            self.history.insert(ActivityItem(title: title, detail: shown, isFile: file, incoming: incoming, path: path), at: 0)
-            if self.history.count > PullClient.historyLimit {
-                self.history.removeLast(self.history.count - PullClient.historyLimit)
-            }
-            if let data = try? JSONEncoder().encode(self.history) {
-                UserDefaults.standard.set(data, forKey: PullClient.historyKey)
+            self.historyQueue.async {
+                guard file || self.historyAllowsClipboard else { return }
+                let record = ActivityItem(title: title, detail: shown, isFile: file, incoming: incoming,
+                                          path: path, receivedFile: receivedFile, clipboardText: clipboardText, bytes: bytes)
+                if self.historyLoaded {
+                    do {
+                        if let clipboardImage {
+                            self.historyRecords = try self.historyStore.saveClipboardImage(clipboardImage, record: record,
+                                                                                           before: self.historyRecords)
+                        } else {
+                            self.historyRecords = try self.historyStore.save([record] + self.historyRecords)
+                        }
+                    } catch { self.reportHistory("Activity could not be saved on this iPhone.") }
+                } else {
+                    self.historyRecords = ActivityHistoryStore.retained([record] + self.historyRecords)
+                    self.reportHistory("Saved activity is unavailable. New activity is shown for this session.")
+                }
+                self.publishHistory()
             }
         }
     }
@@ -211,10 +860,44 @@ final class PullClient: ObservableObject {
     }
 
     /// Bonjour is what makes iOS show Local Network. A plain TCP connect often does not.
-    func prepare() {
-        PhoneNotice.arm()
+    func loadLocalState() {
         loadSaved()
+        publishWidgetPairing()
+        if hideLockScreenDetails { PhoneNotice.removeDetailedPreviews() }
         loadHistory()
+        importSentReceipts()
+        UserDefaults.standard.removeObject(forKey: "porthole.code")
+        if !didReclaimStaging {
+            didReclaimStaging = true
+            fileQueue.async {
+                self.fileStorage.reclaimOldPreviews()
+                TransferStaging.removeExpiredDirectories(in: FileManager.default.temporaryDirectory, prefix: "Original-",
+                                                         olderThan: Date().addingTimeInterval(-86400))
+            }
+        }
+        recoverReceivedTransfers()
+        fileQueue.async { OutboundTransferJournal.shared()?.reclaimExpired() }
+    }
+
+    private func recoverReceivedTransfers() {
+        guard !receivingRecoveryScheduled else { return }
+        receivingRecoveryScheduled = true
+        incomingQueue.async {
+            for (path, receipt) in self.incomingStore.unimportedReceipts() {
+                self.importReceivedReceipt(receipt, at: path)
+            }
+            for intent in self.incomingStore.pendingStaging() {
+                if (try? self.fileStorage.recoverStaging(intent)) != nil {
+                    self.incomingStore.completeStaging(intent.id)
+                }
+            }
+            self.incomingStore.reclaimExpired()
+            DispatchQueue.main.async { self.receivingRecoveryScheduled = false }
+        }
+    }
+
+    func prepare() {
+        loadLocalState()
         guard browser == nil else { return }
         let parameters = NWParameters.tcp
         let browser = NWBrowser(for: .bonjour(type: "_porthole._tcp", domain: nil), using: parameters)
@@ -234,66 +917,47 @@ final class PullClient: ObservableObject {
             listener.start(queue: queue)
             announcer = listener
         } catch {
-            show("Could not ask for Local Network")
+            show("Unable to request Local Network access.")
         }
-        if normalized() != nil {
-            connect()
-        } else {
-            show("Allow Local Network when iOS asks. It is also under Settings → Privacy & Security → Local Network.")
-        }
+        show("Allow Local Network access to discover and connect to your PC.")
     }
 
     func cameForward() {
-        // Silence uses a playback session, and iOS then disables Share screen
-        // until mirroring takes the sound away. Play it only in the background.
         foreground = true
-        stay.stop()
-        let board = UIPasteboard.general
-        if let waiting = deferred, board.changeCount == seenCount {
-            deferred = nil
-            applyRemote(kind: waiting.0, data: waiting.1)
-        } else {
-            deferred = nil
-            considerLocal(force: false, announceEmpty: false)
-            launchSend = false
-        }
-        guard !greeted, normalized() != nil else { return }
-        connect()
-    }
-
-    private var screenCaptured = false
-
-    /// A playback session hides the banners a broadcast is supposed to show.
-    /// While the screen is shared, stay quiet so those notices appear on the PC.
-    func setScreenCaptured(_ on: Bool) {
-        screenCaptured = on
-        if on {
-            stay.stop()
-        } else if !foreground {
-            stay.start()
-        }
+        loadLocalState()
+        refreshBroadcastStatus()
+        if !disconnectedByPC, !linked, !connecting, requestedPeer != nil { connect() }
     }
 
     func enteredBackground() {
         foreground = false
-        if !screenCaptured { stay.start() }
+        cancelInputVerification(message: "Bluetooth verification was interrupted.")
     }
 
     /// A Paste button handed over text or a picture. iOS only reveals another
     /// app's copy through that button, so this is what puts it on the PC.
     func sendPasted(_ providers: [NSItemProvider]) {
+        guard canSendClipboard(), let peer = fileSendPeer, let generation = clipboardPreference.generation else { return }
         for provider in providers {
-            if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
-                provider.loadObject(ofClass: UIImage.self) { object, _ in
-                    guard let image = object as? UIImage else { return }
-                    DispatchQueue.main.async { self.deliverImage(image) }
+            if let type = provider.registeredTypeIdentifiers.first(where: { UTType($0)?.conforms(to: .image) == true }) {
+                provider.loadFileRepresentation(forTypeIdentifier: type) { url, _ in
+                    let png = url.flatMap { source -> Data? in
+                        guard let size = (try? source.resourceValues(forKeys: [.fileSizeKey]))?.fileSize,
+                              (1...32 * 1024 * 1024).contains(size),
+                              let image = CGImageSourceCreateWithURL(source as CFURL, nil) else { return nil }
+                        return Self.boundedClipboardPNG(image)
+                    }
+                    DispatchQueue.main.async { self.deliverPreparedClipboardImage(png, peer: peer, generation: generation) }
                 }
                 return
             }
             if provider.hasItemConformingToTypeIdentifier(UTType.url.identifier) {
                 provider.loadObject(ofClass: URL.self) { object, _ in
                     guard let url = object as? URL else { return }
-                    DispatchQueue.main.async { self.deliverText(url.absoluteString) }
+                    DispatchQueue.main.async {
+                        guard self.fileSendPeer?.id == peer.id, self.clipboardPreference.allows(generation) else { return }
+                        self.deliverText(url.absoluteString)
+                    }
                 }
                 return
             }
@@ -301,132 +965,251 @@ final class PullClient: ObservableObject {
                 || provider.hasItemConformingToTypeIdentifier(UTType.utf8PlainText.identifier) {
                 provider.loadObject(ofClass: NSString.self) { object, _ in
                     guard let text = object as? String, !text.isEmpty else { return }
-                    DispatchQueue.main.async { self.deliverText(text) }
+                    DispatchQueue.main.async {
+                        guard self.fileSendPeer?.id == peer.id, self.clipboardPreference.allows(generation) else { return }
+                        self.deliverText(text)
+                    }
                 }
                 return
             }
         }
-        clipStatus = "Tap Paste to send what you copied to \(deviceTitle())."
+        clipStatus = "Use Paste to transfer clipboard content to \(deviceTitle())."
     }
 
     /// Reads the iPhone pasteboard from a tap, which iOS allows even when
     /// Paste from Other Apps is still Ask.
     func sendClipboardNow() {
-        considerLocal(force: true)
+        guard canSendClipboard() else { return }
+        considerLocal()
     }
 
-    /// Drops the playback session so the system Share screen button will accept a tap.
-    func pauseKeepAlive() {
-        stay.stop()
-    }
-
-    /// Drops the saved PC so another address and code can be entered.
     func forgetPC() {
-        reconnectWork?.cancel()
-        connection?.cancel()
-        connection = nil
-        greeted = false
-        syncReady = false
-        linked = false
-        address = ""
-        code = ""
-        clipStatus = ""
-        arrival = nil
-        choiceIDs = []
-        deviceName = ""
-        UserDefaults.standard.removeObject(forKey: "porthole.device")
-        queue.async {
-            self.choicePending = false
-            self.abortPush()
+        var forgotten = Set<String>()
+        for peer in [requestedPeer, savedPeer(), PendingPairing.load()?.peer].compactMap({ $0 })
+            where forgotten.insert(peer.credentialProfile).inserted {
+            fileQueue.async { OutboundTransferJournal.shared()?.discard(for: peer) }
+            PairingCredential.remove(peer.credentialProfile)
+            PendingPairing.clear(for: peer)
         }
+        PairingCredential.remove(savedPeerKey)
+        requestedPeer = nil
+        reconnectWork?.cancel()
+        reconnectWork = nil
+        connecting = false
+        setDisconnected()
+        TrustedPeerStore.clear()
+        queue.async { self.resetTransport() }
+        address = ""
+        UserDefaults.standard.removeObject(forKey: savedPeerKey)
         UserDefaults.standard.removeObject(forKey: "porthole.host")
         UserDefaults.standard.removeObject(forKey: "porthole.code")
-        status = "Enter the address and code shown on the device."
+        UserDefaults.standard.removeObject(forKey: "porthole.device")
+        publishWidgetPairing()
+        status = "Choose a PC or scan its secure connection QR code."
     }
 
-    /// Fills the address from a PC found on this Wi-Fi. Connects when a code is already entered.
-    func selectNearby(address: String) -> Bool {
-        let previous = self.address.split(separator: ":").first.map(String.init) ?? self.address
-        if previous != address {
-            code = ""
-        }
-        self.address = address
-        adoptDeviceName()
-        if normalized() != nil {
-            connect()
-            return true
-        }
-        status = "Enter the code shown on the device."
-        return false
+    private func setDisconnected() {
+        fileSendPeer = nil
+        linked = false
+        inputControlSupported = false
+        inputSettingsApplied = false
+        inputVerificationSupported = false
+        endInputVerification(.required)
+        choiceIDs = []
+        chosenOriginal = ""
+        deviceName = ""
+        clipStatus = ""
+        clipboardLinkReady = false
+        requestedInputID = nil
+        sharedPairingReady = false
+        publishWidgetPairing()
     }
 
-    func connect() {
-        guard let fields = normalized() else {
-            show("Enter the address and code from F1 help")
-            return
-        }
-        address = fields.host
-        code = fields.token
-        UserDefaults.standard.set(fields.host, forKey: "porthole.host")
-        UserDefaults.standard.set(fields.token, forKey: "porthole.code")
-        reconnectWork?.cancel()
+    private func resetTransport() {
         connection?.cancel()
+        connection = nil
+        transportPeer = nil
+        handshakeTimer?.cancel()
+        frameTimer?.cancel()
+        inputReceiptTimer?.cancel()
+        clipboardReceiptTimer?.cancel()
+        frameTimer = nil
+        originalTimer?.cancel()
+        originalReceipt = nil
+        clearOriginalDownload()
+        originalBodyQueued = false
+        originalEarlyReceipt = nil
+        choiceTimer?.cancel()
+        matchCancellation?.cancel()
+        matchCancellation = nil
+        expectedClipboardReceipt = nil
+        expectedInputReceipt = nil
+        pairingKey = nil
+        pairingCommitted = false
+        enrolling = false
+        pendingPairingCapabilities.removeAll()
+        sendingOriginal = false
+        deferredLines.removeAll()
+        greeted = false
+        syncReady = false
+        proposedClipboardGeneration = nil
+        acceptedClipboardGeneration = nil
+        pendingData = nil
+        pendingClipboardGeneration = nil
+        chosenIdentifier = nil
+        choicePending = false
+        matching = false
+        exporting = false
         buffer.removeAll()
         body.removeAll()
         bodyLeft = 0
-        abortPush()
-        choicePending = false
-        syncReady = false
-        exporting = false
-        greeted = false
-        let link = NWConnection(host: NWEndpoint.Host(fields.host), port: 47731, using: .tcp)
-        connection = link
-        let token = fields.token
-        link.stateUpdateHandler = { [weak self, weak link] state in
-            DispatchQueue.main.async {
-                guard let self, let link, self.connection === link else { return }
-                self.noteLink(state, token: token)
-            }
+        bodyClipboardGeneration = nil
+        lastRemoteClipboardAt = nil
+        if let interrupted = pushTransfer {
+            reportReceive(interrupted, received: interrupted.bytes - pushLeft, phase: .interrupted)
         }
-        link.start(queue: queue)
-        show("Connecting to \(fields.host)")
+        abortPush()
     }
 
-    private func normalized() -> (host: String, token: String)? {
-        var raw = address.trimmingCharacters(in: .whitespacesAndNewlines)
-        var token = code.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        let parts = raw.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-        if parts.count >= 2 {
-            raw = parts[0]
-            let extra = parts[1].uppercased()
-            if token.count != 8, extra.count == 8, extra.allSatisfy(\.isHexDigit) {
-                token = extra
+    /// The UI uses local pairing drafts. Reconnects only use a previously verified identity.
+    @discardableResult
+    func connect(address rawAddress: String, code rawCode: String, fingerprint rawFingerprint: String? = nil) -> Bool {
+        let token = rawCode.filter { !$0.isWhitespace }.uppercased()
+        let fingerprint = rawFingerprint.flatMap(TrustedPeer.normalizeFingerprint)
+        guard let host = TrustedPeer.pairingHost(rawAddress), token.utf8.count == 8,
+              token.utf8.allSatisfy({ (48...57).contains($0) || (65...70).contains($0) }),
+              let fingerprint else {
+            status = "Enter a PC address, eight-character code and its SHA-256 certificate fingerprint, or scan its secure QR code."
+            return false
+        }
+        guard !host.contains(":") else {
+            status = "Use the IPv4 address shown in Porthole on the PC."
+            return false
+        }
+        let peer = TrustedPeer(host: host, name: host, fingerprint: fingerprint, id: UUID())
+        guard PendingPairing.prepare(peer, code: token) else {
+            status = "Porthole couldn’t save this pending pairing in the iPhone Keychain."
+            return false
+        }
+        let previous = requestedPeer ?? savedPeer()
+        if previous != nil {
+            // An explicit pairing replaces any active extension authorization.
+            TrustedPeerStore.clear()
+            broadcastStatus = nil
+        }
+        requestedPeer = peer
+        reconnectAttempt = 0
+        connecting = false
+        address = host
+        connectCurrentPeer()
+        return true
+    }
+
+    func connect() {
+        if reconnectAttempt >= 4, let requestedPeer,
+           PendingPairing.load()?.peer.samePairing(as: requestedPeer) == true {
+            reconnectAttempt = 1
+        }
+        connectCurrentPeer()
+    }
+
+    private func connectCurrentPeer() {
+        disconnectedByPC = false
+        guard !connecting, let requestedPeer else { return }
+        let profile = requestedPeer.credentialProfile
+        let savedKey = PairingCredential.load(profile)
+        let pending = PendingPairing.load().flatMap { $0.peer.samePairing(as: requestedPeer) ? $0 : nil }
+        let pendingKey = pending?.key ?? PairingCredential.load("pending/" + profile)
+        let credentials: [String]
+        if let savedKey {
+            credentials = [savedKey]
+        } else if let pending {
+            // Retry the bound key after a lost acknowledgement, and the code
+            // when the PC never committed the pairing.
+            credentials = [pending.activeCode, pending.key].compactMap { $0 }
+        } else {
+            credentials = [pendingKey, PairingCredential.load("bootstrap/" + profile)].compactMap { $0 }
+        }
+        guard !credentials.isEmpty else {
+            status = "Pair this PC again with its secure QR code."
+            return
+        }
+        var candidates = [requestedPeer.host]
+        if pending == nil {
+            if let saved = savedPeer(), saved.samePairing(as: requestedPeer) { candidates[0] = saved.host }
+            startFinder()
+            for service in nearby where !candidates.contains(service.address) {
+                candidates.append(service.address)
             }
         }
-        if let colon = raw.lastIndex(of: ":"), raw.firstIndex(of: ":") == colon {
-            let suffix = raw[raw.index(after: colon)...]
-            if !suffix.isEmpty, suffix.allSatisfy(\.isNumber) {
-                raw = String(raw[..<colon])
+        let token = credentials[(reconnectAttempt / candidates.count) % credentials.count]
+        let peer = requestedPeer.newSession(host: candidates[reconnectAttempt % candidates.count])
+        self.requestedPeer = peer
+        reconnectWork?.cancel()
+        reconnectWork = nil
+        connecting = true
+        setDisconnected()
+        if savedKey != nil {
+            TrustedPeerStore.save(peer.remembered)
+        }
+        status = "Verifying the identity of \(peer.name)…"
+        queue.async {
+            self.resetTransport()
+            self.enrolling = token.utf8.count == 8
+            self.pairingKey = token.utf8.count == 32 ? token : pendingKey ?? PairingCredential.getOrCreate("pending/" + profile)
+            guard self.pairingKey != nil else {
+                self.disconnect(peer, message: "Porthole couldn’t prepare a pairing key. Check the iPhone Keychain and retry.")
+                return
+            }
+            self.transportPeer = peer
+            let link = TrustedPeerTransport.connection(to: peer, port: 47731)
+            self.connection = link
+            link.stateUpdateHandler = { [weak self, weak link] state in
+                guard let self, let link, self.connection === link else { return }
+                self.noteLink(state, token: token, peer: peer)
+            }
+            let timeout = DispatchWorkItem { [weak self, weak link] in
+                guard let self, let link, self.connection === link, !self.pairingCommitted else { return }
+                self.disconnect(peer, message: "The PC did not complete secure pairing. Check its certificate and connection code.")
+            }
+            self.handshakeTimer = timeout
+            self.queue.asyncAfter(deadline: .now() + 12, execute: timeout)
+            link.start(queue: self.queue)
+        }
+    }
+
+    private func savedPeer() -> TrustedPeer? {
+        let stored = PairingCredential.load(savedPeerKey).map { Data($0.utf8) }
+        guard let data = stored ?? UserDefaults.standard.data(forKey: savedPeerKey) else { return nil }
+        guard let peer = try? JSONDecoder().decode(TrustedPeer.self, from: data) else { return nil }
+        guard peer.pairingID == nil else { return peer }
+        let upgraded = peer.remembered
+        let oldProfile = "\(peer.host)/\(peer.fingerprint)"
+        for prefix in ["", "pending/", "bootstrap/"] {
+            if let value = PairingCredential.load(prefix + oldProfile) {
+                guard PairingCredential.save(value, for: prefix + upgraded.credentialProfile) else { return peer }
+                PairingCredential.remove(prefix + oldProfile)
             }
         }
-        guard !raw.isEmpty, token.count == 8, token.allSatisfy(\.isHexDigit) else { return nil }
-        return (raw, token)
+        if let encoded = try? JSONEncoder().encode(upgraded) {
+            UserDefaults.standard.set(encoded, forKey: savedPeerKey)
+        }
+        return upgraded
     }
 
     private func startFinder() {
         guard finder == nil else { return }
-        let finder = NWBrowser(for: .bonjour(type: "_porthole-pc._tcp", domain: nil), using: .tcp)
+        let finder = NWBrowser(for: .bonjourWithTXTRecord(type: "_porthole-pc._tcp", domain: nil), using: .tcp)
         finder.browseResultsChangedHandler = { [weak self] results, _ in
             var found: [NearbyPC] = []
             for result in results {
                 guard case .service(let name, _, _, _) = result.endpoint else { continue }
-                guard case .bonjour(let txt) = result.metadata, let addr = txt["addr"], Self.isIPv4(addr) else { continue }
+                guard case .bonjour(let txt) = result.metadata, let addr = txt["addr"], TrustedPeer.validHost(addr) else { continue }
                 found.append(NearbyPC(name: name, address: addr))
             }
             found.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
             DispatchQueue.main.async {
                 self?.nearby = found
-                self?.adoptDeviceName()
             }
         }
         finder.stateUpdateHandler = { [weak self] state in
@@ -436,64 +1219,53 @@ final class PullClient: ObservableObject {
         self.finder = finder
     }
 
-    private static func isIPv4(_ raw: String) -> Bool {
-        let parts = raw.split(separator: ".", omittingEmptySubsequences: false)
-        guard parts.count == 4 else { return false }
-        for part in parts {
-            if part.count > 1, part.hasPrefix("0") { return false }
-            if UInt8(part) == nil { return false }
-        }
-        return true
-    }
-
     private func noteBrowse(_ state: NWBrowser.State) {
         if case .waiting(let error) = state, isDenied(error) {
-            show("Local Network is off. Settings → Privacy & Security → Local Network → turn on Porthole.")
+            show("Local Network access is disabled. Enable Porthole in Settings › Privacy & Security › Local Network.")
         }
     }
 
     private func noteAnnounce(_ state: NWListener.State) {
         switch state {
         case .ready:
-            if !greeted, connection == nil {
-                show("Local Network is on. Enter the F1 address and code, then Connect.")
+            if !linked, !connecting {
+                show("Local Network access enabled. Select a PC or enter its address and connection code.")
             }
         case .waiting(let error), .failed(let error):
             if isDenied(error) {
-                show("Local Network is off. Settings → Privacy & Security → Local Network → turn on Porthole.")
+                show("Local Network access is disabled. Enable Porthole in Settings › Privacy & Security › Local Network.")
             }
         default:
             break
         }
     }
 
-    private func noteLink(_ state: NWConnection.State, token: String) {
+    private func noteLink(_ state: NWConnection.State, token: String, peer: TrustedPeer) {
         switch state {
         case .ready:
-            reconnectAttempt = 0
-            show("Connected")
             send("HELLO \(token)\n")
             receive()
         case .waiting(let error):
-            if connection?.currentPath?.unsatisfiedReason == .localNetworkDenied || isDenied(error) {
-                show("Local Network is off. Settings → Privacy & Security → Local Network → turn on Porthole.")
-            } else {
-                // A refused connect (Porthole restarting) waits for a network change that
-                // never comes. Drop it and try again on the backoff instead.
-                greeted = false
-                show("Waiting for the PC. \(explain(error))")
-                connection?.cancel()
-                scheduleReconnect()
+            if isDenied(error) {
+                disconnect(peer, message: "Allow Porthole in Local Network settings to connect.")
             }
-        case .failed(let error):
-            greeted = false
-            linked = false
-            show("Not connected. \(explain(error))")
-            scheduleReconnect()
-        case .cancelled:
-            break
-        default:
-            break
+        case .failed:
+            disconnect(peer, message: "Unable to verify or reach this PC. Check that it supports secure pairing and that its certificate is unchanged.")
+        default: break
+        }
+    }
+
+    private func disconnect(_ peer: TrustedPeer, message: String) {
+        resetTransport()
+        DispatchQueue.main.async {
+            guard self.requestedPeer?.id == peer.id else { return }
+            self.setDisconnected()
+            if let shared = TrustedPeerStore.load(), shared.samePairing(as: peer) {
+                TrustedPeerStore.save(shared.remembered)
+            }
+            self.connecting = false
+            self.status = message
+            self.scheduleReconnect()
         }
     }
 
@@ -502,137 +1274,355 @@ final class PullClient: ObservableObject {
         return false
     }
 
-    private func explain(_ error: NWError) -> String {
-        if case .posix(let code) = error {
-            switch code {
-            case .ECONNREFUSED:
-                return "Nothing is answering on port 47731. Start Porthole on the PC."
-            case .EHOSTUNREACH, .ENETUNREACH, .EHOSTDOWN, .ENETDOWN, .ETIMEDOUT:
-                return "Use the address from F1 help. The phone and the PC must be on the same Wi-Fi."
-            default:
-                break
-            }
-        }
-        return String(describing: error)
-    }
-
     private func show(_ text: String) {
-        if greeted, text != "Connected. Leave this app open." { return }
+        if linked || connecting { return }
         status = text
     }
 
-    private func send(_ text: String) {
-        guard let data = text.data(using: .utf8) else { return }
-        connection?.send(content: data, completion: .contentProcessed { _ in })
+    private func send(_ text: String, queued: (() -> Void)? = nil) {
+        guard let link = connection, let peer = transportPeer else { return }
+        if sendingOriginal {
+            guard deferredLines.count < 64 else {
+                disconnect(peer, message: "The PC sent too many messages during transfer.")
+                return
+            }
+            deferredLines.append(DeferredLine(text: text, queued: queued))
+            return
+        }
+        link.send(content: Data(text.utf8), completion: .contentProcessed { [weak self, weak link] error in
+            guard let self, let link, self.connection === link, error != nil else { return }
+            self.disconnect(peer, message: "The secure connection was interrupted.")
+        })
+        queued?()
     }
 
     private func receive() {
-        guard let link = connection else { return }
+        guard let link = connection, let peer = transportPeer else { return }
         link.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self, weak link] data, _, complete, error in
             guard let self, let link, self.connection === link else { return }
             if let data, !data.isEmpty {
                 self.buffer.append(data)
-                self.drain()
+                self.drain(peer: peer)
             }
-            if error != nil || complete {
-                let hadHello = self.greeted
-                self.greeted = false
-                self.choicePending = false
-                self.abortPush()
-                DispatchQueue.main.async {
-                    self.choiceIDs = []
-                    self.linked = false
-                    self.show(hadHello ? "Disconnected. Reconnecting." : "The PC closed the connection. Check the code in F1 help.")
-                    self.scheduleReconnect()
+            guard self.connection === link else { return }
+            if complete || error != nil {
+                self.disconnect(peer, message: self.greeted ? "Disconnected. Reconnecting…" : "The PC closed secure pairing. Verify its connection code.")
+            } else {
+                self.receive()
+            }
+        }
+    }
+
+    private func armFrameTimeout(peer: TrustedPeer) {
+        guard frameTimer == nil else { return }
+        let timer = DispatchWorkItem { [weak self] in
+            guard let self, self.transportPeer?.id == peer.id else { return }
+            self.disconnect(peer, message: "The PC did not finish sending a message.")
+        }
+        frameTimer = timer
+        queue.asyncAfter(deadline: .now() + 30, execute: timer)
+    }
+
+    private func finishFrameTimer() { frameTimer?.cancel(); frameTimer = nil }
+
+    private func drain(peer: TrustedPeer) {
+        while connection != nil {
+            if pushChunkLeft > 0 {
+                let prior = pushChunkLeft
+                guard writePushBody(peer: peer) else { return }
+                if prior != pushChunkLeft { finishFrameTimer() }
+                if pushChunkLeft > 0 { armFrameTimeout(peer: peer); return }
+                if pushLeft == 0 { finishPush() }
+            }
+            if bodyLeft > 0 {
+                let take = min(bodyLeft, buffer.count)
+                if take > 0 {
+                    if let revision = bodyClipboardGeneration, clipboardPreference.allows(revision) {
+                        body.append(buffer.prefix(take))
+                    } else {
+                        bodyClipboardGeneration = nil
+                        body.removeAll()
+                    }
+                    buffer.removeFirst(take)
+                    bodyLeft -= take
+                    finishFrameTimer()
+                }
+                if bodyLeft > 0 { armFrameTimeout(peer: peer); return }
+                let payload = body
+                let generation = bodyClipboardGeneration
+                body.removeAll()
+                bodyClipboardGeneration = nil
+                applyRemote(kind: bodyKind, data: payload, generation: generation, peer: transportPeer ?? peer)
+            }
+            guard let newline = buffer.firstIndex(of: 10) else {
+                if buffer.count > lineLimit { disconnect(peer, message: "The PC sent an oversized message header.") }
+                else if !buffer.isEmpty || pushLeft > 0 { armFrameTimeout(peer: peer) }
+                return
+            }
+            let line = buffer[..<newline]
+            guard line.count <= lineLimit, let value = String(data: line, encoding: .utf8) else {
+                disconnect(peer, message: "The PC sent an invalid message header.")
+                return
+            }
+            buffer.removeSubrange(...newline)
+            finishFrameTimer()
+            let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !greeted {
+                if text == "DISCONNECTED" {
+                    resetTransport()
+                    DispatchQueue.main.async {
+                        guard self.requestedPeer?.id == peer.id else { return }
+                        self.disconnectedByPC = true
+                        self.reconnectWork?.cancel()
+                        self.setDisconnected()
+                        self.connecting = false
+                        TrustedPeerStore.clear()
+                        self.status = "Disconnected by PC. Select Connect to reconnect."
+                    }
+                    return
+                }
+                guard acceptGreeting(text, peer: peer) else {
+                    disconnect(peer, message: "The PC must support secure pairing and accept your connection code.")
+                    return
+                }
+                continue
+            }
+            if !pairingCommitted {
+                handle(text)
+                continue
+            }
+            if text.hasPrefix("CLIP ") {
+                guard let (kind, length) = clipHeader(text) else {
+                    disconnect(peer, message: "The PC sent an invalid clipboard header.")
+                    return
+                }
+                bodyKind = kind
+                bodyLeft = length
+                bodyClipboardGeneration = acceptedClipboardGeneration
+                body.removeAll()
+            } else if text.hasPrefix("CHUNK ") {
+                guard chunkedPush, pushStage != nil, let count = IncomingTransfer.chunkLength(text, remaining: pushLeft) else {
+                    disconnect(peer, message: "The PC sent an invalid file segment.")
+                    return
+                }
+                pushChunkLeft = count
+            } else if text.hasPrefix("PUSH2 ") || text.hasPrefix("PUSH3 ") {
+                guard let transfer = IncomingTransfer(header: text), incomingOperation == nil else {
+                    disconnect(peer, message: "The PC sent an invalid or overlapping file request.")
+                    return
+                }
+                beginPush(transfer, chunked: text.hasPrefix("PUSH3 "))
+            } else if text.hasPrefix("PUSH ") {
+                disconnect(peer, message: "Update Porthole on your PC to send files securely.")
+                return
+            } else {
+                handle(text)
+            }
+        }
+    }
+
+    private func acceptGreeting(_ line: String, peer: TrustedPeer) -> Bool {
+        let fields = line.split(separator: " ")
+        guard (2...3).contains(fields.count), fields[0] == "OK",
+              TrustedPeer.isChannelTicket(String(fields[1])) else { return false }
+        let advertisedName = fields.count == 3 ? Data(base64Encoded: String(fields[2]))
+            .flatMap { String(data: $0, encoding: .utf8) }.flatMap { Self.displayName($0, maxBytes: 63) } : nil
+        var verified = TrustedPeer(host: peer.host, name: advertisedName ?? peer.host, fingerprint: peer.fingerprint,
+                                   id: peer.id, pairingID: peer.stableID)
+        verified.channelTicket = String(fields[1])
+        transportPeer = verified
+        greeted = true
+        send("RESUME?\n")
+        if !enrolling { completePairing(verified) }
+        return true
+    }
+
+    private func completePairing(_ peer: TrustedPeer) {
+        guard let key = pairingKey else { return }
+        pairingKey = nil
+        pairingCommitted = true
+        handshakeTimer?.cancel()
+        let remembered = peer.remembered
+        DispatchQueue.main.async {
+            guard self.requestedPeer?.id == peer.id else { return }
+            let previous = self.savedPeer()
+            guard let data = try? JSONEncoder().encode(remembered),
+                  PairingCredential.save(key, for: peer.credentialProfile),
+                  PairingCredential.save(String(decoding: data, as: UTF8.self), for: self.savedPeerKey) else {
+                self.queue.async {
+                    guard self.transportPeer?.id == peer.id else { return }
+                    self.disconnect(peer, message: "Porthole couldn’t save the verified pairing. Retrying…")
                 }
                 return
             }
-            self.receive()
-        }
-    }
-
-    private func drain() {
-        if pushLeft > 0 {
-            writePushBody()
-            if pushLeft > 0 { return }
-            finishPush()
-        }
-        if bodyLeft > 0 {
-            let take = min(bodyLeft, buffer.count)
-            if take > 0 {
-                body.append(buffer.prefix(take))
-                buffer.removeFirst(take)
-                bodyLeft -= take
+            UserDefaults.standard.set(data, forKey: self.savedPeerKey)
+            PendingPairing.clear(for: peer)
+            if let previous, !previous.samePairing(as: peer) {
+                self.fileQueue.async { OutboundTransferJournal.shared()?.discard(for: previous) }
+                PairingCredential.remove(previous.credentialProfile)
+                PendingPairing.clear(for: previous)
             }
-            if bodyLeft > 0 { return }
-            let payload = body
-            let kind = bodyKind
-            body.removeAll(keepingCapacity: false)
-            applyRemote(kind: kind, data: payload)
+            self.reconnectAttempt = 0
+            self.connecting = false
+            self.fileSendPeer = peer
+            self.deviceName = peer.name
+            self.address = peer.host
+            self.linked = true
+            self.status = "Connected securely to \(peer.name)."
+            self.publishSharedPeer(peer)
+            self.publishWidgetPairing()
+            self.setPhoneAlias(self.phoneAlias)
         }
-        while let newline = buffer.firstIndex(of: 10) {
-            let line = buffer[..<newline]
-            buffer.removeSubrange(...newline)
-            guard let text = String(data: line, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) else { continue }
-            if let header = clipHeader(text) {
-                bodyKind = header.0
-                bodyLeft = header.1
-                body.removeAll(keepingCapacity: false)
-                drain()
-                return
-            }
-            if let push = pushHeader(text) {
-                beginPush(bytes: push.0, name: push.1)
-                drain()
-                return
-            }
-            handle(text)
-        }
+        if peer.resumable { send("FILES 2\nFILES 3\n") }
+        send("INBOX?\nIV?\n")
+        let capabilities = pendingPairingCapabilities
+        pendingPairingCapabilities.removeAll()
+        for capability in capabilities { handle(capability) }
     }
 
     private func handle(_ line: String) {
-        if line == "OK" {
-            greeted = true
+        guard let peer = transportPeer, greeted else { return }
+        if line == "PAIRED", !pairingCommitted, peer.resumable {
+            completePairing(peer)
+            return
+        }
+        if line == "RESUME 2" {
+            guard !peer.resumable else { return }
+            var resumable = peer
+            resumable.resumable = true
+            transportPeer = resumable
+            guard pairingCommitted else {
+                if let pairingKey { send("PAIR \(pairingKey)\n") }
+                return
+            }
+            send("FILES 2\nFILES 3\n")
             DispatchQueue.main.async {
-                self.linked = true
-                self.status = "Connected. You can open Photos."
+                guard self.fileSendPeer?.id == resumable.id else { return }
+                self.fileSendPeer = resumable
+                self.publishSharedPeer(resumable)
             }
             return
         }
-        if line == "SYNC" {
-            guard greeted else { return }
-            syncReady = true
-            send("SYNC\n")
-            send("FILES\n")
-            let device = UIDevice.current.name
-                .replacingOccurrences(of: "\n", with: " ")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !device.isEmpty {
-                send("NAME \(String(device.prefix(40)))\n")
+        guard pairingCommitted else {
+            if line == "SYNC READY" || line == "INPUT READY", !pendingPairingCapabilities.contains(line) {
+                pendingPairingCapabilities.append(line)
             }
-            startPasteWatch()
+            return
+        }
+        if line == "INBOX 3" {
+            var capable = peer
+            capable.inboxVersion = 3
+            transportPeer = capable
             DispatchQueue.main.async {
-                self.clipStatus = "Clipboard connected. Paste on the iPhone with Ctrl+V."
-                self.sendLaunchClipboardIfNeeded()
+                guard self.fileSendPeer?.id == capable.id else { return }
+                self.fileSendPeer = capable
+                self.publishSharedPeer(capable)
+            }
+            return
+        }
+        if line == "INPUT READY" {
+            DispatchQueue.main.async {
+                guard self.fileSendPeer?.id == peer.id, !self.inputControlSupported else { return }
+                self.inputControlSupported = true
+                self.sendInputPreferences()
+            }
+            return
+        }
+        if line == "IV READY" {
+            DispatchQueue.main.async {
+                guard self.fileSendPeer?.id == peer.id, !self.inputVerificationSupported else { return }
+                self.inputVerificationSupported = true
+                self.sendInputPreferences()
+            }
+            return
+        }
+        if line.hasPrefix("IV ") {
+            DispatchQueue.main.async {
+                guard self.fileSendPeer?.id == peer.id, self.inputVerificationSupported else { return }
+                if line == "IV RESET" {
+                    let status: InputVerificationStatus = self.inputVerificationStatus.inProgress
+                        ? .failed("The Bluetooth connection changed. Try again.")
+                        : .required
+                    self.endInputVerification(status)
+                    return
+                }
+                guard let id = self.inputVerification?.id else { return }
+                if line == "IV OK \(id)", self.inputVerificationStatus == .confirming, self.inputControlsEnabled {
+                    self.endInputVerification(.verified)
+                } else if line == "IV FAILED \(id)" {
+                    self.endInputVerification(.failed("The selected PC could not verify its Bluetooth connection."))
+                }
+            }
+            return
+        }
+        if line == expectedInputReceipt {
+            expectedInputReceipt = nil
+            inputReceiptTimer?.cancel()
+            let id = line.split(separator: " ")[2]
+            DispatchQueue.main.async {
+                guard self.fileSendPeer?.id == peer.id, self.requestedInputID == String(id) else { return }
+                self.inputSettingsApplied = true
+            }
+            return
+        }
+        if line == "SYNC READY" {
+            guard !syncReady else { return }
+            syncReady = true
+            negotiateClipboard(peer)
+            return
+        }
+        if line == expectedClipboardReceipt {
+            expectedClipboardReceipt = nil
+            clipboardReceiptTimer?.cancel()
+            let enabled = line.hasSuffix(" 1")
+            acceptedClipboardGeneration = proposedClipboardGeneration
+            DispatchQueue.main.async {
+                guard self.fileSendPeer?.id == peer.id, self.clipboardSyncEnabled == enabled else { return }
+                self.clipboardLinkReady = enabled
+                self.clipStatus = enabled ? "Clipboard sync connected." : "Clipboard sync disabled."
             }
             flushClip()
             return
         }
         if line == "CLIP?" {
-            guard greeted else { return }
+            guard let generation = acceptedClipboardGeneration, clipboardPreference.allows(generation) else { return }
             DispatchQueue.main.async { [weak self] in
-                self?.answerClipAsk(tries: 6)
+                guard let self, self.foreground, self.fileSendPeer?.id == peer.id else { return }
+                self.answerClipAsk(tries: 6, peerID: peer.id, generation: generation)
+            }
+            return
+        }
+        if let receipt = originalReceipt, originalBodyQueued {
+            let id = receipt.id.uuidString.lowercased()
+            if line == "RECEIVED \(id)" || line == "REJECTED \(id)" {
+                let saved = line.hasPrefix("RECEIVED ")
+                if sendingOriginal { originalEarlyReceipt = saved }
+                else { finishOriginal(peer, saved: saved) }
+                return
+            }
+        }
+        if line == "CANCEL PULL" {
+            // The desktop drains and rejects any FILE2 body already in flight.
+            guard !sendingOriginal, originalReceipt == nil, matching || choicePending || exporting else { return }
+            matchCancellation?.cancel()
+            matchCancellation = nil
+            choiceTimer?.cancel()
+            originalTimer?.cancel()
+            clearOriginalDownload()
+            matching = false
+            choicePending = false
+            exporting = false
+            send("MISS cancelled\n")
+            DispatchQueue.main.async {
+                if self.fileSendPeer?.id == peer.id { self.choiceIDs = [] }
             }
             return
         }
         guard greeted, line.hasPrefix("PULL ") else { return }
-        if choicePending {
-            choicePending = false
-            DispatchQueue.main.async { self.choiceIDs = [] }
-        }
+        guard !matching, !exporting, !choicePending else { return }
         let parts = line.split(separator: " ")
         guard (3...6).contains(parts.count), let hash = UInt64(parts[1], radix: 16),
-              let aspect = Double(parts[2]) else {
+              let aspect = Double(parts[2]), aspect.isFinite, (0.05...20).contains(aspect) else {
             send("MISS\n")
             return
         }
@@ -653,6 +1643,8 @@ final class PullClient: ObservableObject {
                 screen = PhotoIndex.Screen(aspect: shape, thumb: whole, detail: wholeDetail)
             }
         }
+        guard parts.count < 4 || thumb != nil, parts.count < 5 || detail != nil,
+              parts.count < 6 || screen != nil else { send("MISS invalid-preview\n"); return }
         if let identifier = chosenIdentifier {
             chosenIdentifier = nil
             DispatchQueue.main.async { self.chosenOriginal = "" }
@@ -660,201 +1652,468 @@ final class PullClient: ObservableObject {
                 send("MISS selected-item-unavailable\n")
                 return
             }
-            export(asset)
+            export(asset, approved: true)
             return
         }
-        DispatchQueue.main.async { self.status = "Finding that photo or video" }
-        let found = index.match(hash: hash, aspect: aspect, thumb: thumb, detail: detail, screen: screen) { [weak self] text in
-            DispatchQueue.main.async { self?.status = text }
-        }
-        if found.asset == nil, !found.choices.isEmpty {
-            choicePending = true
-            let ids = found.choices
-            DispatchQueue.main.async {
-                self.choiceIDs = ids
-                self.status = "Two photos look alike. Pick one."
-            }
-            return
-        }
-        guard index.ready, let asset = found.asset else {
-            if found.closest < 65 {
-                // The debug thumb stays last: the PC reads the final field as hex.
-                let parts = ["MISS \(found.closest)", found.note, found.video,
-                             found.debug.trimmingCharacters(in: .whitespaces)]
-                send(parts.filter { !$0.isEmpty }.joined(separator: " ") + "\n")
-            } else {
-                send("MISS\n")
-            }
-            let closest = found.closest
-            DispatchQueue.main.async {
-                if !index.ready {
-                    self.status = "Load photos, then drag the picture again"
-                } else if closest < 65 {
-                    self.status = "Could not identify this item. Use Choose original, then drag again. (\(closest) bits)"
-                } else {
-                    self.status = "Could not identify this item. Use Choose original, then drag again."
-                }
-            }
-            return
-        }
-        // The scores go after the name, for the PC log; older PCs ignore them.
-        let why = (found.note + " " + found.video).components(separatedBy: .newlines).joined(separator: " ")
-        export(asset, note: why.trimmingCharacters(in: .whitespaces))
+        guard thumb != nil || screen != nil else { send("MISS preview-required\n"); return }
+        matchOriginal(index: index, hash: hash, aspect: aspect, thumb: thumb,
+                      detail: detail, screen: screen, peer: peer)
     }
 
-    private func export(_ asset: PHAsset, note: String = "") {
-        exportNote = note
+    private func matchOriginal(index: PhotoIndex, hash: UInt64, aspect: Double, thumb: [Double]?,
+                               detail: [Double]?, screen: PhotoIndex.Screen?, peer: TrustedPeer) {
+        matching = true
+        let cancellation = MatchCancellation()
+        matchCancellation = cancellation
+        DispatchQueue.main.async {
+            guard !cancellation.cancelled else { return }
+            switch index.prepareMatch() {
+            case .ready:
+                if self.fileSendPeer?.id == peer.id { self.status = "Identifying photo or video" }
+                self.runPhotoMatch(index: index, hash: hash, aspect: aspect, thumb: thumb,
+                                   detail: detail, screen: screen, peer: peer, cancellation: cancellation)
+                return
+            case .preparing:
+                self.rejectUnreadyPhotoMatch(peer, cancellation: cancellation, reason: "photo-library-preparing",
+                                            message: "Preparing your photo library. Check Photo access, then try again.")
+            case .accessRequired:
+                self.rejectUnreadyPhotoMatch(peer, cancellation: cancellation, reason: "photo-access-required",
+                                            message: "Allow Photo access on your iPhone before identifying an original.")
+            }
+        }
+    }
+
+    private func rejectUnreadyPhotoMatch(_ peer: TrustedPeer, cancellation: MatchCancellation, reason: String, message: String) {
+        queue.async {
+            guard self.transportPeer?.id == peer.id, self.matchCancellation === cancellation else { return }
+            self.matching = false
+            self.matchCancellation = nil
+            self.send("MISS \(reason)\n")
+            DispatchQueue.main.async { if self.fileSendPeer?.id == peer.id { self.status = message } }
+        }
+    }
+
+    private func runPhotoMatch(index: PhotoIndex, hash: UInt64, aspect: Double, thumb: [Double]?,
+                              detail: [Double]?, screen: PhotoIndex.Screen?, peer: TrustedPeer, cancellation: MatchCancellation) {
+        matchQueue.async {
+            let found = index.match(hash: hash, aspect: aspect, thumb: thumb, detail: detail, screen: screen,
+                                    isCancelled: { cancellation.cancelled }) { [weak self] text in
+                DispatchQueue.main.async { [weak self] in
+                    if !cancellation.cancelled, self?.fileSendPeer?.id == peer.id { self?.status = text }
+                }
+            }
+            self.queue.async {
+                guard self.transportPeer?.id == peer.id, self.greeted,
+                      self.matchCancellation === cancellation else { return }
+                self.matching = false
+                self.matchCancellation = nil
+                if found.asset == nil, !found.choices.isEmpty {
+                    self.askToSendOriginal(found.choices, to: peer)
+                } else if let asset = found.asset {
+                    self.askToSendOriginal([asset.localIdentifier], to: peer)
+                } else {
+                    self.send(found.videoUnavailable ? "MISS video-unavailable\n" : "MISS \(found.closest)\n")
+                    DispatchQueue.main.async {
+                        guard self.fileSendPeer?.id == peer.id else { return }
+                        self.status = found.videoUnavailable
+                            ? "Some videos were unavailable for comparison. Select the original in Photo access."
+                            : "Unable to identify this item. Select an original in Photo access to try again."
+                    }
+                }
+            }
+        }
+    }
+
+    private func askToSendOriginal(_ ids: [String], to peer: TrustedPeer) {
+        choicePending = true
+        DispatchQueue.main.async {
+            guard self.fileSendPeer?.id == peer.id else { return }
+            self.choiceIDs = ids
+            self.status = ids.count == 1 ? "Confirm transfer of the unedited original." : "Select the original to transfer."
+        }
+        let timer = DispatchWorkItem { [weak self] in
+            guard let self, self.transportPeer?.id == peer.id, self.choicePending else { return }
+            self.choicePending = false
+            self.send("MISS confirmation-expired\n")
+            DispatchQueue.main.async {
+                guard self.fileSendPeer?.id == peer.id else { return }
+                self.choiceIDs = []
+                self.status = "Original transfer confirmation expired."
+            }
+        }
+        choiceTimer = timer
+        queue.asyncAfter(deadline: .now() + 30, execute: timer)
+    }
+
+    private func export(_ proposedAsset: PHAsset, approved: Bool = false) {
+        guard let peer = transportPeer, let link = connection, greeted, !exporting else { return }
+        let permission = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard permission == .authorized || permission == .limited,
+              let asset = PHAsset.fetchAssets(withLocalIdentifiers: [proposedAsset.localIdentifier], options: nil).firstObject else {
+            send("MISS selected-item-unavailable\n")
+            return
+        }
         let resources = PHAssetResource.assetResources(for: asset)
-        let wanted: [PHAssetResourceType] = asset.mediaType == .video
-            ? [.video, .fullSizeVideo] : [.photo, .fullSizePhoto]
-        guard let resource = wanted.lazy.compactMap({ type in resources.first(where: { $0.type == type }) }).first else {
-            send("MISS\n")
+        if !approved, resources.contains(where: { $0.type == .adjustmentData || $0.type == .adjustmentBasePhoto || $0.type == .adjustmentBaseVideo }) {
+            askToSendOriginal([asset.localIdentifier], to: peer)
             return
         }
-        guard let name = safeName(resource.originalFilename) else {
-            send("MISS\n")
-            return
+        let type: PHAssetResourceType = asset.mediaType == .video ? .video : .photo
+        guard let resource = resources.first(where: { $0.type == type }) else { send("MISS\n"); return }
+        let name = TransferFileName.make(resource.originalFilename, index: 0)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("Original-" + UUID().uuidString, isDirectory: true)
+        let stage: PhotoExportStaging
+        do { stage = try PhotoExportStaging(file: directory.appendingPathComponent(name), sourceIdentifier: asset.localIdentifier) }
+        catch { send("MISS storage-unavailable\n"); return }
+        originalDownload = stage
+        exporting = true
+        let monitor = DispatchSource.makeTimerSource(queue: queue)
+        monitor.schedule(deadline: .now() + .milliseconds(500), repeating: .milliseconds(500))
+        monitor.setEventHandler { [weak self, weak stage] in
+            guard let self, let stage, self.originalDownload === stage,
+                  !stage.canReadSource(verifyExistence: true) else { return }
+            self.cancelRevokedOriginal(stage, peer: peer)
         }
-        // Written to a file first: the PC needs the size before the bytes, and a video
-        // can be far larger than what fits in memory.
-        let file = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString + "-" + name)
+        originalAccessMonitor = monitor
+        monitor.resume()
         let options = PHAssetResourceRequestOptions()
         options.isNetworkAccessAllowed = true
-        options.progressHandler = { [weak self] progress in
-            DispatchQueue.main.async {
-                self?.status = "Downloading original from iCloud: \(Int(progress * 100))%"
-            }
+        let deadline = DispatchWorkItem { [weak self, weak stage] in
+            guard let self, let stage, self.originalDownload === stage else { return }
+            self.failOriginalPreparation(stage, peer: peer, reason: "Original preparation timed out.")
         }
-        let kind = asset.mediaType == .video ? "video" : "photo"
-        DispatchQueue.main.async { self.status = "Reading that \(kind)" }
-        exporting = true
-        PHAssetResourceManager.default().writeData(for: resource, toFile: file, options: options) { [weak self] error in
-            guard let self else { return }
+        originalTimer = deadline
+        queue.asyncAfter(deadline: .now() + 60, execute: deadline)
+        DispatchQueue.main.async {
+            if self.fileSendPeer?.id == peer.id { self.status = "Preparing \(name) for transfer" }
+        }
+        stage.start(resource: resource, options: options) { [weak self, weak stage] size in
+            guard let self, let stage else { return }
             self.queue.async {
-                if error != nil {
-                    try? FileManager.default.removeItem(at: file)
-                    self.exporting = false
-                    self.send("MISS\n")
-                    self.flushClip()
-                    DispatchQueue.main.async { self.status = "Could not read that \(kind)" }
+                guard self.connection === link, self.originalDownload === stage else { return }
+                self.originalTimer?.cancel()
+                guard stage.canReadSource(verifyExistence: true) else {
+                    self.cancelRevokedOriginal(stage, peer: peer)
                     return
                 }
-                self.stream(file, name: name)
+                guard let size else {
+                    self.failOriginalPreparation(stage, peer: peer, reason: "Unable to read the original or it exceeds the 512 MB limit.")
+                    return
+                }
+                self.streamOriginal(stage, name: name, size: size, peer: peer, link: link)
             }
         }
     }
 
-    /// FILE line, then the file in 1 MB pieces, each sent after the previous one is taken.
-    /// Scores of the match being sent, appended to its FILE line.
-    private var exportNote = ""
+    private func clearOriginalDownload() {
+        originalAccessMonitor?.cancel()
+        originalAccessMonitor = nil
+        originalDownload?.cancel()
+        originalDownload = nil
+    }
 
-    private func stream(_ file: URL, name: String) {
-        let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?.int64Value ?? 0
-        guard size > 0, let handle = try? FileHandle(forReadingFrom: file), let link = connection else {
-            try? FileManager.default.removeItem(at: file)
-            exporting = false
-            send("MISS\n")
-            flushClip()
+    private func cancelRevokedOriginal(_ stage: PhotoExportStaging, peer: TrustedPeer) {
+        let reason = "This original is no longer available in your photo library. Transfer stopped."
+        if sendingOriginal {
+            // The PC is still reading the FILE2 body. Close the link so it discards a partial file.
+            disconnect(peer, message: reason)
+        } else {
+            failOriginalPreparation(stage, peer: peer, reason: reason)
+        }
+    }
+
+    private func failOriginalPreparation(_ stage: PhotoExportStaging, peer: TrustedPeer, reason: String) {
+        guard originalDownload === stage else { return }
+        originalTimer?.cancel()
+        clearOriginalDownload()
+        exporting = false
+        send("MISS unavailable\n")
+        DispatchQueue.main.async { if self.fileSendPeer?.id == peer.id { self.status = reason } }
+    }
+
+    private func streamOriginal(_ stage: PhotoExportStaging, name: String, size: Int64, peer: TrustedPeer, link: NWConnection) {
+        guard let handle = try? FileHandle(forReadingFrom: stage.file) else {
+            failOriginalPreparation(stage, peer: peer, reason: "Unable to open the original for transfer.")
             return
         }
-        func finish(_ text: String) {
-            try? handle.close()
-            try? FileManager.default.removeItem(at: file)
-            exporting = false
-            flushClip()
-            DispatchQueue.main.async { self.status = text }
-        }
-        func next() {
-            let chunk = handle.readData(ofLength: 1 << 20)
-            if chunk.isEmpty {
-                finish("Sent \(name)")
-                note(name, "Original sent to the PC", file: true, incoming: false)
+        let id = UUID()
+        originalReceipt = (id, name, size)
+        originalBodyQueued = false
+        originalEarlyReceipt = nil
+        send("FILE2 \(id.uuidString.lowercased()) \(size) \(name)\n")
+        sendingOriginal = true
+        func next(remaining: Int64) {
+            guard self.connection === link, self.originalDownload === stage else { try? handle.close(); return }
+            if remaining == 0 {
+                try? handle.close()
+                self.clearOriginalDownload()
+                self.sendingOriginal = false
+                let commands = self.deferredLines
+                self.deferredLines.removeAll()
+                for command in commands { self.send(command.text, queued: command.queued) }
+                self.flushClip()
+                if let saved = self.originalEarlyReceipt { self.finishOriginal(peer, saved: saved); return }
+                let timer = DispatchWorkItem { [weak self] in
+                    guard let self, self.transportPeer?.id == peer.id, self.originalReceipt?.id == id else { return }
+                    self.finishOriginal(peer, saved: nil)
+                }
+                self.originalTimer = timer
+                self.queue.asyncAfter(deadline: .now() + 30, execute: timer)
                 return
             }
-            link.send(content: chunk, completion: .contentProcessed { error in
-                if error != nil {
-                    finish("Sending \(name) stopped")
+            guard stage.canReadSource() else {
+                try? handle.close()
+                self.cancelRevokedOriginal(stage, peer: peer)
+                return
+            }
+            do {
+                guard let chunk = try handle.read(upToCount: Int(min(remaining, 1 << 19))), !chunk.isEmpty else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                self.originalBodyQueued = Int64(chunk.count) == remaining
+                let timer = DispatchWorkItem { [weak self] in
+                    guard let self, self.connection === link, self.sendingOriginal else { return }
+                    self.disconnect(peer, message: "Original transfer was interrupted.")
+                }
+                self.originalTimer?.cancel()
+                self.originalTimer = timer
+                self.queue.asyncAfter(deadline: .now() + 10, execute: timer)
+                link.send(content: chunk, completion: .contentProcessed { error in
+                    guard self.connection === link else { try? handle.close(); return }
+                    self.originalTimer?.cancel()
+                    if error == nil { next(remaining: remaining - Int64(chunk.count)) }
+                    else {
+                        try? handle.close()
+                        self.disconnect(peer, message: "Original transfer was interrupted.")
+                    }
+                })
+            } catch {
+                try? handle.close()
+                self.disconnect(peer, message: "Unable to finish reading the original.")
+            }
+        }
+        next(remaining: size)
+    }
+
+    private func finishOriginal(_ peer: TrustedPeer, saved: Bool?) {
+        guard let receipt = originalReceipt else { return }
+        originalTimer?.cancel()
+        originalReceipt = nil
+        originalEarlyReceipt = nil
+        originalBodyQueued = false
+        exporting = false
+        if saved == true {
+            note(receipt.name, "Original saved on \(peer.name)", file: true, incoming: false, bytes: receipt.bytes)
+        }
+        DispatchQueue.main.async {
+            guard self.fileSendPeer?.id == peer.id else { return }
+            switch saved {
+            case true?: self.status = "Saved \(receipt.name) on \(peer.name)."
+            case false?: self.status = "The PC could not save \(receipt.name)."
+            case nil: self.status = "The PC has not confirmed saving \(receipt.name). Check the PC before retrying."
+            }
+        }
+    }
+
+    private func reportReceive(_ transfer: IncomingTransfer, received: Int, phase: ReceiveProgress.Phase) {
+        let progress = ReceiveProgress(transferID: transfer.id, name: transfer.name, bytes: transfer.bytes,
+                                       received: received, phase: phase)
+        DispatchQueue.main.async { self.setReceiveProgress(progress) }
+    }
+
+    private func beginPush(_ transfer: IncomingTransfer, chunked: Bool) {
+        guard let peer = transportPeer else { return }
+        let operation = UUID()
+        let deadline = DispatchTime.now() + .seconds(120)
+        incomingOperation = operation
+        pushTransfer = transfer
+        chunkedPush = chunked
+        pushLeft = transfer.bytes
+        reportReceive(transfer, received: 0, phase: .receiving)
+        beginReceiveBackgroundTask(operation, peer: peer)
+        reportIncomingPending(transfer, operation: operation, peer: peer, deadline: deadline)
+        incomingQueue.async {
+            let profile = SHA256.hash(data: Data(peer.credentialProfile.utf8)).map { String(format: "%02x", $0) }.joined()
+            let state = Result { try self.incomingStore.prepare(transfer, profile: profile) }
+            if case .success(.saved(let receipt?, at: let path)) = state {
+                self.importReceivedReceipt(receipt, at: path)
+            }
+            self.queue.async {
+                guard self.transportPeer?.id == peer.id, self.incomingOperation == operation else {
+                    if case .success(.staged(let staged)) = state { try? staged.handle.close() }
                     return
                 }
-                next()
-            })
+                self.incomingHeartbeat?.cancel()
+                switch state {
+                case .failure:
+                    self.rejectPush(transfer, peer: peer)
+                case .success(.saved):
+                    self.send("SAVED \(transfer.id)\n")
+                    self.abortPush()
+                    DispatchQueue.main.async { self.setReceiveProgress(nil) }
+                case .success(.staged(let staged)):
+                    self.pushStage = staged
+                    self.pushLeft = transfer.bytes - staged.offset
+                    self.pushChunkLeft = chunked ? 0 : self.pushLeft
+                    self.reportReceive(transfer, received: staged.offset, phase: .receiving)
+                    self.send("OFFSET \(transfer.id) \(staged.offset)\n")
+                    DispatchQueue.main.async {
+                        if self.fileSendPeer?.id == peer.id { self.status = "Receiving \(transfer.name)" }
+                    }
+                    if self.pushLeft == 0 { self.finishPush() }
+                    else { self.armFrameTimeout(peer: peer) }
+                }
+            }
         }
-        send("FILE \(size) \(name)" + (exportNote.isEmpty ? "" : " " + exportNote) + "\n")
-        next()
     }
 
-    private func pushHeader(_ line: String) -> (Int, String)? {
-        guard line.hasPrefix("PUSH ") else { return nil }
-        let rest = line.dropFirst(5)
-        guard let space = rest.firstIndex(of: " ") else { return nil }
-        let countText = rest[..<space]
-        let name = String(rest[rest.index(after: space)...])
-        guard let count = Int(countText), count > 0, count <= 512 * 1024 * 1024 else { return nil }
-        guard !name.isEmpty, !name.contains("/"), !name.contains("\\"), name != ".", name != ".." else { return nil }
-        return (count, name)
+    private func reportIncomingPending(_ transfer: IncomingTransfer, operation: UUID,
+                                       peer: TrustedPeer, deadline: DispatchTime) {
+        guard transportPeer?.id == peer.id, incomingOperation == operation else { return }
+        guard DispatchTime.now() < deadline else {
+            disconnect(peer, message: "The save folder is still processing the file. Check Files before retrying.")
+            return
+        }
+        send("PENDING \(transfer.id)\n")
+        let progress = DispatchWorkItem { [weak self] in
+            self?.reportIncomingPending(transfer, operation: operation, peer: peer, deadline: deadline)
+        }
+        incomingHeartbeat = progress
+        queue.asyncAfter(deadline: .now() + 4, execute: progress)
     }
 
-    private func beginPush(bytes: Int, name: String) {
-        pushLeft = bytes
-        pushName = name
-        pushFailed = false
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString + "-" + name)
-        FileManager.default.createFile(atPath: url.path, contents: nil)
-        pushURL = url
-        pushHandle = try? FileHandle(forWritingTo: url)
-        if pushHandle == nil { pushFailed = true }
-        DispatchQueue.main.async { self.status = "Receiving \(name)" }
+    private static func digest(of url: URL) throws -> String {
+        let file = try FileHandle(forReadingFrom: url)
+        defer { try? file.close() }
+        var hash = SHA256()
+        while let data = try file.read(upToCount: 1 << 20), !data.isEmpty { hash.update(data: data) }
+        return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    private func writePushBody() {
-        let take = min(pushLeft, buffer.count)
-        guard take > 0 else { return }
-        let chunk = buffer.prefix(take)
-        buffer.removeFirst(take)
-        pushLeft -= take
-        if pushFailed { return }
+    @discardableResult
+    private func writePushBody(peer: TrustedPeer) -> Bool {
+        guard let stage = pushStage else { return false }
+        let take = min(pushChunkLeft, buffer.count)
+        guard take > 0 else { return true }
         do {
-            try pushHandle?.write(contentsOf: chunk)
+            try stage.handle.write(contentsOf: buffer.prefix(take))
+            buffer.removeFirst(take)
+            pushLeft -= take
+            pushChunkLeft -= take
+            let now = DispatchTime.now()
+            if let transfer = pushTransfer, now.uptimeNanoseconds - lastReceiveProgressAt.uptimeNanoseconds >= 150_000_000 {
+                lastReceiveProgressAt = now
+                reportReceive(transfer, received: transfer.bytes - pushLeft, phase: .receiving)
+            }
+            return true
         } catch {
-            pushFailed = true
+            disconnect(peer, message: "Unable to stage the incoming file. Check available storage and retry from the PC.")
+            return false
         }
     }
 
     private func finishPush() {
-        try? pushHandle?.close()
-        pushHandle = nil
-        let url = pushURL
-        let name = pushName
-        let failed = pushFailed
-        pushURL = nil
-        pushName = ""
-        pushFailed = false
-        guard let url, !failed, !name.isEmpty else {
-            if let url { try? FileManager.default.removeItem(at: url) }
-            send("NO\n")
-            DispatchQueue.main.async { self.status = "Could not save that file" }
+        guard let stage = pushStage, let transfer = pushTransfer, let peer = transportPeer,
+              let operation = incomingOperation else { return }
+        do { try stage.handle.synchronize(); try stage.handle.close() }
+        catch {
+            rejectPush(transfer, peer: peer)
             return
         }
-        guard let saved = moveIntoDocuments(url, name: name) else {
-            try? FileManager.default.removeItem(at: url)
-            send("NO\n")
-            DispatchQueue.main.async { self.status = "Could not save \(name)" }
-            return
+        pushStage = nil
+        reportReceive(transfer, received: transfer.bytes, phase: .saving)
+        reportIncomingPending(transfer, operation: operation, peer: peer, deadline: .now() + .seconds(120))
+        incomingQueue.async {
+            let result = Result {
+                let saved: ReceivedFileStorage.SavedFile
+                let receipt: IncomingTransferStore.Receipt
+                if let intent = self.incomingStore.intent(for: stage),
+                   let recovered = self.fileStorage.recover(intent, validates: { (try? Self.digest(of: $0)) == transfer.digest }) {
+                    saved = recovered
+                    receipt = try self.incomingStore.record(recovered.reference, from: peer.name, at: stage.receipt)
+                    try? FileManager.default.removeItem(at: stage.data)
+                } else {
+                    if try Self.digest(of: stage.data) != transfer.digest {
+                        try FileManager.default.removeItem(at: stage.data)
+                        throw CocoaError(.fileReadCorruptFile)
+                    }
+                    var committed: IncomingTransferStore.Receipt?
+                    saved = try self.fileStorage.save(stage.data, named: transfer.name,
+                                                      planStage: self.incomingStore.planStaging,
+                                                      clearStage: self.incomingStore.completeStaging, plan: { intent in
+                        try self.incomingStore.plan(intent, at: stage)
+                    }) { file in
+                        committed = try self.incomingStore.record(file, from: peer.name, at: stage.receipt)
+                    }
+                    guard let committed else { throw CocoaError(.fileWriteUnknown) }
+                    receipt = committed
+                }
+                self.importReceivedReceipt(receipt, at: stage.receipt)
+                return saved
+            }
+            self.queue.async {
+                let sameSession = self.transportPeer?.id == peer.id && self.incomingOperation == operation
+                switch result {
+                case .success(let saved):
+                    if sameSession {
+                        self.send("SAVED \(transfer.id)\n")
+                        self.abortPush()
+                    }
+                    DispatchQueue.main.async {
+                        if self.receiveProgress?.transferID == transfer.id { self.setReceiveProgress(nil) }
+                    }
+                    self.announce(saved, from: peer.name)
+                case .failure:
+                    if sameSession { self.rejectPush(transfer, peer: peer) }
+                }
+            }
         }
-        send("SAVED\n")
-        announce(saved)
+    }
+
+    private func rejectPush(_ transfer: IncomingTransfer, peer: TrustedPeer) {
+        send("NO \(transfer.id)\n")
+        reportReceive(transfer, received: transfer.bytes - pushLeft, phase: .failed)
+        abortPush()
+        DispatchQueue.main.async {
+            guard self.fileSendPeer?.id == peer.id else { return }
+            self.status = "Unable to save \(transfer.name). Check available storage and try again."
+        }
     }
 
     private func abortPush() {
-        try? pushHandle?.close()
-        pushHandle = nil
-        if let url = pushURL { try? FileManager.default.removeItem(at: url) }
-        pushURL = nil
+        try? pushStage?.handle.close()
+        pushStage = nil
+        pushTransfer = nil
         pushLeft = 0
-        pushName = ""
-        pushFailed = false
+        pushChunkLeft = 0
+        chunkedPush = false
+        if let operation = incomingOperation {
+            DispatchQueue.main.async { self.endReceiveBackgroundTask(operation) }
+        }
+        incomingOperation = nil
+        incomingHeartbeat?.cancel()
+        incomingHeartbeat = nil
+    }
+
+    private func beginReceiveBackgroundTask(_ operation: UUID, peer: TrustedPeer) {
+        DispatchQueue.main.async {
+            guard self.fileSendPeer?.id == peer.id, UIApplication.shared.applicationState != .background else { return }
+            let task = UIApplication.shared.beginBackgroundTask(withName: "Finish receiving a file") { [weak self] in
+                guard let self else { return }
+                self.endReceiveBackgroundTask(operation)
+                self.queue.async {
+                    guard self.transportPeer?.id == peer.id, self.incomingOperation == operation else { return }
+                    self.disconnect(peer, message: "iOS paused the transfer. Reopen Porthole to resume from the PC.")
+                }
+            }
+            if task != .invalid { self.receiveBackgroundTasks[operation] = task }
+        }
+    }
+
+    private func endReceiveBackgroundTask(_ operation: UUID) {
+        if let task = receiveBackgroundTasks.removeValue(forKey: operation) {
+            UIApplication.shared.endBackgroundTask(task)
+        }
     }
 
     private enum MediaKind { case photo, video, file }
@@ -867,39 +2126,6 @@ final class PullClient: ObservableObject {
             return .video
         default:
             return .file
-        }
-    }
-
-    private func moveIntoDocuments(_ temp: URL, name: String) -> URL? {
-        guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
-            return nil
-        }
-        let folder = docs.appendingPathComponent("Porthole", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        } catch {
-            return nil
-        }
-        var dest = folder.appendingPathComponent(name)
-        let base = (name as NSString).deletingPathExtension
-        let ext = (name as NSString).pathExtension
-        var n = 2
-        while FileManager.default.fileExists(atPath: dest.path), n < 50 {
-            let next = ext.isEmpty ? "\(base) \(n)" : "\(base) \(n).\(ext)"
-            dest = folder.appendingPathComponent(next)
-            n += 1
-        }
-        do {
-            try FileManager.default.moveItem(at: temp, to: dest)
-            return dest
-        } catch {
-            do {
-                try FileManager.default.copyItem(at: temp, to: dest)
-                try? FileManager.default.removeItem(at: temp)
-                return dest
-            } catch {
-                return nil
-            }
         }
     }
 
@@ -923,60 +2149,45 @@ final class PullClient: ObservableObject {
         }
     }
 
-    /// A file kept under Files › Porthole, by the name stored on an activity row.
-    func fileURL(named name: String) -> URL? {
-        guard !name.isEmpty, !name.contains("/"), !name.contains("\\"),
-              let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
-            return nil
-        }
-        let url = docs.appendingPathComponent("Porthole", isDirectory: true).appendingPathComponent(name)
-        return FileManager.default.fileExists(atPath: url.path) ? url : nil
-    }
-
     static func isPhotoOrVideo(_ name: String) -> Bool {
         mediaKind(name) != .file
     }
 
-    private func announce(_ file: URL) {
-        let name = file.lastPathComponent
-        note(name, "From the PC", file: true, incoming: true, path: name)
-        DispatchQueue.main.async {
-            self.arrival = Arrival(name: name, file: file)
-            self.status = "\(name) received"
-            PhoneNotice.fileArrived(name, from: self.deviceTitle())
-        }
-    }
-
-    private func safeName(_ raw: String) -> String? {
-        var out = ""
-        var dotted = false
-        for character in raw {
-            if character == "/" || character == "\\" || character == ":" { return nil }
-            let mapped: Character = character == " " ? "_" : character
-            if !(mapped.isLetter || mapped.isNumber || mapped == "." || mapped == "_" || mapped == "-") {
-                return nil
+    // The durable receipt owns the Activity identity. Replaying after a crash
+    // is safe even if the Activity update committed just before termination.
+    private func importReceivedReceipt(_ receipt: IncomingTransferStore.Receipt, at path: URL) {
+        historyQueue.sync {
+            do {
+                if !historyLoaded {
+                    historyRecords = try historyStore.load()
+                    historyLoaded = true
+                }
+                let file = receipt.reference
+                let record = ActivityItem(id: file.id, date: receipt.date, title: file.name,
+                                          detail: "Received from \(receipt.device)", isFile: true, incoming: true,
+                                          path: file.name, receivedFile: file, bytes: file.bytes, isUnread: true)
+                historyRecords = try historyStore.importReceived(record, into: historyRecords)
+                publishHistory()
+                try incomingStore.markImported(path)
+                historyStore.completeIncomingImport(file.id)
+            } catch {
+                reportHistory("A received file was saved. Porthole will retry adding it to Activity.")
             }
-            if mapped == "." { dotted = true }
-            out.append(mapped)
-            if out.count >= 80 { break }
         }
-        if out.isEmpty || out.hasPrefix(".") || !dotted { return nil }
-        return out
     }
 
-    private func sendLaunchClipboardIfNeeded() {
-        guard launchSend else { return }
-        launchSend = false
-        considerLocal(force: true)
-    }
-
-    private func startPasteWatch() {
-        guard pasteObserver == nil else { return }
-        pasteObserver = NotificationCenter.default.addObserver(
-            forName: UIPasteboard.changedNotification, object: UIPasteboard.general, queue: .main
-        ) { [weak self] _ in
-            guard let self, self.foreground else { return }
-            self.considerLocal(force: false)
+    private func announce(_ saved: ReceivedFileStorage.SavedFile, from device: String) {
+        let reference = saved.reference
+        DispatchQueue.main.async {
+            self.arrival = Arrival(name: reference.name, file: saved.localURL, reference: reference, warning: saved.warning)
+            self.rememberReceivedFiles()
+            self.status = saved.warning ?? "\(reference.name) received"
+            if let warning = saved.warning { self.storageMessage = warning }
+            PhoneNotice.fileArrived(reference, from: device, privatePreview: self.hideLockScreenDetails)
+            let arrivalID = self.arrival?.id
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+                if self.arrival?.id == arrivalID { self.arrival = nil }
+            }
         }
     }
 
@@ -989,298 +2200,197 @@ final class PullClient: ObservableObject {
         return (kind, n)
     }
 
-    private func answerClipAsk(tries: Int) {
+    private func answerClipAsk(tries: Int, peerID: UUID, generation: Int) {
+        guard foreground, clipboardLinkReady, clipboardPreference.allows(generation),
+              fileSendPeer?.id == peerID else { return }
         if UIPasteboard.general.changeCount != seenCount {
-            considerLocal(force: true, announceEmpty: false)
+            considerLocal(announceEmpty: false)
             return
         }
         if tries <= 0 { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            self?.answerClipAsk(tries: tries - 1)
+            self?.answerClipAsk(tries: tries - 1, peerID: peerID, generation: generation)
         }
     }
 
-    private func considerLocal(force: Bool, announceEmpty: Bool = true) {
-        if writingRemote { return }
+    private func considerLocal(announceEmpty: Bool = true) {
+        guard canSendClipboard(), foreground, !writingRemote,
+              let peer = fileSendPeer, let generation = clipboardPreference.generation else { return }
         let board = UIPasteboard.general
-        if !force && board.changeCount == seenCount { return }
-        if let url = board.url, board.string == nil, !board.hasImages {
-            deliverText(url.absoluteString)
+        if board.hasImages, let type = board.types.first(where: { UTType($0)?.conforms(to: .image) == true }),
+           let data = board.data(forPasteboardType: type), data.count <= 32 * 1024 * 1024 {
             seenCount = board.changeCount
+            clipboardImageQueue.async {
+                let png = CGImageSourceCreateWithData(data as CFData, nil).flatMap(Self.boundedClipboardPNG)
+                DispatchQueue.main.async { self.deliverPreparedClipboardImage(png, peer: peer, generation: generation) }
+            }
             return
         }
-        if board.hasImages, let image = board.image, let png = pngData(from: image) {
-            let mark = fingerprint(png)
-            if !force && mark == lastSent {
-                seenCount = board.changeCount
-                return
-            }
-            lastSent = mark
-            seenCount = board.changeCount
-            queueClip(kind: "P", data: png)
-            clipStatus = "Sent the image to \(deviceTitle())"
-            note("Picture", "Copied to the PC", file: false, incoming: false)
-            return
-        }
-        if let text = board.string, !text.isEmpty {
-            if isPairingText(text) {
-                seenCount = board.changeCount
-                return
-            }
-            guard let data = text.data(using: .utf8) else { return }
-            if data.count > 256 * 1024 {
-                clipStatus = "That copy is too long to send"
-                seenCount = board.changeCount
-                return
-            }
-            let mark = fingerprint(data)
-            if !force && mark == lastSent {
-                seenCount = board.changeCount
-                return
-            }
-            lastSent = mark
-            seenCount = board.changeCount
-            queueClip(kind: "T", data: data)
-            clipStatus = "Sent the copy to \(deviceTitle())"
-            note(PullClient.preview(text), "Copied to the PC", file: false, incoming: false)
-            return
-        }
-        // Another app's copy stays hidden until the user taps Paste. Do not
-        // mark it seen, or the next open gives up on it.
+        if let text = board.string, !text.isEmpty { deliverText(text); return }
+        if let url = board.url { deliverText(url.absoluteString); return }
         if board.hasStrings || board.hasImages || board.hasURLs {
-            clipStatus = "Tap Paste to send this copy to \(deviceTitle())."
+            clipStatus = "Use Paste to transfer clipboard content to \(peer.name)."
             return
         }
         seenCount = board.changeCount
-        if force && announceEmpty {
-            clipStatus = "Nothing to send. Copy on this iPhone, then tap Paste."
-        }
+        if announceEmpty { clipStatus = "Clipboard is empty. Copy text or an image, then select Paste." }
     }
 
     private func deliverText(_ text: String) {
-        guard let data = text.data(using: .utf8), !data.isEmpty else { return }
-        if isPairingText(text) {
-            seenCount = UIPasteboard.general.changeCount
-            return
-        }
-        if data.count > 256 * 1024 {
-            clipStatus = "That copy is too long to send"
-            seenCount = UIPasteboard.general.changeCount
-            return
-        }
-        lastSent = fingerprint(data)
+        guard canSendClipboard() else { return }
         seenCount = UIPasteboard.general.changeCount
-        queueClip(kind: "T", data: data)
-        clipStatus = "Sent the copy to \(deviceTitle())"
-        note(PullClient.preview(text), "Copied to the PC", file: false, incoming: false)
+        guard !text.isEmpty else { return }
+        guard text.utf8.count <= 256 * 1024 else { clipStatus = "Clipboard text exceeds the 256 KB limit."; return }
+        if isPairingText(text) { clipStatus = "Pairing details stay on this iPhone."; return }
+        queueClip(kind: "T", data: Data(text.utf8))
+        clipStatus = "Clipboard queued for \(deviceTitle())."
     }
 
-    private func deliverImage(_ image: UIImage) {
-        guard let png = pngData(from: image) else {
-            clipStatus = "That picture could not be sent"
-            return
-        }
-        lastSent = fingerprint(png)
+    private func deliverPreparedClipboardImage(_ data: Data?, peer: TrustedPeer, generation: Int) {
+        guard foreground, fileSendPeer?.id == peer.id, clipboardPreference.allows(generation) else { return }
+        guard let data else { clipStatus = "Unable to prepare this clipboard image within the transfer limits."; return }
         seenCount = UIPasteboard.general.changeCount
-        queueClip(kind: "P", data: png)
-        clipStatus = "Sent the image to \(deviceTitle())"
-        note("Picture", "Copied to the PC", file: false, incoming: false)
+        queueClip(kind: "P", data: data)
+        clipStatus = "Image queued for \(peer.name)."
     }
 
     private func isPairingText(_ text: String) -> Bool {
-        var raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        var token = ""
-        let parts = raw.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-        if parts.count >= 2 {
-            raw = parts[0]
-            let extra = parts[1].uppercased()
-            if extra.count == 8, extra.allSatisfy(\.isHexDigit) { token = extra }
-        }
-        if let colon = raw.lastIndex(of: ":"), raw.firstIndex(of: ":") == colon {
-            let suffix = raw[raw.index(after: colon)...]
-            if !suffix.isEmpty, suffix.allSatisfy(\.isNumber) {
-                raw = String(raw[..<colon])
-            }
-        }
-        if token.isEmpty { return false }
-        return raw == address && token.uppercased() == code.uppercased()
+        let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if raw.range(of: "porthole://", options: .caseInsensitive) != nil { return true }
+        let fields = raw.split(whereSeparator: \.isWhitespace)
+        if fields.count == 2, fields[1].utf8.count == 8, fields[1].allSatisfy(\.isHexDigit),
+           TrustedPeer.pairingHost(String(fields[0])) != nil { return true }
+        guard fields.count == 1, let peer = fileSendPeer else { return false }
+        return PairingCredential.load("bootstrap/" + peer.credentialProfile)?.caseInsensitiveCompare(raw) == .orderedSame
     }
 
     private func queueClip(kind: Character, data: Data) {
+        guard let generation = clipboardPreference.generation, let peer = fileSendPeer else { return }
         queue.async {
+            guard self.transportPeer?.id == peer.id, self.clipboardPreference.allows(generation) else { return }
             self.pendingKind = kind
             self.pendingData = data
+            self.pendingClipboardGeneration = generation
             self.flushClip()
         }
     }
 
     private func flushClip() {
-        guard syncReady, !exporting, let data = pendingData, let link = connection else { return }
+        // Clipboard packets may not interrupt an original file body.
+        guard let generation = pendingClipboardGeneration,
+              clipboardPreference.allows(generation) else {
+            pendingData = nil
+            pendingClipboardGeneration = nil
+            return
+        }
+        guard acceptedClipboardGeneration == generation, syncReady, !sendingOriginal, let data = pendingData, let link = connection, let peer = transportPeer else { return }
         pendingData = nil
-        var packet = Data("CLIP \(pendingKind) \(data.count)\n".utf8)
+        pendingClipboardGeneration = nil
+        let kind = pendingKind
+        var packet = Data("CLIP \(kind) \(data.count)\n".utf8)
         packet.append(data)
-        link.send(content: packet, completion: .contentProcessed { _ in })
+        clipboardPreference.performIfAllowed(generation) {
+            link.send(content: packet, completion: .contentProcessed { [weak self] error in
+                DispatchQueue.main.async {
+                    guard let self, self.fileSendPeer?.id == peer.id, self.clipboardPreference.allows(generation) else { return }
+                    guard error == nil else {
+                        self.clipStatus = "Clipboard transfer failed. Try again."
+                        return
+                    }
+                    self.clipStatus = "Clipboard sent to \(self.deviceTitle())."
+                    let title = kind == "P" ? "Image" : Self.preview(String(data: data, encoding: .utf8) ?? "Text")
+                    self.note(title, "Sent to the PC", file: false, incoming: false,
+                              clipboardText: kind == "T" ? String(data: data, encoding: .utf8) : nil,
+                              clipboardImage: kind == "P" ? data : nil)
+                }
+            })
+        }
     }
 
-    private func applyRemote(kind: Character, data: Data) {
-        DispatchQueue.main.async {
-            let board = UIPasteboard.general
-            self.writingRemote = true
-            var wrote = false
-            if kind == "T", let text = String(data: data, encoding: .utf8), !text.isEmpty {
-                board.string = text
-                wrote = true
-                self.clipStatus = "\(self.deviceTitle()) clipboard is here. Paste with Ctrl+V."
-                self.note(PullClient.preview(text), "Copied from the PC", file: false, incoming: true)
-            } else if kind == "P", let image = UIImage(data: data) {
-                board.image = image
-                wrote = true
-                self.clipStatus = "\(self.deviceTitle()) image is here. Paste with Ctrl+V."
-                self.note("Picture", "Copied from the PC", file: false, incoming: true)
+    private func applyRemote(kind: Character, data: Data, generation: Int?, peer: TrustedPeer) {
+        guard let generation, clipboardPreference.allows(generation) else { return }
+        let now = DispatchTime.now()
+        if let lastRemoteClipboardAt, now < lastRemoteClipboardAt + .milliseconds(100) { return }
+        lastRemoteClipboardAt = now
+        if kind == "T", let text = String(data: data, encoding: .utf8), !text.isEmpty {
+            DispatchQueue.main.async {
+                guard self.foreground, self.fileSendPeer?.id == peer.id, self.clipboardPreference.allows(generation) else { return }
+                self.writeLocalClipboard(type: .utf8PlainText, value: text)
+                self.clipStatus = "Clipboard received from \(peer.name)."
+                self.note(Self.preview(text), "Received from \(peer.name)", file: false, incoming: true, clipboardText: text)
             }
-            if wrote {
-                self.seenCount = board.changeCount
-                self.lastSent = self.fingerprint(data)
-            }
-            self.writingRemote = false
-            if self.foreground {
-                self.deferred = nil
-            } else if wrote {
-                self.deferred = (kind, data)
+        } else if kind == "P", !decodingRemoteClipboard {
+            decodingRemoteClipboard = true
+            clipboardImageQueue.async {
+                let png = CGImageSourceCreateWithData(data as CFData, nil).flatMap(Self.boundedClipboardPNG)
+                self.queue.async { self.decodingRemoteClipboard = false }
+                DispatchQueue.main.async {
+                    guard self.foreground, self.fileSendPeer?.id == peer.id,
+                          self.clipboardPreference.allows(generation), let png else { return }
+                    self.writeLocalClipboard(type: .png, value: png)
+                    self.clipStatus = "Image received from \(peer.name)."
+                    self.note("Image", "Received from \(peer.name)", file: false, incoming: true, clipboardImage: png)
+                }
             }
         }
     }
 
-    private func pngData(from image: UIImage) -> Data? {
-        let maxBytes = 8 * 1024 * 1024
-        var scale: CGFloat = 1
-        for _ in 0..<8 {
-            let current: UIImage
-            if scale < 1 {
-                let size = CGSize(width: max(1, image.size.width * scale),
-                                  height: max(1, image.size.height * scale))
-                let renderer = UIGraphicsImageRenderer(size: size)
-                current = renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: size)) }
-            } else {
-                current = image
-            }
-            if let data = current.pngData(), data.count <= maxBytes { return data }
-            scale *= 0.7
+    private func writeLocalClipboard(type: UTType, value: Any) {
+        let board = UIPasteboard.general
+        writingRemote = true
+        board.setItems([[type.identifier: value]], options: [.localOnly: true])
+        seenCount = board.changeCount
+        writingRemote = false
+    }
+
+    private static func boundedClipboardPNG(_ source: CGImageSource) -> Data? {
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int,
+              (1...8192).contains(width), (1...8192).contains(height), width * height <= 24_000_000 else { return nil }
+        for side in [2048, 1440, 1024] {
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: side,
+                kCGImageSourceShouldCacheImmediately: true
+            ]
+            guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+            let data = NSMutableData()
+            guard let destination = CGImageDestinationCreateWithData(data as CFMutableData, UTType.png.identifier as CFString, 1, nil) else { return nil }
+            CGImageDestinationAddImage(destination, image, nil)
+            if CGImageDestinationFinalize(destination), data.length <= 8 * 1024 * 1024 { return data as Data }
         }
         return nil
     }
 
-    private func fingerprint(_ data: Data) -> String {
-        var hash: UInt64 = 14695981039346656037
-        for byte in data {
-            hash ^= UInt64(byte)
-            hash &*= 1099511628211
-        }
-        return "\(data.count):\(hash)"
-    }
-
     private func loadSaved() {
-        let defaults = UserDefaults.standard
-        if address.isEmpty, let host = defaults.string(forKey: "porthole.host") {
-            address = host
-        }
-        if code.isEmpty, let token = defaults.string(forKey: "porthole.code") {
-            code = token
-        }
-        if deviceName.isEmpty, let saved = defaults.string(forKey: "porthole.device"), !saved.isEmpty {
-            deviceName = saved
-        }
-        guard normalized() == nil, let pasted = UIPasteboard.general.string else { return }
-        let savedAddress = address
-        let savedCode = code
-        address = pasted
-        code = ""
-        if normalized() == nil {
-            address = savedAddress
-            code = savedCode
+        guard requestedPeer == nil else { return }
+        if let pending = PendingPairing.load() {
+            requestedPeer = pending.peer
+            address = pending.peer.host
+            // The PC may have stored the key before the app received PAIRED.
+            reconnectAttempt = 1
+        } else if let saved = savedPeer() {
+            requestedPeer = saved
+            address = saved.host
         }
     }
 
     private func scheduleReconnect() {
-        guard normalized() != nil else { return }
+        guard !disconnectedByPC, let peer = requestedPeer else { return }
         reconnectWork?.cancel()
+        if reconnectAttempt >= 4, PendingPairing.load()?.peer.samePairing(as: peer) == true {
+            status = "Pairing could not finish. Tap Connect to retry, or use the current code shown on your PC."
+            return
+        }
         let delay = min(2 << min(reconnectAttempt, 3), 15)
         reconnectAttempt += 1
         let work = DispatchWorkItem { [weak self] in
-            guard let self, !self.greeted else { return }
-            self.connect()
+            guard let self, self.requestedPeer?.id == peer.id, !self.linked, !self.connecting else { return }
+            self.connectCurrentPeer()
         }
         reconnectWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(delay), execute: work)
-    }
-}
-
-/// Silent playback so iOS keeps this process alive after the user opens Photos.
-private final class SilentKeepAlive {
-    private let engine = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
-    private var attached = false
-    private var wanted = false
-    private var observers: [NSObjectProtocol] = []
-
-    /// iOS stops the engine when the audio route changes, for example when AirPlay
-    /// mirroring starts or Porthole on the PC restarts. Without the silence playing,
-    /// the app is suspended a few seconds later and the photo link drops.
-    init() {
-        let center = NotificationCenter.default
-        observers.append(center.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine,
-                                            queue: .main) { [weak self] _ in self?.restart() })
-        observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil,
-                                            queue: .main) { [weak self] _ in self?.restart() })
-        observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification, object: nil,
-                                            queue: .main) { [weak self] note in
-            guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-                  AVAudioSession.InterruptionType(rawValue: raw) == .ended else { return }
-            self?.restart()
-        })
-    }
-
-    deinit {
-        observers.forEach { NotificationCenter.default.removeObserver($0) }
-    }
-
-    private func restart() {
-        guard wanted, !engine.isRunning || !player.isPlaying else { return }
-        player.stop()
-        start()
-    }
-
-    func stop() {
-        wanted = false
-        player.stop()
-        engine.stop()
-        try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
-    }
-
-    func start() {
-        wanted = true
-        let session = AVAudioSession.sharedInstance()
-        do {
-            try session.setCategory(.playback, options: [.mixWithOthers])
-            try session.setActive(true)
-            guard let format = AVAudioFormat(standardFormatWithSampleRate: 8000, channels: 1) else { return }
-            if !attached {
-                engine.attach(player)
-                engine.connect(player, to: engine.mainMixerNode, format: format)
-                attached = true
-            }
-            engine.mainMixerNode.outputVolume = 0
-            if !engine.isRunning {
-                try engine.start()
-            }
-            guard !player.isPlaying else { return }
-            let frames: AVAudioFrameCount = 8000
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return }
-            buffer.frameLength = frames
-            player.scheduleBuffer(buffer, at: nil, options: .loops)
-            player.play()
-        } catch {
-            return
-        }
     }
 }

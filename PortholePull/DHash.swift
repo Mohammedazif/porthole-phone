@@ -93,8 +93,12 @@ enum PictureHash {
     /// picture's own width / height, for video frames stored as a square grid.
     static func cells(luma: [UInt8], width: Int, height: Int, placement: Placement, side: Int,
                       shape: Double? = nil, samples k: Int = 4) -> [Double] {
+        guard (1...64).contains(side), (1...8).contains(k), (1...1024).contains(width),
+              (1...1024).contains(height), luma.count == width * height,
+              shape.map({ $0.isFinite && $0 > 0 }) ?? true else { return [] }
         switch placement {
         case .crop(let aspect, let along, let zoom):
+            guard aspect.isFinite, aspect > 0, along.isFinite, (0...1).contains(along), zoom.isFinite else { return [] }
             guard let shape else {
                 return thumb(luma: luma, width: width,
                              crop: crop(width: width, height: height, aspect: aspect, along: along, zoom: zoom),
@@ -125,6 +129,7 @@ enum PictureHash {
             }
             return out
         case .fit(let screen, let background):
+            guard screen.isFinite, screen > 0, background.isFinite else { return [] }
             var out = [Double](repeating: background, count: side * side)
             guard width >= 1, height >= 1, luma.count >= width * height, screen > 0 else { return out }
             let a = shape ?? Double(width) / Double(height)
@@ -185,13 +190,13 @@ enum PictureHash {
 
     /// Times to decode around the coarse frames that came closest, covering the gap to
     /// the neighbouring coarse frames. Bounded, so a long movie stays quick.
-    static func refinementTimes(duration: Double, frames: Int, anchors: [Int]) -> [Double] {
-        guard duration.isFinite, duration > 0, frames > 0, !anchors.isEmpty else { return [] }
+    static func refinementTimes(duration: Double, anchors: [Double]) -> [Double] {
+        guard duration.isFinite, duration > 0, duration < Double(Int.max / 1200), !anchors.isEmpty else { return [] }
         let step = max(1.0, duration / Double(videoFramesMax))
         let radius = step / 2 + 0.6
         var ticks = Set<Int>()
-        for anchor in anchors.prefix(2) where anchor >= 0 && anchor < frames {
-            let center = Double(anchor) * step
+        for center in anchors.prefix(2) where center.isFinite && center >= 0 && center < duration {
+            ticks.insert(Int((center * 600).rounded(.down)))
             let lower = max(0, center - radius)
             let upper = min(duration - 0.05, center + radius)
             guard upper >= lower else { continue }
@@ -286,7 +291,8 @@ enum PictureHash {
     /// A library thumbnail is square; the camera file usually is not. Cropping
     /// both to the same shape is what makes those two pictures comparable.
     static func dhashCrop(luma: [UInt8], width: Int, height: Int, aspect: Double, along: Double = 0.5) -> UInt64 {
-        if width < 2 || height < 2 || aspect < 0.05 || luma.count < width * height { return 0 }
+        guard (2...1024).contains(width), (2...1024).contains(height), aspect.isFinite,
+              aspect >= 0.05, luma.count == width * height else { return 0 }
         let c = crop(width: width, height: height, aspect: aspect, along: along)
         return dhash(width: c.w, height: c.h) { x, y in
             luma[(c.y + y) * width + (c.x + x)]
@@ -304,7 +310,7 @@ enum PictureHash {
     /// axis, 0.5 being the centre.
     static func crop(width: Int, height: Int, aspect: Double, along: Double = 0.5, zoom: Double = 1) -> Crop {
         var c = Crop(x: 0, y: 0, w: width, h: height)
-        if width < 2 || height < 2 || aspect < 0.05 { return c }
+        if width < 2 || height < 2 || !aspect.isFinite || aspect < 0.05 || !along.isFinite || !zoom.isFinite { return c }
         let photo = Double(width) / Double(height)
         let t = min(1, max(0, along))
         if photo > aspect {
@@ -436,9 +442,10 @@ enum PictureHash {
 
     /// side squared bytes as hex, such as the fifth PULL field at detailSide.
     static func parseCells(_ hex: Substring, side: Int) -> [Double]? {
+        guard (1...64).contains(side) else { return nil }
         let n = side * side
+        guard hex.utf8.count == n * 2 else { return nil }
         let bytes = Array(hex.utf8)
-        if bytes.count != n * 2 { return nil }
         var out = [Double]()
         out.reserveCapacity(n)
         var high: UInt8 = 0

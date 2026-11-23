@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import Photos
 import UIKit
 
@@ -14,56 +15,94 @@ struct IndexedPhoto {
 struct VideoEntry {
     let localIdentifier: String
     let modified: Double
+    struct Frame {
+        let seconds: Double
+        let pixels: [UInt8]
+    }
     let aspect: Double
-    let frames: [[UInt8]]
+    let frames: [Frame]
 }
 
 final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
-    @Published var status = "Photos not loaded"
+    @Published var status = "Photo library not indexed"
     @Published var ready = false
-    /// What iOS actually reports. AssistiveTouch and Dwell are not readable.
-    @Published private(set) var accessLabel = "Not asked"
+    @Published private(set) var accessLabel = "Not requested"
+    @Published private(set) var authorizationStatus: PHAuthorizationStatus = .notDetermined
     private let lock = NSLock()
     private var photos: [IndexedPhoto] = []
     private var videos: [VideoEntry] = []
-    /// Videos in the library, and those skipped because they are only in iCloud.
+    /// Videos in the library and those that did not yield local frames.
     private var videoTotal = 0
     private var videoSkipped = 0
     private let videoQueue = DispatchQueue(label: "porthole.videos", qos: .utility)
-    private var manager: PHCachingImageManager?
     private var indexing = false
     private var observing = false
     private var refreshPending = false
     private var lastRefresh = Date.distantPast
+    // Permission and snapshot changes invalidate work already in flight.
+    private var libraryAccess: PHAuthorizationStatus?
+    private var libraryGeneration = 0
     private var videoGeneration = 0
-    /// Bumped whenever `photos` is replaced, so caches built from it know they are stale.
     private var photosGeneration = 0
-    /// Every photo fitted to the screen at 16 cells, for the whole-screen quick pass.
-    /// Only the PullClient queue touches these. The screen's shape never changes, so
-    /// after the first drag the pass is just a comparison.
+    // Match jobs can run off the companion's queue. Protect fitted data with the
+    // same lock as the photo snapshot, and clear it with a permission change.
     private var fitKey = ""
     private var fitCells: [[UInt8]] = []
+    private static let photoPixelBudget = 128 * 1024 * 1024
+    private static let videoPixelBudget = 48 * 1024 * 1024
+    private static let maxPhotoEntries = 80_000
+    private static let maxVideoEntries = 12_000
     private let indexQueue = DispatchQueue(label: "porthole.index", qos: .utility)
-    /// Thumbnails arrive on the main thread; they are shrunk to cells here instead.
+    /// Run bounded thumbnail requests and sampling away from the main thread.
     private let sampleQueue = DispatchQueue(label: "porthole.sample", qos: .utility, attributes: .concurrent)
 
     deinit {
         if observing { PHPhotoLibrary.shared().unregisterChangeObserver(self) }
     }
 
-    /// Reuse unchanged thumbnails; retry items that were unavailable in iCloud.
+    func refreshAuthorization() {
+        noteAccess(PHPhotoLibrary.authorizationStatus(for: .readWrite))
+    }
+
+    /// Only Photos entry points warm the index. Permission prompts require an explicit action.
     func refreshIfNeeded() {
-        if Date().timeIntervalSince(lastRefresh) >= 30 {
+        let access = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        noteAccess(access)
+        if canAccessLibrary, !indexing, !ready || Date().timeIntervalSince(lastRefresh) >= 30 {
             requestAccessAndIndex(refresh: true)
         }
     }
 
-    /// iCloud sync can change the library many times a minute. Index once it settles.
+    enum MatchReadiness { case ready, preparing, accessRequired }
+
+    func prepareMatch() -> MatchReadiness {
+        refreshIfNeeded()
+        guard canAccessLibrary else { return .accessRequired }
+        return ready ? .ready : .preparing
+    }
+
+    /// iCloud sync can change the library repeatedly. Refetch once it settles,
+    /// but immediately retire work and any limited-library snapshot on a change.
     private var changeWork: DispatchWorkItem?
 
     func photoLibraryDidChange(_ changeInstance: PHChange) {
+        let access = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        lock.lock()
+        if access == .limited || access != libraryAccess {
+            invalidateLocked(access: access)
+        } else {
+            libraryGeneration += 1
+        }
+        lock.unlock()
         DispatchQueue.main.async {
+            let latest = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+            self.noteAccess(latest)
+            if latest == .limited {
+                self.ready = false
+                self.status = "Updating selected photos"
+            }
             self.changeWork?.cancel()
+            guard self.canAccessLibrary else { return }
             let work = DispatchWorkItem { [weak self] in self?.requestAccessAndIndex(refresh: true) }
             self.changeWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
@@ -71,7 +110,8 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
     }
 
     func requestAccessAndIndex(refresh: Bool = false) {
-        noteAccess(PHPhotoLibrary.authorizationStatus(for: .readWrite))
+        let access = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        noteAccess(access)
         if indexing {
             refreshPending = refreshPending || refresh
             return
@@ -79,38 +119,99 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         if ready && !refresh { return }
         indexing = true
         lastRefresh = Date()
-        PHPhotoLibrary.requestAuthorization(for: .readWrite) { [weak self] access in
-            DispatchQueue.main.async {
-                self?.noteAccess(access)
-                guard access == .authorized || access == .limited else {
-                    self?.indexing = false
-                    self?.status = "Allow photo access in Settings"
-                    self?.ready = false
-                    return
+        if access == .notDetermined {
+            PHPhotoLibrary.requestAuthorization(for: .readWrite) { [weak self] _ in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.startIndex(access: PHPhotoLibrary.authorizationStatus(for: .readWrite))
                 }
-                guard let self else { return }
-                if !self.observing {
-                    PHPhotoLibrary.shared().register(self)
-                    self.observing = true
-                }
-                if !self.ready {
-                    self.status = Self.photoCacheExists() ? "Checking for new photos" : "Updating library"
-                }
-                // Off the main thread: walking ~60,000 items there froze the app at launch,
-                // and with it the Start Broadcast sheet that runs inside the app.
-                self.indexQueue.async { self.index() }
+            }
+        } else {
+            startIndex(access: access)
+        }
+    }
+
+    private func startIndex(access: PHAuthorizationStatus) {
+        noteAccess(access)
+        guard canAccessLibrary else { finishIndex(); return }
+        if !observing {
+            PHPhotoLibrary.shared().register(self)
+            observing = true
+        }
+        if !ready { status = "Checking photo library" }
+        lock.lock()
+        let generation = libraryGeneration
+        lock.unlock()
+        indexQueue.async { self.index(generation: generation, diskCache: access == .authorized) }
+    }
+
+    private func invalidateLocked(access: PHAuthorizationStatus) {
+        libraryAccess = access
+        libraryGeneration += 1
+        photosGeneration += 1
+        videoGeneration += 1
+        photos.removeAll()
+        videos.removeAll()
+        videoTotal = 0
+        videoSkipped = 0
+        fitKey = ""
+        fitCells.removeAll()
+        if access != .authorized {
+            for name in ["photo-index-v2.bin", "video-frames-v2.bin"] {
+                if let url = Self.cacheURL(name) { try? FileManager.default.removeItem(at: url) }
             }
         }
     }
 
     private func noteAccess(_ access: PHAuthorizationStatus) {
+        let old = authorizationStatus
+        authorizationStatus = access
+        lock.lock()
+        if libraryAccess == nil {
+            Self.removeLegacyCaches()
+        }
+        if libraryAccess != access { invalidateLocked(access: access) }
+        lock.unlock()
+        if old != access { ready = false }
         switch access {
-        case .authorized: accessLabel = "Allowed"
-        case .limited: accessLabel = "Limited"
-        case .denied, .restricted: accessLabel = "Off"
-        case .notDetermined: accessLabel = "Not asked"
+        case .authorized: accessLabel = "Full access"
+        case .limited: accessLabel = "Limited access"
+        case .denied: accessLabel = "Access denied"
+        case .restricted: accessLabel = "Restricted"
+        case .notDetermined: accessLabel = "Not requested"
         @unknown default: accessLabel = "Unknown"
         }
+        if !canAccessLibrary {
+            ready = false
+            status = access == .restricted ? "Photo access is restricted by device settings."
+                : access == .notDetermined ? "Photo access has not been requested."
+                : "Photo access required. Review permissions in Settings."
+        }
+    }
+
+    private func isCurrent(_ generation: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isCurrentLocked(generation)
+    }
+
+    private func isCurrentLocked(_ generation: Int) -> Bool {
+        generation == libraryGeneration && (libraryAccess == .authorized || libraryAccess == .limited)
+            && PHPhotoLibrary.authorizationStatus(for: .readWrite) == libraryAccess
+    }
+
+    private static func itemCount(_ count: Int) -> String {
+        "\(count) \(count == 1 ? "item" : "items")"
+    }
+
+    private static func currentAsset(_ id: String, modified: Double) -> PHAsset? {
+        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject,
+              (asset.modificationDate?.timeIntervalSince1970 ?? 0) == modified else { return nil }
+        return asset
+    }
+
+    private var canAccessLibrary: Bool {
+        authorizationStatus == .authorized || authorizationStatus == .limited
     }
 
     struct Match {
@@ -120,8 +221,7 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         var note = ""
         /// Best and runner-up video scores, for the PC log.
         var video = ""
-        /// The closest photo's thumb, which the PC saves beside its own. Always last.
-        var debug = ""
+        var videoUnavailable = false
         /// Two different pictures that both clear the minimum when neither wins.
         var choices: [String] = []
     }
@@ -151,17 +251,37 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
 
     /// The picture the PC cut out first, then the whole screen; photos, then videos.
     func match(hash: UInt64, aspect: Double, thumb: [Double]?, detail: [Double]? = nil,
-               screen: Screen? = nil, progress: ((String) -> Void)? = nil) -> Match {
+               screen: Screen? = nil, isCancelled: @escaping () -> Bool = { false },
+               progress: ((String) -> Void)? = nil) -> Match {
+        guard (0.05...20).contains(aspect), screen.map({ (0.05...20).contains($0.aspect) }) ?? true else {
+            return Match()
+        }
+        lock.lock()
+        let generation = libraryGeneration
+        lock.unlock()
+        let deadline = DispatchTime.now() + .seconds(14)
+        let authorized = { !isCancelled() && self.isCurrent(generation) }
+        let current = { DispatchTime.now() < deadline && authorized() }
+        guard current() else { return Match() }
+        let result = matchCurrent(hash: hash, aspect: aspect, thumb: thumb, detail: detail, screen: screen,
+                                  deadline: deadline, current: current, progress: progress)
+        return authorized() && (DispatchTime.now() < deadline || result.videoUnavailable) ? result : Match()
+    }
+
+    private func matchCurrent(hash: UInt64, aspect: Double, thumb: [Double]?, detail: [Double]?,
+                              screen: Screen?, deadline: DispatchTime, current: @escaping () -> Bool,
+                              progress: ((String) -> Void)?) -> Match {
         // With no edges to find, the PC sends the whole screen as the picture too.
         let onlyScreen = screen != nil && thumb == screen?.thumb
         var found = Match()
         if !onlyScreen {
-            found = matchPhotos(hash: hash, aspect: aspect, thumb: thumb, detail: detail)
+            found = matchPhotos(hash: hash, aspect: aspect, thumb: thumb, detail: detail, current: current)
             if found.asset != nil || !found.choices.isEmpty { return found }
         }
+        guard current() else { return Match() }
         if let screen {
-            progress?("Comparing the whole screen")
-            let fitted = matchFitted(screen)
+            progress?("Analyzing shared screen")
+            let fitted = matchFitted(screen, current: current)
             found.note += (found.note.isEmpty ? "" : " ") + "screen " + fitted.note
             if let asset = fitted.asset {
                 found.asset = asset
@@ -175,17 +295,25 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         var videoNotes: [String] = []
         if !onlyScreen, let thumb, thumb.count == PictureHash.thumbSide * PictureHash.thumbSide {
             let video = matchVideos(placement: .crop(aspect: aspect), thumb: thumb, detail: detail,
-                                    shapeFilter: aspect, progress: progress)
+                                    shapeFilter: aspect, deadline: deadline, current: current, progress: progress)
             if let asset = video.asset { return Match(asset: asset, closest: found.closest, note: found.note, video: video.note) }
             videoNotes.append(video.note)
+            found.videoUnavailable = video.unavailable
+            if !video.choices.isEmpty {
+                found.video = video.note
+                found.choices = video.choices
+                return found
+            }
         }
-        if let screen {
+        if let screen, current() {
             let video = matchVideos(placement: screen.placement, thumb: screen.thumb, detail: screen.detail,
-                                    shapeFilter: nil, progress: progress)
+                                    shapeFilter: nil, deadline: deadline, current: current, progress: progress)
             if let asset = video.asset {
                 return Match(asset: asset, closest: found.closest, note: found.note, video: "screen " + video.note)
             }
             videoNotes.append("screen " + video.note)
+            found.videoUnavailable = found.videoUnavailable || video.unavailable
+            found.choices = video.choices
         }
         found.video = videoNotes.joined(separator: " ")
         return found
@@ -235,8 +363,9 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
     /// win that is not near-perfect is confirmed the same way: a wrong file is worse
     /// than none, and a page of text can look like a list on a phone at 32 cells.
     private func closerLook(_ ranked: [Candidate], items: [IndexedPhoto], at position: [String: Int],
-                            placement: (Candidate) -> PictureHash.Placement, detail: [Double]?,
-                            thumb: [Double]) -> (id: String?, note: String, choices: [String]) {
+                            placement: @escaping (Candidate) -> PictureHash.Placement, detail: [Double]?,
+                            thumb: [Double], current: @escaping () -> Bool) -> (id: String?, note: String, choices: [String]) {
+        guard current() else { return (nil, "cancelled", []) }
         let first = Self.decide(ranked, min: PictureHash.gradientMin)
         guard let top = ranked.first else { return first }
         let runner = ranked.count > 1 ? ranked[1].score : -1
@@ -248,16 +377,16 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         // Photos draws each sharper copy in its own time: ask for them all at once.
         let candidates = Array(close)
         var refined: [Candidate] = Parallel.map(candidates.count, serialBelow: 2) { (k: Int) -> Candidate? in
+            guard current() else { return nil }
             let candidate = candidates[k]
+            guard let index = position[candidate.id] else { return nil }
+            let photo = items[index]
+            guard let asset = Self.currentAsset(candidate.id, modified: photo.modified) else { return nil }
             let luma: [UInt8], width: Int, height: Int
-            if let asset = PHAsset.fetchAssets(withLocalIdentifiers: [candidate.id], options: nil).firstObject,
-               let sampled = Self.render(asset, longSide: 320) {
+            if let sampled = Self.render(asset, longSide: 320, current: current) {
                 (luma, width, height) = (sampled.luma, sampled.width, sampled.height)
-            } else if let index = position[candidate.id] {
-                let photo = items[index]
-                (luma, width, height) = (photo.luma, photo.gridW, photo.gridH)
             } else {
-                return nil
+                (luma, width, height) = (photo.luma, photo.gridW, photo.gridH)
             }
             // Each candidate at its best of a few zooms: the right one gains far more than
             // a different picture does, so the lead grows.
@@ -289,7 +418,8 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         return (nil, note + (first.id != nil ? " unconfirmed" : ""), choices)
     }
 
-    private func matchPhotos(hash: UInt64, aspect: Double, thumb: [Double]?, detail: [Double]?) -> Match {
+    private func matchPhotos(hash: UInt64, aspect: Double, thumb: [Double]?, detail: [Double]?,
+                             current: @escaping () -> Bool) -> Match {
         lock.lock()
         let items = photos
         lock.unlock()
@@ -297,6 +427,7 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         // The cut may not be centred: the closest of three positions counts, and where it
         // sat is kept for scoring below.
         let hashed: [(distance: Int, along: Double)] = Parallel.map(items.count) { (index: Int) -> (distance: Int, along: Double) in
+            if index.isMultiple(of: 64), !current() { return (65, 0.5) }
             let photo = items[index]
             var distance = 65, at = 0.5
             for along in Self.slides(photo, aspect) ? [0.5, 0.2, 0.8] : [0.5] {
@@ -311,40 +442,35 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
             }
             return (distance, at)
         }
+        guard current() else { return Match() }
         let hashMs = Parallel.ms(since: started)
         var distances = [Int](repeating: 65, count: items.count)
         var best = -1
         var bestDistance = 65
-        var second = 65
         for index in items.indices {
             let distance = hashed[index].distance
             if distance == 65 { continue }
             distances[index] = distance
             if distance < bestDistance {
-                second = bestDistance
                 bestDistance = distance
                 best = index
-            } else if distance < second {
-                second = distance
             }
         }
         guard best >= 0 else { return Match() }
         guard let thumb, thumb.count == PictureHash.thumbSide * PictureHash.thumbSide else {
-            // A PC before the thumb: a mirrored photo lands about 15 to 17 bits away, and the
-            // next library photo is often only a few bits behind that.
-            let unique = bestDistance <= PictureHash.matchMax && bestDistance < second
-            guard unique else { return Match(asset: nil, closest: bestDistance) }
-            return Match(asset: fetch(items[best]), closest: bestDistance)
+            // A hash alone proposes a candidate. Original transfer requires image evidence.
+            return Match(closest: bestDistance, note: "thumbnail required")
         }
 
-        // The dHash only shortlists: everything close, and at least the 400 closest, since
-        // a dark picture or one under Photos' bars can land far from its own dHash.
+        // Bound the detailed work even if a large library shares one perceptual
+        // hash. Keep coarse scores for every asset, but never retain an image
+        // pattern for every hash near the requested item.
         let side = PictureHash.thumbSide
-        let placement = PictureHash.Placement.crop(aspect: aspect)
         let query = PictureHash.pattern(thumb, side: side)
         var order = items.indices.filter { distances[$0] < 65 }
         order.sort { distances[$0] < distances[$1] }
-        let limit = max(600, order.prefix { distances[$0] <= PictureHash.candidateBits }.count)
+        let closeCount = order.prefix { distances[$0] <= PictureHash.candidateBits }.count
+        let limit = min(768, max(400, closeCount))
         // Each at the centre and where its dHash sat; then the closest few at every cut,
         // so a thumbnail cut away from the centre still wins without scoring thousands
         // of photos seven times over.
@@ -368,22 +494,25 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         ranked.replaceSubrange(0..<head, with: wider)
         ranked.sort { $0.score > $1.score }
 
-        // The closest photo, as the app sees it, for the PC to save beside its own copy.
-        let near = items[ranked.first.flatMap { position[$0.id] } ?? best]
-        let nearCells = PictureHash.cells(luma: near.luma, width: near.gridW, height: near.gridH,
-                                          placement: placement, side: side)
-        let debug = String(format: " near %dx%d ", near.gridW, near.gridH) + PictureHash.hex(nearCells)
-
         let rankMs = Parallel.ms(since: started) - hashMs
         var verdict = closerLook(ranked, items: items, at: position,
                                  placement: { .crop(aspect: aspect, along: $0.along) },
-                                 detail: detail, thumb: thumb)
+                                 detail: detail, thumb: thumb, current: current)
         verdict.note += " ms hash \(hashMs) rank \(rankMs) look \(Parallel.ms(since: started) - hashMs - rankMs)"
-        if let id = verdict.id, let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject {
-            return Match(asset: asset, closest: distances[position[id] ?? best], note: verdict.note)
+        if let id = verdict.id, let index = position[id],
+           let asset = Self.currentAsset(id, modified: items[index].modified) {
+            return Match(asset: asset, closest: distances[index], note: verdict.note)
         }
-        return Match(asset: nil, closest: bestDistance, note: verdict.note, debug: debug,
-                     choices: verdict.choices)
+        return Match(asset: nil, closest: bestDistance, note: verdict.note,
+                     choices: Self.currentChoices(verdict.choices, items: items, position: position))
+    }
+
+    private static func currentChoices(_ ids: [String], items: [IndexedPhoto], position: [String: Int]) -> [String] {
+        let valid = ids.filter { id in
+            guard let index = position[id] else { return false }
+            return currentAsset(id, modified: items[index].modified) != nil
+        }
+        return valid.count > 1 ? valid : []
     }
 
     /// Candidates scored at every cut position in the ranking above.
@@ -413,10 +542,12 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
 
     /// Every library photo placed on the whole screen the way Photos shows it. A quick
     /// pass at 16 cells keeps the 300 closest; those are compared properly.
-    private func matchFitted(_ screen: Screen) -> (asset: PHAsset?, note: String, choices: [String]) {
+    private func matchFitted(_ screen: Screen, current: @escaping () -> Bool) -> (asset: PHAsset?, note: String, choices: [String]) {
         lock.lock()
         let items = photos
         let generation = photosGeneration
+        let cachedKey = fitKey
+        let cachedCells = fitCells
         lock.unlock()
         let placement = screen.placement
         let quickSide = PictureHash.videoSide
@@ -424,17 +555,27 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
               let quick = PictureHash.FrameQuery(cells: PictureHash.shrink(screen.thumb, to: quickSide), side: quickSide)
         else { return (nil, "none", []) }
         let background = PictureHash.background(screen.thumb, side: PictureHash.thumbSide)
-        let key = String(format: "%d %.3f %d", generation, screen.aspect, Int(background / 24))
-        if key != fitKey || fitCells.count != items.count {
-            fitCells = Parallel.map(items.count) { (index: Int) -> [UInt8] in
+        guard (0...255).contains(background) else { return (nil, "invalid preview", []) }
+        let key = "\(generation) \(screen.aspect) \(background)"
+        let all: [[UInt8]]
+        if key == cachedKey && cachedCells.count == items.count {
+            all = cachedCells
+        } else {
+            all = Parallel.map(items.count) { (index: Int) -> [UInt8] in
+                if index.isMultiple(of: 64), !current() { return [] }
                 let photo = items[index]
                 return PictureHash.cells(luma: photo.luma, width: photo.gridW, height: photo.gridH,
                                          placement: placement, side: quickSide, samples: 2)
                     .map { UInt8(min(255, max(0, $0.rounded()))) }
             }
-            fitKey = key
+            guard current() else { return (nil, "cancelled", []) }
+            lock.lock()
+            if photosGeneration == generation {
+                fitKey = key
+                fitCells = all
+            }
+            lock.unlock()
         }
-        let all = fitCells
         var rough: [(index: Int, rank: Double)] = Parallel.map(all.count) { (index: Int) -> (index: Int, rank: Double) in
             let s = quick.score(all[index])
             return (index, 0.6 * s.grad + 0.4 * s.luma)
@@ -455,24 +596,34 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         for entry in shortlist { position[items[entry.index].localIdentifier] = entry.index }
         ranked.sort { $0.score > $1.score }
         let verdict = closerLook(ranked, items: items, at: position, placement: { _ in placement },
-                                 detail: screen.detail.isEmpty ? nil : screen.detail, thumb: screen.thumb)
-        guard let id = verdict.id else { return (nil, verdict.note, verdict.choices) }
-        return (PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject, verdict.note, [])
+                                 detail: screen.detail.isEmpty ? nil : screen.detail, thumb: screen.thumb, current: current)
+        guard let id = verdict.id, let index = position[id] else {
+            return (nil, verdict.note, Self.currentChoices(verdict.choices, items: items, position: position))
+        }
+        return (Self.currentAsset(id, modified: items[index].modified), verdict.note, [])
+    }
+
+    private struct VideoMatch {
+        var asset: PHAsset?
+        var note: String
+        var choices: [String] = []
+        var unavailable = false
     }
 
     private func matchVideos(placement: PictureHash.Placement, thumb: [Double], detail: [Double]?,
-                             shapeFilter: Double?, progress: ((String) -> Void)?) -> (asset: PHAsset?, note: String) {
+                             shapeFilter: Double?, deadline: DispatchTime, current: @escaping () -> Bool,
+                             progress: ((String) -> Void)?) -> VideoMatch {
         lock.lock()
         let entries = videos
         let total = videoTotal
         let skipped = videoSkipped
         lock.unlock()
         let started = DispatchTime.now()
-        let read = "read \(entries.count)/\(total) icloud \(skipped)"
+        let read = "read \(entries.count)/\(total) unavailable \(skipped)"
         let side = PictureHash.videoSide
         guard !entries.isEmpty,
               let query = PictureHash.FrameQuery(cells: PictureHash.shrink(thumb, to: side), side: side) else {
-            return (nil, "video none " + read)
+            return VideoMatch(note: "video none " + read)
         }
         var fitted = false
         if case .fit = placement { fitted = true }
@@ -484,7 +635,9 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
             let rank: Double
             let anchors: [Int]
         }
+        guard current() else { return VideoMatch(note: "cancelled") }
         let coarse: [Coarse] = Parallel.map(entries.count) { (index: Int) -> Coarse? in
+            if index.isMultiple(of: 16), !current() { return nil }
             let entry = entries[index]
             // Cropped to the shape on screen rather than skipped: a library thumbnail is a
             // square cut from the middle of a tall or wide video.
@@ -492,7 +645,8 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
             var bestGrad = -2.0
             var scored: [(frame: Int, rank: Double)] = []
             scored.reserveCapacity(entry.frames.count)
-            for (frameIndex, frame) in entry.frames.enumerated() {
+            for (frameIndex, sample) in entry.frames.enumerated() {
+                let frame = sample.pixels
                 let pixels: [UInt8]
                 if !fitted, let aspect = shapeFilter, aspect > 0, abs(entry.aspect - aspect) / aspect <= 0.03 {
                     pixels = frame // already this shape
@@ -510,21 +664,21 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
             guard let lead = scored.first else { return nil }
             return Coarse(index: index, grad: bestGrad, rank: lead.rank, anchors: scored.prefix(2).map(\.frame))
         }.compactMap { $0 }
-        guard !coarse.isEmpty else { return (nil, "video none " + read) }
+        guard current(), !coarse.isEmpty else { return VideoMatch(note: "video none " + read) }
         let byGrad = coarse.sorted { $0.grad > $1.grad }
         let top = byGrad[0].grad
         let runner = byGrad.count > 1 ? byGrad[1].grad : -1
         var note = String(format: "video %.3f %.3f ", top, runner) + read + " ms \(Parallel.ms(since: started))"
+        let leading = entries[byGrad[0].index]
         if !fitted, top >= PictureHash.videoMin, top - runner >= PictureHash.videoGap,
-           let asset = PHAsset.fetchAssets(withLocalIdentifiers: [entries[byGrad[0].index].localIdentifier],
-                                           options: nil).firstObject {
-            return (asset, note)
+           let asset = Self.currentAsset(leading.localIdentifier, modified: leading.modified) {
+            return VideoMatch(asset: asset, note: note)
         }
 
         // Decoding takes seconds. When no video is even near, such as on the home screen,
         // answer now. A video dragged mid-motion scored 0.44 here before it was refined.
         if top < (fitted ? 0.40 : 0.30) {
-            return (nil, note + " not near")
+            return VideoMatch(note: note + " not near")
         }
 
         // Twenty-four coarse frames can miss the exact moment, above all when the camera
@@ -537,238 +691,269 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         }
         let detailSide = detail != nil ? PictureHash.detailSide : PictureHash.thumbSide
         let detailQuery = PictureHash.pattern(detail ?? thumb, side: detailSide)
-        let deadline = Date().addingTimeInterval(15)
         var refined: [Candidate] = []
-        var tried = 0
+        var sources: [String: VideoEntry] = [:]
+        var unavailable = 0
         for (n, candidate) in shortlist.enumerated() {
-            if Date() > deadline { break }
-            progress?("Checking videos closely \(n + 1)/\(shortlist.count)")
+            guard current() else { unavailable += shortlist.count - n; break }
+            progress?("Analyzing video matches · \(n + 1)/\(shortlist.count)")
             let entry = entries[candidate.index]
-            guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [entry.localIdentifier], options: nil).firstObject,
-                  let video = Self.loadVideo(asset) else { continue }
-            let times = PictureHash.refinementTimes(duration: asset.duration, frames: entry.frames.count,
-                                                    anchors: candidate.anchors)
-            tried += 1
+            let candidateDeadline = min(deadline, .now() + .seconds(3))
+            guard let asset = Self.currentAsset(entry.localIdentifier, modified: entry.modified),
+                  let video = Self.loadVideo(asset, deadline: min(deadline, .now() + .seconds(2)), current: current)
+            else { unavailable += 1; continue }
+            let times = PictureHash.refinementTimes(duration: asset.duration,
+                                                    anchors: candidate.anchors.map { entry.frames[$0].seconds })
             guard let found = Self.bestFrame(in: video, times: times, placement: placement, query: detailQuery,
-                                             side: detailSide, deadline: deadline) else { continue }
+                                             side: detailSide, deadline: candidateDeadline, current: current)
+            else { unavailable += 1; continue }
             refined.append(Candidate(id: entry.localIdentifier, score: found.score, pattern: found.pattern))
+            sources[entry.localIdentifier] = entry
         }
         refined.sort { $0.score > $1.score }
         let minimum = detail != nil ? PictureHash.detailMin : PictureHash.gradientMin
+        if unavailable > 0 {
+            // Missing evidence cannot break a tie in favor of the remaining videos.
+            let choices = refined.lazy.filter { $0.score >= minimum }.compactMap { candidate -> String? in
+                guard let entry = sources[candidate.id] else { return nil }
+                return Self.currentAsset(candidate.id, modified: entry.modified)?.localIdentifier
+            }.prefix(2)
+            return VideoMatch(note: note + " refinement unavailable \(unavailable)/\(shortlist.count)",
+                              choices: Array(choices), unavailable: true)
+        }
         let verdict = Self.decide(refined, min: minimum)
-        note += " refined " + verdict.note + " tried \(tried)"
-        if let id = verdict.id {
-            return (PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject, note)
+        note += " refined " + verdict.note + " tried \(refined.count)"
+        if let id = verdict.id, let entry = sources[id] {
+            let asset = Self.currentAsset(id, modified: entry.modified)
+            return VideoMatch(asset: asset, note: note, unavailable: asset == nil)
         }
-        return (nil, note)
+        let choices = verdict.choices.compactMap { id -> String? in
+            guard let entry = sources[id] else { return nil }
+            return Self.currentAsset(id, modified: entry.modified)?.localIdentifier
+        }
+        return VideoMatch(note: note, choices: choices, unavailable: choices.count < verdict.choices.count)
     }
 
-    private static func loadVideo(_ asset: PHAsset) -> AVAsset? {
-        let options = PHVideoRequestOptions()
-        options.isNetworkAccessAllowed = false // never download unrelated candidates
-        options.deliveryMode = .automatic
-        options.version = .current
-        let done = DispatchSemaphore(value: 0)
-        var loaded: AVAsset?
-        PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { result, _, _ in
-            loaded = result
-            done.signal()
-        }
-        _ = done.wait(timeout: .now() + 10)
-        return loaded
-    }
+    private final class CallbackResults<Value>: @unchecked Sendable {
+        private let lock = NSLock()
+        private let signal = DispatchSemaphore(value: 0)
+        private var remaining: Int
+        private var accepting = true
+        private var values: [Value] = []
 
-    /// The frame among these times that best matches the picture on screen.
-    private static func bestFrame(in video: AVAsset, times: [Double], placement: PictureHash.Placement,
-                                  query: PictureHash.Pattern, side: Int,
-                                  deadline: Date) -> (score: Double, pattern: PictureHash.Pattern)? {
-        guard !times.isEmpty else { return nil }
-        let generator = AVAssetImageGenerator(asset: video)
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: 256, height: 256)
-        let tolerance = CMTime(value: 1, timescale: 60)
-        generator.requestedTimeToleranceBefore = tolerance
-        generator.requestedTimeToleranceAfter = tolerance
-        let lock = NSLock()
-        var best: (score: Double, pattern: PictureHash.Pattern)?
-        var remaining = times.count
-        let done = DispatchSemaphore(value: 0)
-        let values = times.map { NSValue(time: CMTime(seconds: $0, preferredTimescale: 600)) }
-        generator.generateCGImagesAsynchronously(forTimes: values) { _, image, _, result, _ in
-            if result == .succeeded, let image, let sampled = Self.sample(UIImage(cgImage: image)) {
-                let cells = PictureHash.cells(luma: sampled.luma, width: sampled.width, height: sampled.height,
-                                              placement: placement, side: side)
-                let pattern = PictureHash.pattern(cells, side: side)
-                let score = PictureHash.similarity(query, pattern)
-                lock.lock()
-                if best == nil || score > best!.score { best = (score: score, pattern: pattern) }
-                lock.unlock()
+        init(count: Int) { remaining = count }
+
+        func complete(_ value: Value?) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard accepting, remaining > 0 else { return }
+            if let value { values.append(value) }
+            remaining -= 1
+            if remaining == 0 { signal.signal() }
+        }
+
+        func wait(deadline: DispatchTime, current: () -> Bool) -> [Value]? {
+            while current(), DispatchTime.now() < deadline {
+                if signal.wait(timeout: min(deadline, .now() + .milliseconds(125))) == .success {
+                    break
+                }
             }
             lock.lock()
-            remaining -= 1
-            let finished = remaining == 0
-            lock.unlock()
-            if finished { done.signal() }
+            defer { lock.unlock() }
+            accepting = false
+            return remaining == 0 && current() ? values : nil
         }
-        let wait = max(1.0, deadline.timeIntervalSinceNow)
-        if done.wait(timeout: .now() + wait) == .timedOut {
+    }
+
+    private static func loadVideo(_ asset: PHAsset, deadline: DispatchTime,
+                                  current: () -> Bool) -> AVAsset? {
+        guard current(), DispatchTime.now() < deadline else { return nil }
+        let options = PHVideoRequestOptions()
+        options.isNetworkAccessAllowed = false
+        options.deliveryMode = .automatic
+        options.version = .current
+        let results = CallbackResults<AVAsset>(count: 1)
+        let manager = PHImageManager.default()
+        let request = manager.requestAVAsset(forVideo: asset, options: options) { video, _, _ in
+            results.complete(video)
+        }
+        guard let completed = results.wait(deadline: deadline, current: current) else {
+            manager.cancelImageRequest(request)
+            return nil
+        }
+        return completed.first
+    }
+
+    private static func videoFrames(in video: AVAsset, times: [Double], maxSide: CGFloat,
+                                    tolerance: CMTime, deadline: DispatchTime,
+                                    current: @escaping () -> Bool) -> [(seconds: Double, sampled: SampledPhoto)]? {
+        guard !times.isEmpty, current(), DispatchTime.now() < deadline else { return nil }
+        let generator = AVAssetImageGenerator(asset: video)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: maxSide, height: maxSide)
+        generator.requestedTimeToleranceBefore = tolerance
+        generator.requestedTimeToleranceAfter = tolerance
+        let results = CallbackResults<(seconds: Double, sampled: SampledPhoto)>(count: times.count)
+        let values = times.map { NSValue(time: CMTime(seconds: $0, preferredTimescale: 600)) }
+        generator.generateCGImagesAsynchronously(forTimes: values) { requested, image, actual, result, _ in
+            if current(), DispatchTime.now() < deadline, result == .succeeded, let image,
+               let sampled = Self.sample(UIImage(cgImage: image), maxSide: maxSide) {
+                let actualSeconds = CMTimeGetSeconds(actual)
+                let seconds = actualSeconds.isFinite && actualSeconds >= 0 ? actualSeconds : CMTimeGetSeconds(requested)
+                results.complete((seconds, sampled))
+            } else {
+                results.complete(nil)
+            }
+        }
+        guard let frames = results.wait(deadline: deadline, current: current) else {
             generator.cancelAllCGImageGeneration()
-            _ = done.wait(timeout: .now() + 2)
+            return nil
         }
-        lock.lock()
-        defer { lock.unlock() }
+        return frames
+    }
+
+    private static func bestFrame(in video: AVAsset, times: [Double], placement: PictureHash.Placement,
+                                  query: PictureHash.Pattern, side: Int, deadline: DispatchTime,
+                                  current: @escaping () -> Bool) -> (score: Double, pattern: PictureHash.Pattern)? {
+        let tolerance = CMTime(value: 1, timescale: 60)
+        guard let frames = videoFrames(in: video, times: times, maxSide: 256, tolerance: tolerance,
+                                      deadline: deadline, current: current) else { return nil }
+        var best: (score: Double, pattern: PictureHash.Pattern)?
+        for (_, sampled) in frames {
+            guard current() else { return nil }
+            let cells = PictureHash.cells(luma: sampled.luma, width: sampled.width, height: sampled.height,
+                                          placement: placement, side: side)
+            let pattern = PictureHash.pattern(cells, side: side)
+            let score = PictureHash.similarity(query, pattern)
+            if score > (best?.score ?? -2) { best = (score, pattern) }
+        }
         return best
     }
 
     /// A sharper copy than the index keeps, for comparing a few close candidates.
-    private static func render(_ asset: PHAsset, longSide: CGFloat) -> SampledPhoto? {
+    private static func render(_ asset: PHAsset, longSide: CGFloat,
+                               manager: PHImageManager = .default(), timeout: Int = 2,
+                               current: () -> Bool) -> SampledPhoto? {
+        guard current() else { return nil }
+        let result = CallbackResults<UIImage>(count: 1)
         let options = PHImageRequestOptions()
-        options.isSynchronous = true
         options.deliveryMode = .highQualityFormat
         options.resizeMode = .exact
         options.isNetworkAccessAllowed = false
+        options.isSynchronous = false
         options.version = .current
-        var image: UIImage?
-        PHImageManager.default().requestImage(for: asset, targetSize: CGSize(width: longSide, height: longSide),
-                                              contentMode: .aspectFit, options: options) { result, _ in
-            image = result
+        let request = manager.requestImage(for: asset, targetSize: CGSize(width: longSide, height: longSide),
+                                           contentMode: .aspectFit, options: options) { image, info in
+            guard (info?[PHImageResultIsDegradedKey] as? Bool) != true else { return }
+            result.complete(image)
         }
-        guard let image else { return nil }
-        return sample(image)
+        guard let completed = result.wait(deadline: .now() + .seconds(timeout), current: current) else {
+            manager.cancelImageRequest(request)
+            return nil
+        }
+        guard let image = completed.first else { return nil }
+        return sample(image, maxSide: longSide)
     }
 
-    private func fetch(_ photo: IndexedPhoto) -> PHAsset? {
-        PHAsset.fetchAssets(withLocalIdentifiers: [photo.localIdentifier], options: nil).firstObject
+    private final class ThumbnailResults: @unchecked Sendable {
+        private let lock = NSLock()
+        private var entries: [(offset: Int, photo: IndexedPhoto)] = []
+        private var pixelBytes = 0
+        private var sampledNew = 0
+
+        var full: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return pixelBytes >= PhotoIndex.photoPixelBudget - 4096 || entries.count >= PhotoIndex.maxPhotoEntries
+        }
+
+        func insert(_ photo: IndexedPhoto, at offset: Int, sampled: Bool) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard entries.count < PhotoIndex.maxPhotoEntries,
+                  photo.luma.count <= PhotoIndex.photoPixelBudget - pixelBytes else { return }
+            entries.append((offset, photo))
+            pixelBytes += photo.luma.count
+            if sampled { sampledNew += 1 }
+        }
+
+        func finish() -> (entries: [IndexedPhoto], sampled: Int) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (entries.sorted { $0.offset < $1.offset }.map(\.photo), sampledNew)
+        }
     }
 
-    private func index() {
-        // Videos are indexed by their preview frame, so a video matches near its start.
+    private func index(generation: Int, diskCache: Bool) {
         lock.lock()
-        var previous = Dictionary(photos.map { ($0.localIdentifier, $0) }, uniquingKeysWith: { _, new in new })
-        videoGeneration += 1 // stop an older video scan before starting another
-        lock.unlock()
-        if previous.isEmpty {
-            previous = Self.loadPhotoCache()
+        guard isCurrentLocked(generation) else {
+            lock.unlock()
+            DispatchQueue.main.async { self.finishIndex() }
+            return
         }
+        var previous = Dictionary(photos.map { ($0.localIdentifier, $0) }, uniquingKeysWith: { _, new in new })
+        videoGeneration += 1
+        let movieGeneration = videoGeneration
+        lock.unlock()
+        if diskCache, previous.isEmpty { previous = Self.loadPhotoCache() }
+
         let fetch = PHFetchOptions()
         fetch.predicate = NSPredicate(format: "mediaType == %d || mediaType == %d",
                                       PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue)
+        fetch.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
         let assets = PHAsset.fetchAssets(with: fetch)
         let total = assets.count
-        let checking = !previous.isEmpty
-        if total == 0 {
-            if checking { Self.savePhotoCache([]) }
-            DispatchQueue.main.async {
-                self.lock.lock()
-                self.photos = []
-                self.photosGeneration += 1
-                self.lock.unlock()
-                self.ready = true
-                self.status = "No photos in the library"
-                self.finishIndex()
-            }
-            return
-        }
-        if checking {
-            let kept = Array(previous.values)
-            DispatchQueue.main.async {
-                self.lock.lock()
-                guard self.photos.isEmpty else {
-                    self.lock.unlock()
-                    return
-                }
-                self.photos = kept
-                self.photosGeneration += 1
-                self.lock.unlock()
-                self.ready = true
-                self.status = "Ready, \(kept.count) photos"
-            }
-        }
-        let manager = PHCachingImageManager()
-        DispatchQueue.main.async { self.manager = manager }
+        let results = ThumbnailResults()
+        let inFlight = DispatchSemaphore(value: 16)
         let group = DispatchGroup()
-        // A bounded number of thumbnails in flight, instead of every one at once.
-        let inFlight = DispatchSemaphore(value: 32)
-        let collect = NSLock()
-        var found: [IndexedPhoto] = []
-        var done = 0
-        var sampledNew = 0
-        for n in 0..<total {
+        let manager = PHCachingImageManager()
+        let current = { self.isCurrent(generation) }
+        for n in 0..<min(total, Self.maxPhotoEntries) {
+            guard current(), !results.full else { break }
+
             let asset = assets.object(at: n)
             guard asset.pixelWidth >= 2, asset.pixelHeight >= 2 else { continue }
+            let id = asset.localIdentifier
             let modified = asset.modificationDate?.timeIntervalSince1970 ?? 0
-            if let old = previous[asset.localIdentifier], old.modified == modified {
-                collect.lock()
-                found.append(old)
-                collect.unlock()
+            if let old = previous[id], old.modified == modified {
+                results.insert(old, at: n, sampled: false)
                 continue
             }
             inFlight.wait()
+            guard current() else { inFlight.signal(); break }
             group.enter()
-            let options = PHImageRequestOptions()
-            options.deliveryMode = .highQualityFormat
-            options.resizeMode = .exact
-            options.isNetworkAccessAllowed = false
-            options.isSynchronous = false
-            options.version = .current
-            // Fit, never fill: a box shaped from pixelWidth and pixelHeight can be the
-            // other way up from the photo, and filling it cut away part of the picture.
-            let longSide: CGFloat = 64
-            let size = CGSize(width: longSide, height: longSide)
-            let once = NSLock()
-            var finished = false
-            manager.requestImage(for: asset, targetSize: size, contentMode: .aspectFit, options: options) { image, info in
-                let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
-                if degraded { return }
-                once.lock()
-                if finished {
-                    once.unlock()
-                    return
-                }
-                finished = true
-                once.unlock()
-                let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
-                self.sampleQueue.async {
-                    defer {
-                        inFlight.signal()
-                        group.leave()
-                    }
-                    guard !cancelled, let image else { return }
-                    guard let sampled = Self.sample(image) else { return }
-                    collect.lock()
-                    found.append(IndexedPhoto(luma: sampled.luma, gridW: sampled.width, gridH: sampled.height,
-                                              localIdentifier: asset.localIdentifier, modified: modified))
-                    done += 1
-                    sampledNew += 1
-                    let count = done
-                    collect.unlock()
-                    if count % 200 == 0 {
-                        DispatchQueue.main.async {
-                            self.status = checking ? "Indexing new photos \(count)" : "Indexing photos \(count)"
-                        }
-                    }
-                }
+            sampleQueue.async {
+                defer { inFlight.signal(); group.leave() }
+                guard let thumbnail = Self.render(asset, longSide: 64, manager: manager, timeout: 5, current: current),
+                      current() else { return }
+                results.insert(IndexedPhoto(luma: thumbnail.luma, gridW: thumbnail.width, gridH: thumbnail.height,
+                                            localIdentifier: id, modified: modified), at: n, sampled: true)
             }
         }
-        group.notify(queue: self.indexQueue) {
-            collect.lock()
-            let finished = found
-            let sampled = sampledNew
-            collect.unlock()
-            let oldIds = Set(previous.keys)
-            let newIds = Set(finished.map { $0.localIdentifier })
-            if sampled > 0 || oldIds != newIds {
-                Self.savePhotoCache(finished)
+        let oldIDs = Set(previous.keys)
+        group.notify(queue: indexQueue) {
+            let (finished, sampledNew) = results.finish()
+            if diskCache, self.isCurrent(generation),
+               sampledNew > 0 || Set(finished.map(\.localIdentifier)) != oldIDs {
+                self.savePhotoCache(finished, generation: generation)
             }
             DispatchQueue.main.async {
-                self.manager = nil
                 self.lock.lock()
-                self.photos = finished
-                self.photosGeneration += 1
+                let accepted = self.isCurrentLocked(generation)
+                if accepted {
+                    self.photos = finished
+                    self.photosGeneration += 1
+                    self.fitKey = ""
+                    self.fitCells.removeAll()
+                }
                 self.lock.unlock()
-                self.ready = true
-                self.status = "Ready, \(finished.count) photos"
-                self.indexVideos(photoCount: finished.count)
+                if accepted {
+                    self.ready = true
+                    self.status = total == 0 ? "No accessible media in the photo library"
+                        : "Photo library ready · \(finished.count) of \(total) items indexed"
+                    self.indexVideos(photoCount: finished.count, generation: generation,
+                                     movieGeneration: movieGeneration, diskCache: diskCache)
+                }
                 self.finishIndex()
             }
         }
@@ -778,240 +963,296 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         indexing = false
         if refreshPending {
             refreshPending = false
-            requestAccessAndIndex(refresh: true)
+            let access = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+            noteAccess(access)
+            if canAccessLibrary { requestAccessAndIndex(refresh: true) }
         }
     }
 
-    /// Reads frames from each video in the background, newest first. A video already in
-    /// the cache file with the same modification date is not read again.
-    private func indexVideos(photoCount: Int) {
-        let fetch = PHFetchOptions()
-        fetch.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue)
-        fetch.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        let assets = PHAsset.fetchAssets(with: fetch)
-        let total = assets.count
-        if total == 0 { return }
-        lock.lock()
-        videoTotal = total
-        videoSkipped = 0
-        let generation = videoGeneration
-        lock.unlock()
+    private func indexVideos(photoCount: Int, generation: Int, movieGeneration: Int, diskCache: Bool) {
+        let current = {
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            return self.isCurrentLocked(generation) && self.videoGeneration == movieGeneration
+        }
         videoQueue.async {
-            var cache = Self.loadVideoCache()
-            var visited = Set<String>()
+            guard current() else { return }
+            let fetch = PHFetchOptions()
+            fetch.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue)
+            fetch.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+            let assets = PHAsset.fetchAssets(with: fetch)
+            let total = assets.count
+            self.lock.lock()
+            var cache = Dictionary(self.videos.map { ($0.localIdentifier, $0) }, uniquingKeysWith: { _, new in new })
+            self.lock.unlock()
+            if diskCache, cache.isEmpty { cache = Self.loadVideoCache() }
+            let decodeUntil = DispatchTime.now() + .seconds(90)
             var built: [VideoEntry] = []
-            var unsaved = 0
-            for n in 0..<total {
+            var skipped = 0
+            var pixels = 0
+            var lastProgress = 0
+            var sampledNew = false
+
+            func publish() -> Bool {
                 self.lock.lock()
-                let current = self.videoGeneration == generation
-                self.lock.unlock()
-                if !current { return }
-                let asset = assets.object(at: n)
-                let id = asset.localIdentifier
-                let modified = asset.modificationDate?.timeIntervalSince1970 ?? 0
-                visited.insert(id)
-                if let old = cache[id], old.modified == modified {
-                    built.append(old)
-                } else if let entry = autoreleasepool(invoking: { Self.sampleVideo(asset, modified: modified) }) {
-                    cache[id] = entry
-                    built.append(entry)
-                    unsaved += 1
-                } else {
-                    self.lock.lock()
-                    self.videoSkipped += 1
-                    self.lock.unlock()
-                }
-                if (n + 1) % 10 == 0 || n + 1 == total {
-                    self.lock.lock()
+                let accepted = self.isCurrentLocked(generation) && self.videoGeneration == movieGeneration
+                if accepted {
                     self.videos = built
-                    self.lock.unlock()
-                    let done = n + 1
-                    DispatchQueue.main.async {
-                        self.status = "Ready, \(photoCount) photos, videos \(done)/\(total)"
-                    }
+                    self.videoTotal = total
+                    self.videoSkipped = skipped
                 }
-                if unsaved >= 20 {
-                    Self.saveVideoCache(Array(cache.values))
-                    unsaved = 0
+                self.lock.unlock()
+                let count = built.count
+                DispatchQueue.main.async {
+                    guard accepted, current() else { return }
+                    self.status = "Library ready · \(Self.itemCount(photoCount)) · \(count) of \(total) videos analyzed"
+                }
+                return accepted
+            }
+
+            for n in 0..<min(total, Self.maxVideoEntries) {
+                guard current(), pixels < Self.videoPixelBudget else { break }
+                let asset = assets.object(at: n)
+                let modified = asset.modificationDate?.timeIntervalSince1970 ?? 0
+                let entry: VideoEntry?
+                if let old = cache[asset.localIdentifier], old.modified == modified {
+                    entry = old
+                } else if DispatchTime.now() < decodeUntil {
+                    entry = autoreleasepool { Self.sampleVideo(asset, modified: modified, current: current) }
+                } else {
+                    continue
+                }
+                if let entry {
+                    let bytes = entry.frames.count * PictureHash.videoSide * PictureHash.videoSide
+                    guard bytes <= Self.videoPixelBudget - pixels else { break }
+                    built.append(entry)
+                    pixels += bytes
+                    if cache[asset.localIdentifier]?.modified != modified { sampledNew = true }
+                } else {
+                    skipped += 1
+                }
+                if built.count - lastProgress >= 64 {
+                    lastProgress = built.count
+                    guard publish() else { return }
                 }
             }
-            cache = cache.filter { visited.contains($0.key) }
-            Self.saveVideoCache(Array(cache.values))
-            let count = built.count
-            DispatchQueue.main.async {
-                self.status = "Ready, \(photoCount) photos, \(count) videos"
+            guard publish() else { return }
+            if diskCache, sampledNew || Set(built.map(\.localIdentifier)) != Set(cache.keys) {
+                self.saveVideoCache(built, generation: generation, movieGeneration: movieGeneration)
             }
         }
     }
 
-    /// Frames spread over the video, read near key frames so each one is quick.
-    /// A video stored only in iCloud is skipped; its preview frame is still a photo entry.
-    private static func sampleVideo(_ asset: PHAsset, modified: Double) -> VideoEntry? {
-        let options = PHVideoRequestOptions()
-        options.isNetworkAccessAllowed = false
-        options.deliveryMode = .automatic
-        options.version = .current
-        let done = DispatchSemaphore(value: 0)
-        var loaded: AVAsset?
-        PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { result, _, _ in
-            loaded = result
-            done.signal()
-        }
-        done.wait()
-        guard let video = loaded else { return nil }
-        let duration = max(0.1, asset.duration)
+    private static func sampleVideo(_ asset: PHAsset, modified: Double,
+                                    current: @escaping () -> Bool) -> VideoEntry? {
+        let deadline = DispatchTime.now() + .seconds(6)
+        guard let video = loadVideo(asset, deadline: min(deadline, .now() + .seconds(2)), current: current) else { return nil }
+        let duration = asset.duration
+        guard duration.isFinite, duration > 0, duration < Double(Int.max / 1200) else { return nil }
         let step = max(1.0, duration / Double(PictureHash.videoFramesMax))
-        let generator = AVAssetImageGenerator(asset: video)
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: 64, height: 64)
+        let times = (0..<PictureHash.videoFramesMax).map { Double($0) * step }.filter { $0 < duration }
         let tolerance = CMTime(seconds: min(step / 2, 1.0), preferredTimescale: 600)
-        generator.requestedTimeToleranceBefore = tolerance
-        generator.requestedTimeToleranceAfter = tolerance
-        var frames: [[UInt8]] = []
-        var aspect = 0.0
-        var time = 0.0
-        while time < duration && frames.count < PictureHash.videoFramesMax {
-            let at = CMTime(seconds: time, preferredTimescale: 600)
-            if let image = try? generator.copyCGImage(at: at, actualTime: nil),
-               let sampled = sample(UIImage(cgImage: image)) {
-                aspect = Double(sampled.width) / Double(sampled.height)
-                let whole = PictureHash.Crop(x: 0, y: 0, w: sampled.width, h: sampled.height)
-                let cells = PictureHash.thumb(luma: sampled.luma, width: sampled.width, crop: whole,
-                                              side: PictureHash.videoSide)
-                frames.append(cells.map { UInt8(min(255, max(0, $0.rounded()))) })
-            }
-            time += step
-        }
-        if frames.isEmpty { return nil }
+        guard let sampledFrames = videoFrames(in: video, times: times, maxSide: 64, tolerance: tolerance,
+                                              deadline: deadline, current: current), let first = sampledFrames.first else { return nil }
+        var seen = Set<Double>()
+        let frames: [VideoEntry.Frame] = sampledFrames.compactMap { seconds, photo in
+            guard seconds >= 0, seconds < duration, seen.insert(seconds).inserted else { return nil }
+            let whole = PictureHash.Crop(x: 0, y: 0, w: photo.width, h: photo.height)
+            let cells = PictureHash.thumb(luma: photo.luma, width: photo.width, crop: whole, side: PictureHash.videoSide)
+            return VideoEntry.Frame(seconds: seconds, pixels: cells.map { UInt8(min(255, max(0, $0.rounded()))) })
+        }.sorted { $0.seconds < $1.seconds }
+        guard !frames.isEmpty else { return nil }
+        let aspect = Double(first.sampled.width) / Double(first.sampled.height)
         return VideoEntry(localIdentifier: asset.localIdentifier, modified: modified, aspect: aspect, frames: frames)
     }
 
-    private static var photoCacheURL: URL? {
-        try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
-                                     appropriateFor: nil, create: true)
-            .appendingPathComponent("photo-index-v1.bin")
+    private static func cacheURL(_ name: String) -> URL? {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?.appendingPathComponent(name)
     }
 
-    private static func photoCacheExists() -> Bool {
-        guard let url = photoCacheURL else { return false }
-        return FileManager.default.fileExists(atPath: url.path)
+    private static func removeLegacyCaches() {
+        let files = FileManager.default
+        if let directory = files.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            for name in ["photo-index-v1.bin", "video-frames-v1.bin"] {
+                try? files.removeItem(at: directory.appendingPathComponent(name))
+            }
+        }
+        if let directory = files.urls(for: .cachesDirectory, in: .userDomainMask).first,
+           let entries = try? files.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) {
+            for item in entries where item.lastPathComponent.hasPrefix(".porthole-index-") {
+                try? files.removeItem(at: item)
+            }
+        }
     }
 
-    private static func savePhotoCache(_ photos: [IndexedPhoto]) {
-        guard let url = photoCacheURL else { return }
-        var body = Data()
-        func put<T>(_ value: T) {
-            withUnsafeBytes(of: value) { body.append(contentsOf: $0) }
+    private struct CacheReader {
+        let data: Data
+        var offset = 4
+
+        init?(url: URL?, magic: String, maximumBytes: Int) {
+            guard let url, let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize,
+                  (8...maximumBytes).contains(size), let bytes = try? Data(contentsOf: url, options: .mappedIfSafe),
+                  bytes.count == size, bytes.prefix(4).elementsEqual(magic.utf8) else { return nil }
+            data = bytes
         }
-        var count: UInt32 = 0
-        for photo in photos {
-            let id = Array(photo.localIdentifier.utf8)
-            let width = photo.gridW
-            let height = photo.gridH
-            guard id.count <= Int(UInt16.max), width > 0, height > 0, width <= 256, height <= 256,
-                  photo.luma.count == width * height else { continue }
-            put(UInt16(id.count))
-            body.append(contentsOf: id)
-            put(photo.modified)
-            put(UInt16(width))
-            put(UInt16(height))
-            body.append(contentsOf: photo.luma)
-            count += 1
+
+        mutating func take(_ count: Int) -> [UInt8]? {
+            guard count >= 0, count <= data.count - offset else { return nil }
+            defer { offset += count }
+            return Array(data[offset..<(offset + count)])
         }
-        var data = Data("PHI1".utf8)
-        withUnsafeBytes(of: count) { data.append(contentsOf: $0) }
-        data.append(body)
-        try? data.write(to: url, options: .atomic)
+
+        mutating func number<T>(_: T.Type) -> T? {
+            let size = MemoryLayout<T>.size
+            guard size <= data.count - offset else { return nil }
+            defer { offset += size }
+            return data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: T.self) }
+        }
+    }
+
+    private struct CacheWriter {
+        let handle: FileHandle
+        var buffer = Data()
+
+        mutating func number<T>(_ value: T) {
+            withUnsafeBytes(of: value) { buffer.append(contentsOf: $0) }
+        }
+
+        mutating func append(_ bytes: [UInt8]) throws {
+            buffer.append(contentsOf: bytes)
+            if buffer.count >= 64 * 1024 { try flush() }
+        }
+
+        mutating func flush() throws {
+            if !buffer.isEmpty { try handle.write(contentsOf: buffer) }
+            buffer.removeAll(keepingCapacity: true)
+        }
+    }
+
+    private func writeCache(_ name: String, generation: Int, movieGeneration: Int? = nil,
+                            build: (inout CacheWriter) throws -> Void) {
+        guard isCurrent(generation), let url = Self.cacheURL(name) else { return }
+        let files = FileManager.default
+        let directory = url.deletingLastPathComponent()
+        let temp = directory.appendingPathComponent(".porthole-index-\(UUID()).tmp")
+        defer { try? files.removeItem(at: temp) }
+        do {
+            try files.createDirectory(at: directory, withIntermediateDirectories: true)
+            guard files.createFile(atPath: temp.path, contents: nil,
+                                   attributes: [.protectionKey: FileProtectionType.complete]) else { return }
+            let handle = try FileHandle(forWritingTo: temp)
+            do {
+                var writer = CacheWriter(handle: handle)
+                try build(&writer)
+                try writer.flush()
+                try handle.close()
+            } catch {
+                try? handle.close()
+                return
+            }
+            lock.lock()
+            defer { lock.unlock() }
+            guard isCurrentLocked(generation), libraryAccess == .authorized,
+                  movieGeneration.map({ $0 == videoGeneration }) ?? true else { return }
+            if files.fileExists(atPath: url.path) {
+                _ = try files.replaceItemAt(url, withItemAt: temp)
+            } else {
+                try files.moveItem(at: temp, to: url)
+            }
+        } catch {
+            // A cache write is optional. Never replace the last valid index
+            // with a partially generated file.
+        }
+    }
+
+    private func savePhotoCache(_ entries: [IndexedPhoto], generation: Int) {
+        let valid = entries.filter { $0.localIdentifier.utf8.count <= 1024 }
+        writeCache("photo-index-v2.bin", generation: generation) { writer in
+            try writer.append(Array("PHI2".utf8))
+            writer.number(UInt32(valid.count))
+            for (index, photo) in valid.enumerated() {
+                if index.isMultiple(of: 128), !isCurrent(generation) { throw CancellationError() }
+                let id = Array(photo.localIdentifier.utf8)
+                writer.number(UInt16(id.count))
+                try writer.append(id)
+                writer.number(photo.modified)
+                writer.number(UInt16(photo.gridW))
+                writer.number(UInt16(photo.gridH))
+                try writer.append(photo.luma)
+            }
+        }
     }
 
     private static func loadPhotoCache() -> [String: IndexedPhoto] {
-        guard let url = photoCacheURL, let data = try? Data(contentsOf: url), data.count >= 8,
-              Data(data.prefix(4)) == Data("PHI1".utf8) else { return [:] }
-        let bytes = [UInt8](data)
-        var at = 4
-        func take(_ count: Int) -> [UInt8]? {
-            guard count >= 0, at + count <= bytes.count else { return nil }
-            defer { at += count }
-            return Array(bytes[at..<(at + count)])
-        }
-        func number<T>(_: T.Type) -> T? {
-            guard let raw = take(MemoryLayout<T>.size) else { return nil }
-            return raw.withUnsafeBytes { $0.load(as: T.self) }
-        }
-        var out: [String: IndexedPhoto] = [:]
-        guard let count = number(UInt32.self) else { return [:] }
+        guard var reader = CacheReader(url: cacheURL("photo-index-v2.bin"), magic: "PHI2",
+                                       maximumBytes: photoPixelBudget + 96 * 1024 * 1024),
+              let count = reader.number(UInt32.self), count <= maxPhotoEntries else { return [:] }
+        var result: [String: IndexedPhoto] = [:]
+        var pixels = 0
         for _ in 0..<count {
-            guard let idLength = number(UInt16.self), let idBytes = take(Int(idLength)),
-                  let id = String(bytes: idBytes, encoding: .utf8),
-                  let modified = number(Double.self),
-                  let gridW = number(UInt16.self), let gridH = number(UInt16.self) else { return [:] }
-            let width = Int(gridW)
-            let height = Int(gridH)
-            guard width > 0, height > 0, width <= 256, height <= 256,
-                  let luma = take(width * height) else { return [:] }
-            out[id] = IndexedPhoto(luma: luma, gridW: width, gridH: height,
-                                   localIdentifier: id, modified: modified)
+            guard let idLength = reader.number(UInt16.self), (1...1024).contains(idLength),
+                  let idBytes = reader.take(Int(idLength)), let id = String(bytes: idBytes, encoding: .utf8),
+                  let modified = reader.number(Double.self), modified.isFinite,
+                  let width = reader.number(UInt16.self), (2...64).contains(width),
+                  let height = reader.number(UInt16.self), (2...64).contains(height) else { return [:] }
+            let bytes = Int(width) * Int(height)
+            guard bytes <= photoPixelBudget - pixels, let luma = reader.take(bytes) else { return [:] }
+            result[id] = IndexedPhoto(luma: luma, gridW: Int(width), gridH: Int(height), localIdentifier: id, modified: modified)
+            pixels += bytes
         }
-        return out
+        return reader.offset == reader.data.count ? result : [:]
     }
 
-    private static var videoCacheURL: URL? {
-        try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
-                                     appropriateFor: nil, create: true)
-            .appendingPathComponent("video-frames-v1.bin")
-    }
-
-    private static func saveVideoCache(_ entries: [VideoEntry]) {
-        guard let url = videoCacheURL else { return }
-        var data = Data("PVF1".utf8)
-        func put<T>(_ value: T) {
-            withUnsafeBytes(of: value) { data.append(contentsOf: $0) }
-        }
-        put(UInt32(entries.count))
-        for entry in entries {
-            let id = Array(entry.localIdentifier.utf8)
-            put(UInt16(id.count))
-            data.append(contentsOf: id)
-            put(entry.modified)
-            put(entry.aspect)
-            put(UInt16(entry.frames.count))
-            for frame in entry.frames {
-                data.append(contentsOf: frame)
+    private func saveVideoCache(_ entries: [VideoEntry], generation: Int, movieGeneration: Int) {
+        let valid = entries.filter { $0.localIdentifier.utf8.count <= 1024 }
+        writeCache("video-frames-v2.bin", generation: generation, movieGeneration: movieGeneration) { writer in
+            try writer.append(Array("PVF2".utf8))
+            writer.number(UInt32(valid.count))
+            for (index, entry) in valid.enumerated() {
+                if index.isMultiple(of: 64) {
+                    lock.lock()
+                    let current = isCurrentLocked(generation) && self.videoGeneration == movieGeneration
+                    lock.unlock()
+                    guard current else { throw CancellationError() }
+                }
+                let id = Array(entry.localIdentifier.utf8)
+                writer.number(UInt16(id.count))
+                try writer.append(id)
+                writer.number(entry.modified)
+                writer.number(entry.aspect)
+                writer.number(UInt16(entry.frames.count))
+                for frame in entry.frames {
+                    writer.number(frame.seconds)
+                    try writer.append(frame.pixels)
+                }
             }
         }
-        try? data.write(to: url, options: .atomic)
     }
 
     private static func loadVideoCache() -> [String: VideoEntry] {
-        guard let url = videoCacheURL, let data = try? Data(contentsOf: url), data.count >= 8,
-              Data(data.prefix(4)) == Data("PVF1".utf8) else { return [:] }
-        let bytes = [UInt8](data)
-        var at = 4
-        func take(_ count: Int) -> [UInt8]? {
-            guard count >= 0, at + count <= bytes.count else { return nil }
-            defer { at += count }
-            return Array(bytes[at..<(at + count)])
-        }
-        func number<T>(_: T.Type) -> T? {
-            guard let raw = take(MemoryLayout<T>.size) else { return nil }
-            return raw.withUnsafeBytes { $0.load(as: T.self) }
-        }
+        guard var reader = CacheReader(url: cacheURL("video-frames-v2.bin"), magic: "PVF2",
+                                       maximumBytes: videoPixelBudget + 24 * 1024 * 1024),
+              let count = reader.number(UInt32.self), count <= maxVideoEntries else { return [:] }
         let cells = PictureHash.videoSide * PictureHash.videoSide
-        var out: [String: VideoEntry] = [:]
-        guard let count = number(UInt32.self) else { return [:] }
+        var result: [String: VideoEntry] = [:]
+        var pixels = 0
         for _ in 0..<count {
-            guard let idLength = number(UInt16.self), let idBytes = take(Int(idLength)),
-                  let id = String(bytes: idBytes, encoding: .utf8),
-                  let modified = number(Double.self), let aspect = number(Double.self),
-                  let frameCount = number(UInt16.self) else { break }
-            var frames: [[UInt8]] = []
+            guard let idLength = reader.number(UInt16.self), (1...1024).contains(idLength),
+                  let idBytes = reader.take(Int(idLength)), let id = String(bytes: idBytes, encoding: .utf8),
+                  let modified = reader.number(Double.self), modified.isFinite,
+                  let aspect = reader.number(Double.self), aspect.isFinite, aspect > 0,
+                  let frameCount = reader.number(UInt16.self), (1...PictureHash.videoFramesMax).contains(Int(frameCount)),
+                  Int(frameCount) * cells <= videoPixelBudget - pixels else { return [:] }
+            var frames: [VideoEntry.Frame] = []
             for _ in 0..<frameCount {
-                guard let frame = take(cells) else { return out }
-                frames.append(frame)
+                guard let seconds = reader.number(Double.self), seconds.isFinite, seconds >= 0,
+                      seconds >= (frames.last?.seconds ?? 0), let frame = reader.take(cells) else { return [:] }
+                frames.append(VideoEntry.Frame(seconds: seconds, pixels: frame))
             }
-            out[id] = VideoEntry(localIdentifier: id, modified: modified, aspect: aspect, frames: frames)
+            result[id] = VideoEntry(localIdentifier: id, modified: modified, aspect: aspect, frames: frames)
+            pixels += Int(frameCount) * cells
         }
-        return out
+        return reader.offset == reader.data.count ? result : [:]
     }
 
     private struct SampledPhoto {
@@ -1021,9 +1262,12 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
     }
 
     /// Upright luma, top row first, same orientation the PC hashes from the mirror.
-    private static func sample(_ image: UIImage) -> SampledPhoto? {
-        let width = max(2, Int(image.size.width.rounded()))
-        let height = max(2, Int(image.size.height.rounded()))
+    private static func sample(_ image: UIImage, maxSide: CGFloat) -> SampledPhoto? {
+        let size = image.size
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else { return nil }
+        let scale = min(1, maxSide / max(size.width, size.height))
+        let width = max(2, Int((size.width * scale).rounded()))
+        let height = max(2, Int((size.height * scale).rounded()))
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
         format.opaque = true

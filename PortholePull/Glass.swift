@@ -22,11 +22,13 @@ enum Ink {
 
 /// A capsule button: glass, or prominent ink glass for the main action on a screen.
 struct GlassCapsuleButton: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let title: String
     var systemImage: String? = nil
     var prominent = false
     var tint: Color? = nil
     var expands = true
+    var compact = false
     let action: () -> Void
 
     var body: some View {
@@ -56,7 +58,9 @@ struct GlassCapsuleButton: View {
             if let systemImage { Image(systemName: systemImage) }
             Text(title)
         }
-        .font(.headline)
+        .font(compact ? .subheadline.weight(.semibold) : .headline)
+        .multilineTextAlignment(.center)
+        .lineLimit(compact && !dynamicTypeSize.isAccessibilitySize ? 2 : nil)
         .frame(maxWidth: expands ? .infinity : nil)
         .padding(.vertical, 4)
     }
@@ -65,7 +69,8 @@ struct GlassCapsuleButton: View {
         Button(action: action) {
             label
                 .padding(.vertical, 8)
-                .padding(.horizontal, expands ? 0 : 16)
+                .padding(.horizontal, 16)
+                .frame(minHeight: 44)
                 .foregroundStyle(prominent ? (tint == nil ? Ink.onFill : Color.white) : (tint ?? Color.primary))
                 .background {
                     if prominent {

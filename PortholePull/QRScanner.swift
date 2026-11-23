@@ -2,40 +2,112 @@ import AVFoundation
 import SwiftUI
 import UIKit
 
-/// Reads a `porthole://` code from the PC window. One code ends the session.
-final class QRScannerController: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
-    var onCode: ((String) -> Void)?
-    private let session = AVCaptureSession()
+/// Capture configuration, start, stop, and metadata delivery share one serial queue.
+/// The representable owns the driver's lifetime and stops it whenever it goes away.
+private final class QRSessionDriver: NSObject, AVCaptureMetadataOutputObjectsDelegate, @unchecked Sendable {
+    let session = AVCaptureSession()
+    private let queue = DispatchQueue(label: "porthole.qr.capture", qos: .userInitiated)
+    private var configured = false
+    private var delivering = false
+    private var codeHandler: ((String) -> Void)?
+
+    func start(onCode: @escaping (String) -> Void, onFailure: @escaping () -> Void) {
+        queue.async {
+            if !self.configured {
+                guard self.configure() else {
+                    DispatchQueue.main.async { onFailure() }
+                    return
+                }
+                self.configured = true
+            }
+            self.codeHandler = onCode
+            self.delivering = false
+            if !self.session.isRunning { self.session.startRunning() }
+        }
+    }
+
+    func stop() {
+        queue.async {
+            self.codeHandler = nil
+            if self.session.isRunning { self.session.stopRunning() }
+        }
+    }
+
+    func resumeScan() {
+        queue.asyncAfter(deadline: .now() + 0.8) {
+            self.delivering = false
+        }
+    }
+
+    private func configure() -> Bool {
+        guard let camera = AVCaptureDevice.default(for: .video),
+              let input = try? AVCaptureDeviceInput(device: camera),
+              session.canAddInput(input) else { return false }
+        let output = AVCaptureMetadataOutput()
+        session.beginConfiguration()
+        defer { session.commitConfiguration() }
+        session.addInput(input)
+        guard session.canAddOutput(output) else {
+            session.removeInput(input)
+            return false
+        }
+        session.addOutput(output)
+        guard output.availableMetadataObjectTypes.contains(.qr) else {
+            session.removeOutput(output)
+            session.removeInput(input)
+            return false
+        }
+        output.setMetadataObjectsDelegate(self, queue: queue)
+        output.metadataObjectTypes = [.qr]
+        return true
+    }
+
+    func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput objects: [AVMetadataObject],
+                        from connection: AVCaptureConnection) {
+        guard !delivering, let codeHandler,
+              let code = objects.lazy.compactMap({ ($0 as? AVMetadataMachineReadableCodeObject)?.stringValue }).first
+        else { return }
+        delivering = true
+        DispatchQueue.main.async { codeHandler(code) }
+    }
+}
+
+final class QRScannerController: UIViewController {
+    var onCode: ((String) -> Bool)?
+    var onCameraError: ((String) -> Void)?
+    private let driver = QRSessionDriver()
     private let preview = AVCaptureVideoPreviewLayer()
-    private var finished = false
-    private let message = UILabel()
+    private var visibility = UUID()
+    private var visible = false
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
-        message.textColor = .white
-        message.numberOfLines = 0
-        message.textAlignment = .center
-        message.font = .preferredFont(forTextStyle: .body)
-        message.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(message)
-        NSLayoutConstraint.activate([
-            message.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
-            message.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
-            message.centerYAnchor.constraint(equalTo: view.centerYAnchor)
-        ])
+        preview.session = driver.session
+        preview.videoGravity = .resizeAspectFill
+        view.layer.addSublayer(preview)
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        visible = true
+        visibility = UUID()
+        let token = visibility
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
-            start()
+            start(token)
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { [weak self] allowed in
                 DispatchQueue.main.async {
-                    if allowed { self?.start() }
-                    else { self?.message.text = "Allow Camera in Settings › Porthole to scan the code." }
+                    guard let self, self.visible, self.visibility == token else { return }
+                    if allowed { self.start(token) }
+                    else { self.onCameraError?("Camera access is off. Enable it in Settings or enter the connection details manually.") }
                 }
             }
+        case .restricted:
+            onCameraError?("Camera access is restricted on this iPhone. Enter the connection details manually.")
         default:
-            message.text = "Allow Camera in Settings › Porthole to scan the code."
+            onCameraError?("Camera access is off. Enable it in Settings or enter the connection details manually.")
         }
     }
 
@@ -46,53 +118,44 @@ final class QRScannerController: UIViewController, AVCaptureMetadataOutputObject
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        if session.isRunning { session.stopRunning() }
+        stop()
     }
 
-    private func start() {
-        message.text = ""
-        guard let device = AVCaptureDevice.default(for: .video),
-              let input = try? AVCaptureDeviceInput(device: device),
-              session.canAddInput(input) else {
-            message.text = "This iPhone has no camera Porthole can use."
-            return
-        }
-        session.addInput(input)
-        let output = AVCaptureMetadataOutput()
-        guard session.canAddOutput(output) else { return }
-        session.addOutput(output)
-        output.setMetadataObjectsDelegate(self, queue: .main)
-        output.metadataObjectTypes = [.qr]
-        preview.session = session
-        preview.videoGravity = .resizeAspectFill
-        preview.frame = view.bounds
-        view.layer.insertSublayer(preview, at: 0)
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.session.startRunning()
-        }
+    func stop() {
+        visible = false
+        visibility = UUID()
+        driver.stop()
     }
 
-    func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput objects: [AVMetadataObject],
-                        from connection: AVCaptureConnection) {
-        guard !finished,
-              let code = objects.compactMap({ $0 as? AVMetadataMachineReadableCodeObject }).first?.stringValue
-        else { return }
-        finished = true
-        session.stopRunning()
-        onCode?(code)
+    private func start(_ token: UUID) {
+        guard visible, visibility == token else { return }
+        driver.start(onCode: { [weak self] code in
+            guard let self, self.visible, self.visibility == token else { return }
+            if self.onCode?(code) == true { self.stop() }
+            else { self.driver.resumeScan() }
+        }, onFailure: { [weak self] in
+            guard let self, self.visible, self.visibility == token else { return }
+            self.onCameraError?("A compatible camera is unavailable. Enter the connection details manually.")
+        })
     }
 }
 
 struct QRScanner: UIViewControllerRepresentable {
-    var onCode: (String) -> Void
+    let onCode: (String) -> Bool
+    let onCameraError: (String) -> Void
 
     func makeUIViewController(context: Context) -> QRScannerController {
         let controller = QRScannerController()
-        controller.onCode = onCode
+        updateUIViewController(controller, context: context)
         return controller
     }
 
     func updateUIViewController(_ controller: QRScannerController, context: Context) {
         controller.onCode = onCode
+        controller.onCameraError = onCameraError
+    }
+
+    static func dismantleUIViewController(_ controller: QRScannerController, coordinator: ()) {
+        controller.stop()
     }
 }

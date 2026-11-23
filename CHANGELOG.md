@@ -1,6 +1,18 @@
 # Changelog
 
+## In development — native design support
+
+The approved iPhone design is now backed by native save-folder selection, full clipboard-history payloads and Copy actions, and a direct Files picker with transfer confirmation, progress, cancellation and retry. File activity and notifications retain their original folder references, so older files remain openable after changing the save folder. Clearing history has a confirmation and leaves documents untouched. Failed access to a chosen save folder falls back to Porthole's local folder with a visible message.
+
+Foreground arrivals use one glass banner and an Activity unread badge, with ordinary iOS notifications in the background. Notification taps can reopen files after a cold launch or a cleared history. The connection layout fills the available height while retaining native Liquid Glass actions and scrolling for smaller layouts. Native provider/UI/device checks remain pending; the portable preference, history, and storage checks pass.
+
 ## 0.1.0
+
+Mouse and keyboard settings now include persistent enable/disable and screen-sharing-only options. The matching PC build starts Bluetooth input only for screen sharing or explicit Bluetooth setup by default, and stops it when controls are disabled or the authenticated phone disconnects. File transfers and clipboard sync remain available independently. Control preferences show as applied only after PC acknowledgement.
+
+Connection status rows open feature settings. Photo access supports permission management, selected-photo access and library refresh. Clipboard synchronization can be enabled or disabled for both directions, and the preference persists across launches. Mouse and keyboard setup reports detected devices and links to supported iOS pointer settings. App labels, permission prompts and transfer messages use consistent terminology.
+
+The Connect tab uses the original Porthole logo. The share-screen control and live timer use a thinner porthole rim and a smaller cursor, with matching light and dark artwork.
 
 The iPhone app now shares the PC app's version number. Buttons use Liquid Glass on iOS 26 and keep the frosted look on older iOS. Share › Porthole takes any file, not only photos and videos: PDFs, ZIPs, audio and documents from Files, Mail or any app. The sheet shows which PC gets them, offers Change when there are several, and ticks each file as the PC saves it. Activity lists the files and copies that moved each way today. Settings says where files land on each side. Needs the PC build from the same day.
 

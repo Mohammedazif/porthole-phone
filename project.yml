@@ -13,17 +13,26 @@ settings:
     CODE_SIGNING_REQUIRED: "NO"
     CODE_SIGN_IDENTITY: ""
     GENERATE_INFOPLIST_FILE: "NO"
+    PORTHOLE_APP_GROUP: group.local.porthole.pull
+    PORTHOLE_WIDGET_APP_GROUP: group.local.porthole.pull.widgets
+    CODE_SIGN_ENTITLEMENTS: Shared/Porthole.entitlements
 targets:
   PortholePull:
     type: application
     platform: iOS
     sources:
-      - PortholePull
+      - path: PortholePull
+        excludes: [PrivacyInfo.xcprivacy, Porthole.entitlements]
+      - path: PortholePull/PrivacyInfo.xcprivacy
+        buildPhase: resources
+      - path: Shared
+        excludes: [Porthole.entitlements]
     settings:
       base:
         PRODUCT_NAME: Porthole
         PRODUCT_BUNDLE_IDENTIFIER: local.porthole.pull
         INFOPLIST_FILE: PortholePull/Info.plist
+        CODE_SIGN_ENTITLEMENTS: PortholePull/Porthole.entitlements
         # The Porthole brand mark (branding/porthole in the PC repo), light and dark.
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     dependencies:
@@ -31,12 +40,17 @@ targets:
         embed: true
       - target: PortholeShare
         embed: true
+      - target: PortholeWidgets
+        embed: true
     scheme: {}
   PortholeBroadcast:
     type: app-extension
     platform: iOS
     sources:
       - PortholeBroadcast
+      - Shared/PortholeAppGroup.swift
+      - Shared/TrustedPeer.swift
+      - Shared/TrustedPeerTransport.swift
     settings:
       base:
         PRODUCT_NAME: PortholeBroadcast
@@ -47,10 +61,32 @@ targets:
     type: app-extension
     platform: iOS
     sources:
-      - PortholeShare
+      - path: PortholeShare
+        excludes: [PrivacyInfo.xcprivacy]
+      - path: PortholeShare/PrivacyInfo.xcprivacy
+        buildPhase: resources
+      - PortholePull/TransferStaging.swift
+      - PortholePull/TransferFileName.swift
+      - PortholePull/ShareReceiptJournal.swift
+      - path: Shared
+        excludes: [Porthole.entitlements, WidgetInbox.swift]
     settings:
       base:
         PRODUCT_NAME: PortholeShare
         PRODUCT_BUNDLE_IDENTIFIER: local.porthole.pull.share
         INFOPLIST_FILE: PortholeShare/Info.plist
+        APPLICATION_EXTENSION_API_ONLY: "YES"
+  PortholeWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: PortholeWidgets
+        excludes: [PortholeWidgets.entitlements]
+      - Shared/WidgetInbox.swift
+    settings:
+      base:
+        PRODUCT_NAME: PortholeWidgets
+        PRODUCT_BUNDLE_IDENTIFIER: local.porthole.pull.widgets
+        INFOPLIST_FILE: PortholeWidgets/Info.plist
+        CODE_SIGN_ENTITLEMENTS: PortholeWidgets/PortholeWidgets.entitlements
         APPLICATION_EXTENSION_API_ONLY: "YES"
