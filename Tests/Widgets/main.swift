@@ -10,7 +10,6 @@ func require(_ condition: Bool, _ description: String) {
 let now = Date(timeIntervalSince1970: 1_800_000_000)
 var state = WidgetInboxSnapshot()
 require(state.summary(at: now) == .open, "Missing state must open Porthole")
-require(state.hideLockScreenDetails, "Fresh installs default to hiding exposed details")
 state.pairing = .unpaired
 require(state.summary(at: now) == .pair, "New installation must offer pairing")
 state.pairing = .paired
@@ -35,14 +34,10 @@ require(state.summary(at: now) == .unread(2), "Previously received files remain 
 require(state.summary(at: now).destination == .received, "Unread files must open Received")
 require(WidgetInboxSummary.unread(1).title == "1 new file", "A single unread file uses the singular")
 
-state.hideLockScreenDetails = true
-let hidden = state.summary(at: now, exposed: true)
-require(hidden == .privateReceived, "Lock Screen and StandBy privacy must hide counts and transfer state")
+let hidden = state.summary(at: now, redacted: true)
+require(hidden == .privateReceived, "System privacy must hide counts and transfer state")
 require(hidden.destination == .received, "Hidden accessories use the neutral Received destination")
-require(state.summary(at: now) == .unread(2), "Locked privacy must leave the Home Screen count available")
-state.hideLockScreenDetails = false
-require(state.summary(at: now, exposed: true) == .unread(2), "Users can opt in to exposed counts")
-require(state.summary(at: now, exposed: true, redacted: true) == .privateReceived, "System privacy overrides the app setting")
+require(state.summary(at: now) == .unread(2), "Unredacted widgets retain the count")
 
 for destination in WidgetDestination.allCases {
     require(WidgetDestination(url: destination.url) == destination, "Every widget route must round trip")
@@ -64,7 +59,7 @@ try store.save(state)
 require(store.load() == state, "A new widget instance must read the saved snapshot")
 let snapshotData = try Data(contentsOf: root.appendingPathComponent("Widgets/Inbox.json"))
 let keys = (try JSONSerialization.jsonObject(with: snapshotData)) as? [String: Any]
-require(Set(keys?.keys.map { $0 } ?? []) == ["unreadCount", "hasReceivedFiles", "pairing", "transfer", "hideLockScreenDetails"],
+require(Set(keys?.keys.map { $0 } ?? []) == ["unreadCount", "hasReceivedFiles", "pairing", "transfer"],
         "Only the approved aggregate widget fields may be published")
 state.unreadCount = 0
 state.transfer = nil
@@ -82,9 +77,9 @@ while reloads == 0 && Date() < waitUntil {
     RunLoop.main.run(until: Date().addingTimeInterval(0.01))
 }
 require(reloads == 1, "A new app process must request a reload even if the restored snapshot is identical")
-publisher.update { $0.unreadCount = 7 }
-publisher.updatePrivacy(true)
-require(store.load()?.unreadCount == 7 && store.load()?.hideLockScreenDetails == true,
-        "Enabling privacy must commit the new snapshot after all earlier publications before returning")
+var legacy = keys ?? [:]
+legacy["hideLockScreenDetails"] = true
+let decoded = try JSONDecoder().decode(WidgetInboxSnapshot.self, from: JSONSerialization.data(withJSONObject: legacy))
+require(decoded.summary(at: now) == .unread(2), "A prior privacy preference must leave control to iOS")
 
 print("Widget tests passed: receipts, stale transfers, privacy, routes, atomic snapshots and startup reload recovery.")

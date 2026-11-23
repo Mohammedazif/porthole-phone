@@ -5,6 +5,22 @@ import Combine
 /// Uses the paired PC's pinned inbox and the per-file acknowledgements used by Share › Porthole.
 /// File bodies are streamed; history is updated only after the PC returns OK.
 final class OutboundFileSender: ObservableObject {
+    private static var privateContainer: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("PortholeTransfers", isDirectory: true)
+    }
+
+    static var storageContainers: [URL] {
+        [PortholeAppGroup.containerURL, privateContainer].compactMap { $0 }
+    }
+
+    private static func pending(for peer: TrustedPeer) -> (OutboundTransferJournal.Batch, OutboundTransferManifest)? {
+        for container in storageContainers {
+            if let pending = OutboundTransferJournal(container: container).openPending(for: peer) { return pending }
+        }
+        return nil
+    }
+
     enum Phase: Equatable { case idle, preparing, ready, sending, sent, failed, cancelled }
     struct Item: Identifiable {
         let id: UUID
@@ -31,6 +47,7 @@ final class OutboundFileSender: ObservableObject {
     private var timer: DispatchWorkItem?
     private var batch: [Int] = []
     private var destination: TrustedPeer?
+    private var verifiedPeer: TrustedPeer?
     private var protocolVersion: Int?
     private var resumable: Bool { (protocolVersion ?? 1) >= 2 }
     private var awaitingReceipt = false
@@ -45,9 +62,7 @@ final class OutboundFileSender: ObservableObject {
             do {
                 guard !urls.isEmpty else { throw SendError.message("No files selected.") }
                 guard urls.count <= TransferStaging.maxItems else { throw SendError.message("Send up to 500 files at a time.") }
-                guard let journal = OutboundTransferJournal.shared() else {
-                    throw SendError.message("Porthole could not open its shared file transfer storage.")
-                }
+                let journal = OutboundTransferJournal(container: PortholeAppGroup.containerURL ?? Self.privateContainer)
                 let batch = try journal.makeBatch(for: peer)
                 self.journalBatch = batch
                 self.destination = peer.remembered
@@ -100,7 +115,11 @@ final class OutboundFileSender: ObservableObject {
 
     func refreshPending(for peer: TrustedPeer?) {
         queue.async {
-            let count = peer.flatMap { OutboundTransferJournal.shared()?.openPending(for: $0)?.1.pendingCount } ?? 0
+            self.verifiedPeer = peer
+            if self.link != nil, self.destination?.id != peer?.id {
+                self.fail("The PC disconnected. Retry when it reconnects.")
+            }
+            let count = peer.flatMap { Self.pending(for: $0)?.1.pendingCount } ?? 0
             DispatchQueue.main.async { self.pendingCount = count }
         }
     }
@@ -108,7 +127,7 @@ final class OutboundFileSender: ObservableObject {
     func restorePending(for peer: TrustedPeer) {
         queue.async {
             self.cleanUp()
-            guard let (batch, manifest) = OutboundTransferJournal.shared()?.openPending(for: peer) else {
+            guard let (batch, manifest) = Self.pending(for: peer) else {
                 self.publish(.failed, message: "This transfer is unavailable or open in another Porthole window.")
                 return
             }
@@ -131,7 +150,7 @@ final class OutboundFileSender: ObservableObject {
                 self.fail(TransferStaging.Failure.desktopFileLimit.localizedDescription)
                 return
             }
-            guard let current = TrustedPeerStore.load(), current.samePairing(as: peer),
+            guard let current = self.verifiedPeer, current.samePairing(as: peer),
                   current.channelTicket != nil else {
                 self.fail("Reconnect to the reviewed PC and retry. Choose the files again to send them to another PC.")
                 return
@@ -171,7 +190,7 @@ final class OutboundFileSender: ObservableObject {
                         self.queue.async {
                             guard self.generation == token, self.link === connection else { return }
                             guard authorized else { self.fail("The PC did not authorize this transfer. Reconnect in Porthole and retry."); return }
-                            guard TrustedPeerStore.load()?.id == current.id else {
+                            guard self.verifiedPeer?.id == current.id else {
                                 self.fail("The paired PC changed before the transfer started."); return
                             }
                             self.write(Data("PSHR \(version) \(self.batch.count)\n".utf8), token: token) {
@@ -253,12 +272,12 @@ final class OutboundFileSender: ObservableObject {
         awaitingReceipt = false
         try? handle?.close(); handle = nil
         let index = batch[cursor], file = files[index]
-        guard let journalBatch, var manifest, let journal = ShareReceiptJournal.shared() else {
+        guard let journalBatch, var manifest else {
             fail("The PC saved this file. Porthole could not record the receipt. Retry to check it again.")
             return
         }
         do {
-            try journal.record(ShareReceipt(id: file.id, date: Date(), peerName: manifest.destination.name,
+            try journalBatch.record(ShareReceipt(id: file.id, date: Date(), peerName: manifest.destination.name,
                                             name: file.name, bytes: file.bytes,
                                             pairingID: manifest.destination.stableID))
             manifest.files[index].sent = true
@@ -308,6 +327,10 @@ final class OutboundFileSender: ObservableObject {
     private func write(_ data: Data, token: UUID, then completion: @escaping () -> Void) {
         guard generation == token, let connection = link else { return }
         guard checkRevocation() else { return }
+        guard verifiedPeer?.id == destination?.id else {
+            fail("The PC disconnected. Retry when it reconnects.")
+            return
+        }
         armTimeout(token)
         connection.send(content: data, completion: .contentProcessed { [weak self, weak connection] error in
             guard let self, self.generation == token, self.link === connection else { return }

@@ -8,7 +8,6 @@ import ReplayKit
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
-import UserNotifications
 
 private struct BroadcastPicker: UIViewRepresentable {
     func makeUIView(context: Context) -> RPSystemBroadcastPickerView {
@@ -18,6 +17,7 @@ private struct BroadcastPicker: UIViewRepresentable {
         picker.showsMicrophoneButton = false
         picker.overrideUserInterfaceStyle = .dark
         picker.tintColor = .white
+        picker.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         return picker
     }
 
@@ -31,6 +31,7 @@ struct ContentView: View {
     @StateObject private var input = InputDeviceMonitor()
     @StateObject private var fileSender = OutboundFileSender()
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.colorScheme) private var colorScheme
     @State private var activeSheet: PhoneSheet?
     @State private var lastSheet: PhoneSheet?
     @State private var offeredChoiceIDs: [String]?
@@ -46,8 +47,6 @@ struct ContentView: View {
     @State private var manualAfterScan = false
     @State private var scanError: String?
     @State private var cameraUnavailable = false
-    @State private var notificationPermission: UNAuthorizationStatus?
-    @State private var phoneAliasDraft = ""
     @State private var captured = false
     @State private var hideSharing = false
     @State private var shareStarted: Date?
@@ -84,7 +83,7 @@ struct ContentView: View {
                         findPC
                     }
                 }
-                .background(Color(.systemGroupedBackground))
+                .background(phoneBackground)
             }
             .tabItem {
                 Label {
@@ -119,10 +118,9 @@ struct ContentView: View {
         }
         .onAppear {
             client.bind(index: index)
-            client.loadLocalState()
+            client.cameForward()
             fileSender.refreshPending(for: client.fileSendPeer)
             index.refreshAuthorization()
-            refreshNotificationPermission()
             updateCapture()
             refreshBroadcast()
             openPendingNotice()
@@ -143,14 +141,12 @@ struct ContentView: View {
                 client.cameForward()
                 fileSender.refreshPending(for: client.fileSendPeer)
                 index.refreshAuthorization()
-                refreshNotificationPermission()
-                input.refresh()
+                    input.refresh()
                 updateCapture()
                 refreshBroadcast()
                 presentNextSheet()
             }
             if phase == .background { client.enteredBackground() }
-            if phase == .inactive { refreshNotificationPermission() }
         }
         .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
             if scenePhase != .background {
@@ -438,154 +434,193 @@ struct ContentView: View {
 
     private func openSendPicker() {
         guard let peer = client.fileSendPeer else { return }
-        if let issue = client.sharedPairingIssue {
-            actionError = issue
-            return
-        }
         showSheet(.sendPicker(peer))
     }
 
-    private func refreshNotificationPermission() {
-        Task { @MainActor in
-            notificationPermission = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
-        }
+    private var phoneBackground: some View {
+        LinearGradient(
+            colors: colorScheme == .dark ? [Color(white: 0.075), .black, Color(white: 0.065)]
+                : [.white, Color(uiColor: .systemGroupedBackground), Color(uiColor: .secondarySystemGroupedBackground)],
+            startPoint: .topLeading, endPoint: .bottomTrailing
+        )
+        .ignoresSafeArea()
     }
 
     private var findPC: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Find your PC")
-                            .font(.largeTitle.bold())
-                        Text("Open Porthole on your PC and connect both devices to the same Wi-Fi network.")
-                            .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 13) {
+                        ZStack(alignment: .bottomTrailing) {
+                            Image(systemName: "desktopcomputer")
+                                .font(.system(size: 28, weight: .medium))
+                                .frame(width: 72, height: 72)
+                                .background(cardFill, in: RoundedRectangle(cornerRadius: 22))
+                            Circle().fill(.green)
+                                .frame(width: 15, height: 15)
+                                .overlay { Circle().strokeBorder(cardFill, lineWidth: 3) }
+                        }
+                        .accessibilityHidden(true)
+                        .padding(.bottom, 8)
+                        Text("Find your PC").font(.largeTitle.bold())
+                        Text("Open Porthole on your PC.\nKeep both devices on the same Wi-Fi.")
+                            .font(.subheadline).foregroundStyle(.secondary)
                     }
                     .id(ConnectionJump.Target.connect)
-                    if !client.nearby.isEmpty {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Available PCs")
-                                .font(.footnote.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                            ForEach(client.nearby) { pc in
-                                Button {
-                                    prepareManualEntry(host: pc.address)
-                                } label: {
-                                    HStack {
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(pc.name).font(.headline)
-                                            Text(pc.address).font(.subheadline).foregroundStyle(.secondary)
-                                        }
-                                        Spacer()
-                                        Text("Connect").font(.subheadline.weight(.semibold))
-                                    }
-                                    .padding(16)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                    }
-                    if !client.address.isEmpty {
-                        Button { client.connect() } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(client.deviceName.isEmpty ? "Saved PC" : client.deviceName).font(.headline)
-                                    Text(client.address).font(.subheadline).foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Text("Connect").font(.subheadline.weight(.semibold))
-                            }
-                            .padding(16)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                        }
-                        .buttonStyle(.plain)
-                    }
+
+                    nearbyPCs
                     receiveStatus.id(ConnectionJump.Target.transfer)
-                    Text(client.status)
+                    VStack(spacing: 12) {
+                        GlassCapsuleButton(title: "Scan QR code", systemImage: "qrcode.viewfinder",
+                                           prominent: true) { openScanner() }
+                        GlassCapsuleButton(title: "Connect manually") { prepareManualEntry(host: client.address) }
+                    }
+                    Text(client.discoveryMessage)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
-                    GlassCapsuleButton(title: "Scan QR code", systemImage: "qrcode.viewfinder",
-                                       prominent: true) { openScanner() }
-                    GlassCapsuleButton(title: "Find nearby PCs", systemImage: "desktopcomputer", action: client.prepare)
-                    GlassCapsuleButton(title: "Connect manually") { prepareManualEntry(host: client.address) }
-                    Text("Allow Local Network access when iOS asks. You can also allow it in Porthole’s iPhone settings.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 12)
                 }
-                .padding(20)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 16)
             }
             .onChange(of: connectionJump, initial: true) { _, jump in
                 scrollConnection(proxy, jump: jump, canShare: false)
             }
         }
-        .navigationBarTitleDisplayMode(.inline)
+        .onAppear(perform: client.prepare)
+        .toolbar(.hidden, for: .navigationBar)
+    }
+
+    private var nearbyPCs: some View {
+        let saved = client.savedPC
+        let nearby = client.nearby.filter { $0.address != saved?.host }
+        return VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                Text("Available PCs").textCase(.uppercase).foregroundStyle(.secondary)
+                Spacer()
+                Label("Nearby", systemImage: "wifi").foregroundStyle(.green)
+            }
+            .font(.caption.weight(.medium))
+            .padding(.horizontal, 12)
+
+            VStack(spacing: 0) {
+                if let saved {
+                    pcRow(saved.name, detail: saved.host) { client.connect() }
+                }
+                ForEach(nearby) { pc in
+                    if saved != nil || pc.id != nearby.first?.id { Divider().padding(.leading, 52) }
+                    pcRow(pc.name, detail: pc.address) { prepareManualEntry(host: pc.address) }
+                }
+                if saved == nil && nearby.isEmpty {
+                    Label("Looking for nearby PCs…", systemImage: "wifi")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(16)
+                }
+            }
+            .background(cardFill, in: RoundedRectangle(cornerRadius: 22))
+        }
+    }
+
+    private func pcRow(_ title: String, detail: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 13) {
+                Image(systemName: "desktopcomputer").frame(width: 24)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title).font(.subheadline.weight(.semibold))
+                    Text(detail).font(.footnote).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 4)
+                Text("Connect").font(.footnote).foregroundStyle(.secondary)
+                Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .frame(minHeight: 58)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private var deviceTitle: String {
-        client.deviceName.isEmpty ? "Your PC" : client.deviceName
+        client.deviceName.isEmpty ? client.savedPC?.name ?? "Your PC" : client.deviceName
     }
 
     private var connected: some View {
         GeometryReader { geometry in
+            let compact = geometry.size.height < 650
+            let stageHeight = min(340, max(180, geometry.size.height - (compact ? 304 : 322)))
             ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        HStack(alignment: .center) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack(spacing: 6) {
-                                    Circle().fill(Color(red: 0.09, green: 0.50, blue: 0.24)).frame(width: 7, height: 7)
-                                    Text("Connected")
-                                        .font(.subheadline.weight(.medium))
-                                        .foregroundStyle(Color(red: 0.09, green: 0.50, blue: 0.24))
-                                }
-                                Text(deviceTitle)
-                                    .font(.largeTitle.bold())
-                            }
-                            Spacer()
-                            GlassIconButton(systemImage: "arrow.left.arrow.right", label: "Switch PC") {
-                                prepareManualEntry(host: client.address)
-                            }
-                        }
-                        .id(ConnectionJump.Target.connect)
-                        receiveStatus.id(ConnectionJump.Target.transfer)
-                        if fileSender.pendingCount > 0, let peer = client.fileSendPeer {
-                            let count = fileSender.pendingCount
-                            linkRow("Pending file transfer", count == 1 ? "1 file ready to retry" : "\(count) files ready to retry",
-                                    green: false, last: true) {
-                                fileSender.restorePending(for: peer)
-                                showSheet(.sendReview(peer))
-                            }
-                            .background(cardFill, in: RoundedRectangle(cornerRadius: 18))
-                        }
-                        shareStage(height: max(264, geometry.size.height - 370)).id(ConnectionJump.Target.share)
-                        VStack(spacing: 0) {
-                            linkRow("Mouse and keyboard", client.inputControlSummary, green: false) {
-                                showSheet(.feature(.input))
-                            }
-                            linkRow("Photo access", index.accessLabel, green: false) { showSheet(.feature(.photos)) }
-                            linkRow("Clipboard sync", client.clipboardSummary, green: false, last: true) {
-                                showSheet(.feature(.clipboard))
-                            }
-                        }
-                        .background(cardFill, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                        let actionLayout = dynamicTypeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 12)) : AnyLayout(HStackLayout(spacing: 12))
-                        actionLayout {
-                            actionCard("Send files", systemImage: "doc") { openSendPicker() }
-                                .disabled(client.fileSendPeer == nil)
-                            actionCard("Send clipboard", systemImage: "doc.on.clipboard") { client.sendClipboardNow() }
-                                .disabled(!client.clipboardSyncEnabled)
-                                .opacity(client.clipboardSyncEnabled ? 1 : 0.45)
-                        }
-                    }
-                    .padding(20)
-                    .frame(minHeight: geometry.size.height, alignment: .top)
+                ViewThatFits(in: .vertical) {
+                    connectedContent(stageHeight: stageHeight, compact: compact)
+                    ScrollView { connectedContent(stageHeight: stageHeight, compact: compact) }
                 }
+                .frame(maxHeight: .infinity, alignment: .top)
                 .onChange(of: connectionJump, initial: true) { _, jump in
                     scrollConnection(proxy, jump: jump, canShare: true)
                 }
+            }
+        }
+        .toolbar(.hidden, for: .navigationBar)
+    }
+
+    private func connectedContent(stageHeight: CGFloat, compact: Bool) -> some View {
+        VStack(alignment: .leading, spacing: compact ? 10 : 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Label("Connected", systemImage: "circle.fill")
+                        .labelStyle(ConnectionStatusLabel())
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(colorScheme == .dark ? Color.green : Color(red: 0.09, green: 0.50, blue: 0.24))
+                    Text(deviceTitle).font(.title.bold()).lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
+                }
+                Spacer()
+                GlassIconButton(systemImage: "arrow.up.arrow.down", label: "Switch PC") {
+                    prepareManualEntry(host: client.address)
+                }
+            }
+            .id(ConnectionJump.Target.connect)
+
+            if client.receiveProgress != nil || client.widgetReceiveAttention != nil {
+                receiveStatus.id(ConnectionJump.Target.transfer)
+            }
+            if fileSender.pendingCount > 0, let peer = client.fileSendPeer {
+                linkRow("Pending file transfer", "\(fileSender.pendingCount) ready to retry", icon: "arrow.clockwise", last: true) {
+                    fileSender.restorePending(for: peer)
+                    showSheet(.sendReview(peer))
+                }
+                .background(cardFill, in: RoundedRectangle(cornerRadius: 18))
+            }
+            shareStage(height: stageHeight).id(ConnectionJump.Target.share)
+
+            VStack(spacing: 0) {
+                linkRow("Mouse and keyboard", client.inputControlSummary, icon: "computermouse") {
+                    showSheet(.feature(.input))
+                }
+                linkRow("Photo access", index.accessLabel, icon: "photo") { showSheet(.feature(.photos)) }
+                linkRow("Clipboard sync", client.clipboardSummary, icon: "clipboard", last: true) {
+                    showSheet(.feature(.clipboard))
+                }
+            }
+            .background(cardFill, in: RoundedRectangle(cornerRadius: 22))
+
+            let actions = dynamicTypeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 10)) : AnyLayout(HStackLayout(spacing: 10))
+            actions {
+                actionCard("Send files", systemImage: "doc") { openSendPicker() }
+                actionCard("Send clipboard", systemImage: "clipboard") { client.sendClipboardNow() }
+                    .disabled(!client.clipboardSyncEnabled)
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, compact ? 10 : 13)
+    }
+
+    private struct ConnectionStatusLabel: LabelStyle {
+        func makeBody(configuration: Configuration) -> some View {
+            HStack(spacing: 5) {
+                configuration.icon.font(.system(size: 6)).accessibilityHidden(true)
+                configuration.title
             }
         }
     }
@@ -675,61 +710,66 @@ struct ContentView: View {
     }
 
     private func shareStage(height: CGFloat) -> some View {
-        VStack(spacing: 16) {
-            PortholeLens(diameter: min(220, max(190, height - 92))) {
-                if isPortholeBroadcasting {
-                    Button { hideSharing = false } label: {
-                        VStack(spacing: 6) {
-                            Image(systemName: "iphone.and.arrow.forward").font(.title2.weight(.semibold))
-                            if !dynamicTypeSize.isAccessibilitySize { Text("Show broadcast").font(.headline) }
-                        }
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: .infinity, minHeight: 44)
+        let available = client.canStartBroadcast && !captured
+        let diameter = min(218, max(122, height - 82))
+        return VStack(spacing: 10) {
+            PortholeLens(diameter: diameter) {
+                if isPortholeBroadcasting || !available {
+                    Button {
+                        if isPortholeBroadcasting { hideSharing = false }
+                        else { actionError = client.sharedPairingIssue ?? broadcastHelp }
+                    } label: {
+                        shareLensLabel(active: isPortholeBroadcasting)
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Show broadcast")
+                    .accessibilityHint(isPortholeBroadcasting ? "" : broadcastHelp)
                 } else {
-                    VStack(spacing: 6) {
-                        if client.canStartBroadcast && !captured {
-                            BroadcastPicker()
-                                .frame(width: 54, height: 54)
-                                .background(.white.opacity(0.12), in: Circle())
-                        }
-                        if !dynamicTypeSize.isAccessibilitySize {
-                            Text("Share screen").font(.headline).multilineTextAlignment(.center)
-                        }
+                    VStack(spacing: 1) {
+                        BroadcastPicker().frame(width: 54, height: 44)
+                        Text("Share screen").font(.subheadline.weight(.semibold))
+                            .accessibilityHidden(true)
                     }
                 }
             }
             .foregroundStyle(.white)
             .environment(\.colorScheme, .dark)
-            if dynamicTypeSize.isAccessibilitySize {
-                Text(isPortholeBroadcasting ? "Show broadcast" : "Share screen")
-                    .font(.headline)
-                    .foregroundStyle(.white)
-                    .multilineTextAlignment(.center)
-                    .accessibilityHidden(isPortholeBroadcasting)
-            }
             Text(broadcastHelp)
-                .font(.footnote)
-                .foregroundStyle(Color.white.opacity(0.8))
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.76))
                 .multilineTextAlignment(.center)
         }
-        .padding(.vertical, 28)
-        .padding(.horizontal, 18)
-        .frame(maxWidth: .infinity)
-        .frame(minHeight: height)
-        .background(Color.black, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, minHeight: height)
+        .background {
+            RoundedRectangle(cornerRadius: 28)
+                .fill(LinearGradient(
+                    colors: [Color(white: 0.225), Color(white: 0.085)],
+                    startPoint: .topLeading, endPoint: .bottomTrailing))
+                .overlay { RoundedRectangle(cornerRadius: 28).strokeBorder(.white.opacity(0.14)) }
+        }
+    }
+
+    private func shareLensLabel(active: Bool) -> some View {
+        VStack(spacing: 5) {
+            Image(systemName: active ? "rectangle.on.rectangle" : "arrow.up.square")
+                .font(.title3.weight(.medium))
+                .accessibilityHidden(true)
+            Text(active ? "Show broadcast" : "Share screen").font(.subheadline.weight(.semibold))
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, minHeight: 44)
+        .contentShape(Rectangle())
     }
 
     private var broadcastHelp: String {
-        if deliveryStopped { return "End Screen Recording in Control Center to finish the broadcast." }
-        if isPortholeBroadcasting { return "Open the broadcast to check its status or stop sharing." }
+        if deliveryStopped { return "Finish in Control Center." }
+        if isPortholeBroadcasting { return "View or stop screen sharing." }
         if let status = client.broadcastStatus, status.phase == .failed, let message = status.message { return message }
-        if let issue = client.sharedPairingIssue { return issue }
-        if !client.canStartBroadcast { return "Connect your PC before sharing your screen." }
-        if captured { return "Stop the active screen recording or mirroring in Control Center first." }
-        return "Tap the broadcast button and select Start Broadcast. Your PC can see your screen and notifications. Audio stays on this iPhone."
+        if client.sharedPairingIssue != nil { return "Screen sharing unavailable in this install." }
+        if captured { return "Stop the current recording in Control Center first." }
+        if !client.canStartBroadcast { return "Connect to your PC first." }
+        return "Select Start Broadcast. Audio stays on iPhone."
     }
 
     private var broadcastLabel: String {
@@ -788,7 +828,7 @@ struct ContentView: View {
                     statCard("Input", input.mouseConnected && input.keyboardConnected ? "Detected" : "Setup required")
                 }
                 receiveStatus
-                Text(client.broadcastStatus?.message ?? "While Porthole is live, your PC can see your screen and notifications, including after you leave this app.")
+                Text(client.broadcastStatus?.message ?? "Your screen and notifications stay visible until you stop sharing.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -826,15 +866,17 @@ struct ContentView: View {
         .background(cardFill, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
-    private func linkRow(_ title: String, _ detail: String, green: Bool, last: Bool = false, action: @escaping () -> Void) -> some View {
+    private func linkRow(_ title: String, _ detail: String, icon: String, last: Bool = false, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             VStack(spacing: 0) {
-                HStack {
+                HStack(spacing: 12) {
+                    Image(systemName: icon).frame(width: 24).accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(title).font(.body.weight(.semibold)).foregroundStyle(.primary)
+                        Text(title).font(.subheadline.weight(.semibold)).foregroundStyle(.primary)
                         Text(detail)
                             .font(.footnote)
-                            .foregroundStyle(green ? Color(red: 0.09, green: 0.50, blue: 0.24) : .secondary)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
                     }
                     Spacer()
                     Image(systemName: "chevron.right")
@@ -842,8 +884,10 @@ struct ContentView: View {
                         .foregroundStyle(.tertiary)
                 }
                 .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-                if !last { Divider().padding(.leading, 16) }
+                .padding(.vertical, 8)
+                .frame(minHeight: 50)
+                .contentShape(Rectangle())
+                if !last { Divider().padding(.leading, 52) }
             }
         }
         .buttonStyle(.plain)
@@ -914,17 +958,7 @@ struct ContentView: View {
                             Button { showSheet(.clipboard(item)) } label: { ActivityRow(item: item, file: client.clipboardPreviewURL(item), canOpen: false) }
                                 .buttonStyle(.plain)
                             if client.canCopy(item) {
-                                GlassIconButton(systemImage: copiedItemID == item.id ? "checkmark" : "doc.on.doc",
-                                                label: copiedItemID == item.id ? "Copied" : "Copy clipboard item") {
-                                    client.copyActivity(item) { success in
-                                        if success {
-                                            copiedItemID = item.id
-                                            AccessibilityNotification.Announcement("Copied to this iPhone.").post()
-                                        } else {
-                                            actionError = client.activityMessage
-                                        }
-                                    }
-                                }
+                                clipboardCopyButton(for: item)
                             }
                         }
                     } else {
@@ -936,7 +970,7 @@ struct ContentView: View {
                 }
             } header: {
                 HStack {
-                    Text(activityFilter == 2 ? "Clipboard history" : "Transfer history")
+                    Text("Recent")
                     Spacer()
                     if !items.isEmpty {
                         Button("Clear history") { confirmingClearHistory = true }
@@ -946,28 +980,19 @@ struct ContentView: View {
                 }
             }
             if activityFilter == 2 {
-                ClipboardHistorySettings(client: client)
-                Section("Clipboard") {
-                    Text(client.clipStatus.isEmpty ? "Clipboard transfer status appears here." : client.clipStatus)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                    GlassCapsuleButton(title: "Send clipboard", systemImage: "doc.on.clipboard") {
-                        client.sendClipboardNow()
-                    }
-                    .disabled(!client.linked || !client.clipboardSyncEnabled)
-                    .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets())
-                    PasteButton(supportedContentTypes: [.plainText, .utf8PlainText, .image, .url]) { providers in
-                        client.sendPasted(providers)
-                    }
-                    .disabled(!client.linked || !client.clipboardSyncEnabled)
-                    .listRowBackground(Color.clear)
+                Section {
+                    ClipboardActions(client: client)
+                        .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
                 }
             }
             if !client.activityMessage.isEmpty {
                 Section { Text(client.activityMessage).font(.footnote).foregroundStyle(.secondary) }
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(phoneBackground)
         .navigationTitle("Activity")
         .onChange(of: activityFilter) { _, _ in selectedHistory.removeAll(); selectingHistory = false }
         .onChange(of: client.clipboardHistoryEnabled) { _, enabled in
@@ -996,97 +1021,119 @@ struct ContentView: View {
         }
     }
 
+    private func clipboardCopyButton(for item: ActivityRecord) -> some View {
+        let copied = copiedItemID == item.id
+        return Button {
+            client.copyActivity(item) { success in
+                if success {
+                    copiedItemID = item.id
+                    AccessibilityNotification.Announcement("Copied").post()
+                } else {
+                    actionError = client.activityMessage
+                }
+            }
+        } label: {
+            VStack(spacing: 3) {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                Text(copied ? "Copied" : "Copy").font(.caption2.weight(.semibold))
+            }
+            .frame(minWidth: 44, minHeight: 44)
+            .padding(.horizontal, 3)
+            .glassPanel(RoundedRectangle(cornerRadius: 14))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(copied ? "Copied" : "Copy clipboard item")
+    }
+
     private var settings: some View {
         List {
             Section {
-                TextField("iPhone", text: $phoneAliasDraft, prompt: Text("iPhone"))
-                    .accessibilityLabel("Phone name")
-                    .textInputAutocapitalization(.words)
-                    .autocorrectionDisabled()
-                    .submitLabel(.done)
-                    .onSubmit(savePhoneAlias)
-                Button("Save phone name", action: savePhoneAlias)
-            } header: {
-                Text("Phone name")
-            } footer: {
-                Text("Your paired PC sees this name. Leave it blank to use iPhone.")
+                HStack(spacing: 12) {
+                    Image(systemName: "desktopcomputer")
+                        .font(.title3)
+                        .frame(width: 46, height: 46)
+                        .background(cardFill, in: RoundedRectangle(cornerRadius: 14))
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(client.linked || client.savedPC != nil ? deviceTitle : "No PC connected")
+                            .font(.headline)
+                        Text(client.linked ? "Connected over Wi-Fi" : "Disconnected")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
+                .listRowInsets(EdgeInsets())
+                .listRowBackground(Color.clear)
             }
+
             Section("Connection features") {
                 NavigationLink {
                     ConnectionSettings(feature: .input, client: client, index: index, input: input)
                 } label: {
-                    LabeledContent("Mouse and keyboard", value: client.inputControlSummary)
+                    Label("Mouse and keyboard", systemImage: "computermouse")
                 }
                 NavigationLink {
                     ConnectionSettings(feature: .photos, client: client, index: index, input: input)
                 } label: {
-                    LabeledContent("Photo access", value: index.accessLabel)
+                    LabeledContent {
+                        Text(index.accessLabel)
+                    } label: { Label("Photo access", systemImage: "photo") }
                 }
                 NavigationLink {
                     ConnectionSettings(feature: .clipboard, client: client, index: index, input: input)
                 } label: {
-                    LabeledContent("Clipboard sync", value: client.clipboardSyncEnabled ? "Enabled" : "Disabled")
+                    LabeledContent {
+                        Text(client.clipboardSyncEnabled ? "On" : "Off")
+                    } label: { Label("Clipboard sync", systemImage: "clipboard") }
                 }
             }
-            Section {
-                Toggle("Hide Lock Screen details", isOn: Binding(
-                    get: { client.hideLockScreenDetails },
-                    set: client.setHideLockScreenDetails
-                ))
-            } header: {
-                Text("Widgets")
-            } footer: {
-                Text("Hides counts and pairing status in Lock Screen widgets and StandBy. File notifications use a generic preview.")
-            }
+
             Section("File storage") {
-                LabeledContent("Save received files to", value: client.saveFolderName)
+                Label {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Save received files to")
+                        Text(client.saveFolderName).font(.footnote).foregroundStyle(.secondary)
+                    }
+                } icon: { Image(systemName: "folder") }
                 Button("Choose another folder", systemImage: "folder.badge.plus") { showSheet(.saveFolder) }
                 if client.usesCustomSaveFolder {
-                    Button("Use default Porthole folder") { client.resetSaveFolder() }
+                    Button("Use default folder") { client.resetSaveFolder() }
                 }
-                Text("Applies to new received files. Existing files stay in their original folders.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
                 if !client.storageMessage.isEmpty {
                     Text(client.storageMessage).font(.footnote).foregroundStyle(.secondary)
                 }
             }
+
             Section {
-                if notificationPermission == .denied {
-                    Button("Open notification settings", action: openAppSettings)
-                } else if notificationPermission == .notDetermined {
-                    Button("Enable file notifications") {
-                        client.requestNotificationPermission(completion: refreshNotificationPermission)
-                    }
-                } else if notificationPermission != nil {
-                    Button("Manage file notifications", action: openAppSettings)
-                } else {
-                    ProgressView("Checking notification settings…")
+                Toggle(isOn: Binding(
+                    get: {
+                        client.fileNotificationsEnabled &&
+                            client.notificationAuthorization != .denied &&
+                            client.notificationAuthorization != .notDetermined
+                    },
+                    set: client.setFileNotificationsEnabled
+                )) {
+                    Label("File notifications", systemImage: "bell")
                 }
-            } header: {
-                Text("Notifications")
+                .disabled(client.notificationAuthorization == .denied)
             } footer: {
-                Text("Choose whether iOS alerts you when a received file is saved while Porthole is in the background.")
+                if client.notificationAuthorization == .denied { Text("iOS has blocked notifications for Porthole.") }
             }
+
             Section {
-                Button("Forget \(client.deviceName.isEmpty ? "PC" : client.deviceName)", role: .destructive) {
-                    client.forgetPC()
+                Button("Help and connection tips", systemImage: "questionmark.circle") {
+                    actionError = "Open Porthole on your PC and connect both devices to the same Wi-Fi."
+                }
+                if client.savedPC != nil {
+                    Button("Forget \(deviceTitle)", role: .destructive) { client.forgetPC() }
                 }
             } footer: {
                 Text("Version \(version)")
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(phoneBackground)
         .navigationTitle("Settings")
-        .onAppear {
-            phoneAliasDraft = client.phoneAlias == "iPhone" ? "" : client.phoneAlias
-            refreshNotificationPermission()
-        }
-    }
-
-    private func savePhoneAlias() {
-        client.setPhoneAlias(phoneAliasDraft)
-        phoneAliasDraft = client.phoneAlias == "iPhone" ? "" : client.phoneAlias
-        AccessibilityNotification.Announcement("Phone name saved as \(client.phoneAlias).").post()
     }
 
     private var manualEntry: some View {

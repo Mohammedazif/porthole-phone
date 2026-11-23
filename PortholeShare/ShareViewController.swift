@@ -94,7 +94,9 @@ final class ShareViewController: UIViewController {
         guard !started else { return }
         started = true
         guard TrustedPeerStore.available else {
-            status.text = "Porthole Share cannot access its App Group. Check that the app and Share extension were signed with the same group."
+            status.text = "Share is unavailable in this install. Use Send files in Porthole."
+            finished = true
+            configureButton("Done", enabled: true)
             return
         }
         guard let peer = TrustedPeerStore.load() else {

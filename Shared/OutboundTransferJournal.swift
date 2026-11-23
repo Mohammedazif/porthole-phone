@@ -113,6 +113,10 @@ struct OutboundTransferJournal {
             try journal.write(manifest, to: folder.appendingPathComponent("batch.json"))
         }
 
+        func record(_ receipt: ShareReceipt) throws {
+            try journal.receipts.record(receipt)
+        }
+
         func discard() throws { try FileManager.default.removeItem(at: folder) }
     }
 

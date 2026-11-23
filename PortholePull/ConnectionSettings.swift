@@ -1,6 +1,7 @@
 import Photos
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 #if compiler(>=6.2)
 import Accessibility
 #endif
@@ -92,8 +93,6 @@ struct ConnectionSettings: View {
             } footer: {
                 if client.linked && (!client.inputControlSupported || !client.inputVerificationSupported) {
                     Text("Update Porthole on your PC to apply these preferences.")
-                } else {
-                    Text("File transfers and clipboard sync remain available when PC controls are disabled.")
                 }
             }
             Section("Input devices on iPhone") {
@@ -102,7 +101,7 @@ struct ConnectionSettings: View {
                 Button("Refresh device status") { input.refresh() }
             }
             Section {
-                Text("In Porthole on your PC, select Set up controls. On this iPhone, open Settings › Bluetooth and select the PC.")
+                Text("Set up controls on your PC, then pair it in Bluetooth.")
                 if client.inputVerificationStatus != .verified {
                     Button("Verify Bluetooth") { showingBluetoothVerification = true }
                         .disabled(!client.canVerifyInput)
@@ -110,7 +109,7 @@ struct ConnectionSettings: View {
             } header: {
                 Text("Bluetooth pairing")
             } footer: {
-                Text("Verify after pairing to enable mouse and keyboard for this connection.")
+                Text("Verify the Bluetooth connection after pairing.")
             }
             Section {
                 Button("AssistiveTouch settings") { openAccessibilitySettings(dwell: false) }
@@ -118,7 +117,7 @@ struct ConnectionSettings: View {
             } header: {
                 Text("Pointer control")
             } footer: {
-                Text("Enable AssistiveTouch for pointer control. Disable Dwell Control to prevent automatic taps. These settings are managed by iOS.")
+                Text("Enable AssistiveTouch for pointer control.")
             }
         }
     }
@@ -155,7 +154,7 @@ struct ConnectionSettings: View {
             } header: {
                 Text("Original file transfer")
             } footer: {
-                Text("The next transfer sends the selected photo or video’s unedited original, including any metadata saved in the original file.")
+                Text("Original files may include their saved metadata.")
             }
         }
     }
@@ -169,24 +168,14 @@ struct ConnectionSettings: View {
                 ))
                 LabeledContent("Status", value: client.clipboardSummary)
             } footer: {
-                Text("Synchronize text and images between this iPhone and your PC. Disabling sync stops clipboard updates in both directions.")
+                Text("Share text and images with your PC.")
             }
             ClipboardHistorySettings(client: client)
-            Section("Transfer clipboard") {
-                Button("Send clipboard") { client.sendClipboardNow() }
-                    .disabled(!client.linked || !client.clipboardSyncEnabled)
-                PasteButton(supportedContentTypes: [.plainText, .utf8PlainText, .image, .url]) {
-                    client.sendPasted($0)
-                }
-                .disabled(!client.linked || !client.clipboardSyncEnabled)
-                if !client.clipStatus.isEmpty {
-                    Text(client.clipStatus).font(.footnote).foregroundStyle(.secondary)
-                }
-            }
             Section {
-                Button("Open app settings", action: openAppSettings)
-            } footer: {
-                Text("If iOS requests clipboard permission, use Paste or allow Paste from Other Apps in Porthole’s settings.")
+                ClipboardActions(client: client)
+                    .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
             }
         }
     }
@@ -234,7 +223,84 @@ struct ClipboardHistorySettings: View {
                 set: { client.setClipboardHistoryEnabled($0) }
             ))
         } footer: {
-            Text("Keep shared text and images on this iPhone for up to seven days and 16 MiB. Turning history off removes saved clipboard items. Clipboard sync is a separate setting.")
+            Text("Keep shared text and images for up to 7 days.")
+        }
+    }
+}
+
+struct ClipboardActions: View {
+    @ObservedObject var client: PullClient
+
+    private var enabled: Bool { client.linked && client.clipboardSyncEnabled && client.clipboardLinkReady }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) {
+                    sendButton
+                    pasteButton.frame(width: 94)
+                }
+                VStack(spacing: 10) {
+                    sendButton
+                    pasteButton.frame(maxWidth: .infinity)
+                }
+            }
+            Text(client.clipStatus.isEmpty ? "Share text and images with your PC." : client.clipStatus)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+        }
+        .disabled(!enabled)
+    }
+
+    private var sendButton: some View {
+        GlassCapsuleButton(title: "Send clipboard", systemImage: "clipboard", compact: true) {
+            client.sendClipboardNow()
+        }
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var pasteButton: some View {
+        ClipboardPasteControl(enabled: enabled, onPaste: client.sendPasted)
+            .frame(minWidth: 86, minHeight: 48, maxHeight: 48)
+            .glassPanel(Capsule())
+    }
+}
+
+private struct ClipboardPasteControl: UIViewRepresentable {
+    let enabled: Bool
+    let onPaste: ([NSItemProvider]) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(onPaste: onPaste) }
+
+    func makeUIView(context: Context) -> UIPasteControl {
+        let configuration = UIPasteControl.Configuration()
+        configuration.displayMode = .iconAndLabel
+        configuration.cornerStyle = .capsule
+        configuration.baseForegroundColor = .label
+        configuration.baseBackgroundColor = .clear
+        let control = UIPasteControl(configuration: configuration)
+        control.target = context.coordinator
+        return control
+    }
+
+    func updateUIView(_ control: UIPasteControl, context: Context) {
+        context.coordinator.onPaste = onPaste
+        control.isEnabled = enabled
+    }
+
+    final class Coordinator: UIResponder {
+        var onPaste: ([NSItemProvider]) -> Void
+
+        init(onPaste: @escaping ([NSItemProvider]) -> Void) {
+            self.onPaste = onPaste
+            super.init()
+            pasteConfiguration = UIPasteConfiguration(acceptableTypeIdentifiers:
+                [UTType.plainText, .utf8PlainText, .image, .url].map(\.identifier))
+        }
+
+        override func paste(itemProviders: [NSItemProvider]) {
+            onPaste(itemProviders)
         }
     }
 }

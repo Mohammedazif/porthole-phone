@@ -44,14 +44,13 @@ struct WidgetInboxSnapshot: Codable, Equatable {
     var hasReceivedFiles = false
     var pairing = Pairing.unknown
     var transfer: Transfer?
-    var hideLockScreenDetails = true
 
     var isPaired: Bool { pairing == .paired || pairing == .disconnected }
 
-    static let preview = Self(unreadCount: 3, hasReceivedFiles: true, pairing: .paired, hideLockScreenDetails: false)
+    static let preview = Self(unreadCount: 3, hasReceivedFiles: true, pairing: .paired)
 
-    func summary(at date: Date, exposed: Bool = false, redacted: Bool = false) -> WidgetInboxSummary {
-        if redacted || (exposed && hideLockScreenDetails) { return .privateReceived }
+    func summary(at date: Date, redacted: Bool = false) -> WidgetInboxSummary {
+        if redacted { return .privateReceived }
         if unreadCount > 0 { return .unread(unreadCount) }
         if let transfer {
             if let expiresAt = transfer.expiresAt, date >= expiresAt { return .transferStatusUnknown }

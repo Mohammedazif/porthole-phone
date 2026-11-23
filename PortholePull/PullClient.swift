@@ -13,55 +13,40 @@ extension Notification.Name {
 }
 
 enum PhoneNotice {
-    static let previewPrivacyKey = "porthole.hideLockScreenDetails"
-    private static let privateBody = "A received file is ready."
-    static var hidesLockScreenDetails: Bool {
-        UserDefaults.standard.object(forKey: previewPrivacyKey) as? Bool ?? true
+    static let enabledKey = "porthole.fileNotificationsEnabled"
+    private static let body = "A received file is ready."
+
+    static var enabled: Bool {
+        UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true
     }
 
-    static func arm(completion: @escaping () -> Void) {
-        let center = UNUserNotificationCenter.current()
-        center.delegate = NoticeDelegate.shared
-        center.requestAuthorization(options: [.alert, .sound]) { _, _ in DispatchQueue.main.async(execute: completion) }
-    }
-
-    static func fileArrived(_ file: ReceivedFileReference, from device: String, privatePreview: Bool) {
-        let name = file.name
+    static func fileArrived(_ file: ReceivedFileReference) {
+        guard enabled else { return }
         let content = UNMutableNotificationContent()
-        if privatePreview {
-            content.title = "Porthole"
-            content.body = privateBody
-        } else {
-            content.title = device.isEmpty ? "File received" : "File received from \(device)"
-            content.body = name
-        }
+        content.title = "Porthole"
+        content.body = body
         content.sound = .default
-        content.userInfo = ["file": name]
+        content.userInfo = ["file": file.name]
         if let reference = try? JSONEncoder().encode(file) { content.userInfo["reference"] = reference }
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         let center = UNUserNotificationCenter.current()
         center.add(request) { error in
-            // The setting can change while the notification service is accepting the request.
-            guard error == nil, !privatePreview, hidesLockScreenDetails else { return }
+            guard error == nil, !enabled else { return }
             center.removePendingNotificationRequests(withIdentifiers: [request.identifier])
             center.removeDeliveredNotifications(withIdentifiers: [request.identifier])
         }
     }
 
-    static func isDetailedFilePreview(_ content: UNNotificationContent) -> Bool {
-        content.userInfo["file"] is String && (content.title != "Porthole" || content.body != privateBody)
-    }
-
-    static func removeDetailedPreviews() {
+    static func removePreviousFileAlerts() {
         let center = UNUserNotificationCenter.current()
+        func shouldRemove(_ request: UNNotificationRequest) -> Bool {
+            request.content.userInfo["file"] is String && (!enabled || request.content.body != body)
+        }
         center.getPendingNotificationRequests { requests in
-            guard hidesLockScreenDetails else { return }
-            center.removePendingNotificationRequests(withIdentifiers: requests
-                .filter { isDetailedFilePreview($0.content) }.map(\.identifier))
+            center.removePendingNotificationRequests(withIdentifiers: requests.filter(shouldRemove).map(\.identifier))
             center.getDeliveredNotifications { notifications in
-                guard hidesLockScreenDetails else { return }
                 center.removeDeliveredNotifications(withIdentifiers: notifications.map(\.request)
-                    .filter { isDetailedFilePreview($0.content) }.map(\.identifier))
+                    .filter(shouldRemove).map(\.identifier))
             }
         }
     }
@@ -80,7 +65,7 @@ final class NoticeDelegate: NSObject, UNUserNotificationCenterDelegate {
                                 willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         // The in-app glass arrival banner is the foreground presentation.
-        completionHandler(PhoneNotice.hidesLockScreenDetails && PhoneNotice.isDetailedFilePreview(notification.request.content) ? [] : [.list])
+        completionHandler(PhoneNotice.enabled ? [.list] : [])
     }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter,
@@ -155,7 +140,6 @@ final class PullClient: ObservableObject {
         let queued: (() -> Void)?
     }
     private var deferredLines: [DeferredLine] = []
-    @Published private(set) var phoneAlias = UserDefaults.standard.string(forKey: "porthole.phoneAlias") ?? "iPhone"
     @Published private(set) var clipboardLinkReady = false
     @Published private(set) var inputControlsEnabled = true
     @Published private(set) var inputScreenSharingOnly = true
@@ -196,7 +180,9 @@ final class PullClient: ObservableObject {
     @Published private(set) var saveFolderName = "On My iPhone › Porthole"
     @Published private(set) var usesCustomSaveFolder = false
     @Published private(set) var unreadReceived = 0
-    @Published private(set) var hideLockScreenDetails = PhoneNotice.hidesLockScreenDetails
+    @Published private(set) var fileNotificationsEnabled = PhoneNotice.enabled
+    @Published private(set) var notificationAuthorization: UNAuthorizationStatus?
+    private var requestingNotificationPermission = false
     private let widgetInbox = WidgetInboxPublisher()
     private var hasReceivedFiles = UserDefaults.standard.bool(forKey: "porthole.hasReceivedFiles")
     @Published var activityMessage = ""
@@ -436,10 +422,8 @@ final class PullClient: ObservableObject {
         }
     }
 
-    func setPhoneAlias(_ raw: String) {
-        let name = Self.displayName(raw, maxBytes: 63) ?? "iPhone"
-        phoneAlias = name
-        UserDefaults.standard.set(name, forKey: "porthole.phoneAlias")
+    private func sendSystemPhoneName() {
+        let name = Self.displayName(UIDevice.current.name, maxBytes: 63) ?? "iPhone"
         guard let peer = fileSendPeer else { return }
         queue.async {
             if self.transportPeer?.id == peer.id { self.send("NAME \(name)\n") }
@@ -527,19 +511,9 @@ final class PullClient: ObservableObject {
         receiveProgress = progress
     }
 
-    func setHideLockScreenDetails(_ hidden: Bool) {
-        hideLockScreenDetails = hidden
-        UserDefaults.standard.set(hidden, forKey: PhoneNotice.previewPrivacyKey)
-        widgetInbox.updatePrivacy(hidden)
-        if hidden { PhoneNotice.removeDetailedPreviews() }
-    }
-
     private func publishWidgetPairing() {
         let pairing: WidgetInboxSnapshot.Pairing = linked ? .paired : savedPeer() == nil ? .unpaired : .disconnected
-        widgetInbox.update {
-            $0.pairing = pairing
-            $0.hideLockScreenDetails = hideLockScreenDetails
-        }
+        widgetInbox.update { $0.pairing = pairing }
     }
 
     func clearArrival() {
@@ -561,7 +535,7 @@ final class PullClient: ObservableObject {
         historyQueue.async {
             do {
                 if !self.historyLoaded { _ = try? self.historyStore.load() }
-                if let journal = ShareReceiptJournal.shared() {
+                for journal in Self.sendReceiptJournals {
                     for receipt in try journal.pending() { try journal.remove(receipt.id) }
                 }
                 try self.historyStore.clear()
@@ -670,25 +644,30 @@ final class PullClient: ObservableObject {
 
     private func loadHistory() { historyQueue.async { self.loadAndTrimHistory() } }
 
+    private static var sendReceiptJournals: [ShareReceiptJournal] {
+        OutboundFileSender.storageContainers.map(ShareReceiptJournal.init(containerURL:))
+    }
+
     func importSentReceipts() {
         historyQueue.async {
-            guard self.historyLoaded, let journal = ShareReceiptJournal.shared() else { return }
-            do {
-                journal.pruneImported()
-                let receipts = try journal.pending()
-                guard !receipts.isEmpty else { return }
-                let existing = Set(self.historyRecords.map(\.id))
-                var merged = self.historyRecords
-                for receipt in receipts where !existing.contains(receipt.id) {
-                    merged.append(ActivityItem(id: receipt.id, date: receipt.date, title: receipt.name,
-                                               detail: "Sent to \(receipt.peerName)", isFile: true, incoming: false, bytes: receipt.bytes))
-                }
-                merged.sort { $0.date > $1.date }
-                try self.historyStore.save(merged)
-                self.historyRecords = merged
-                self.publishHistory()
-                for receipt in receipts { try journal.markImported(receipt.id) }
-            } catch { self.reportHistory("Share activity could not be imported. Porthole will try again when you reopen it.") }
+            guard self.historyLoaded else { return }
+            for journal in Self.sendReceiptJournals {
+                do {
+                    journal.pruneImported()
+                    let receipts = try journal.pending()
+                    guard !receipts.isEmpty else { continue }
+                    let existing = Set(self.historyRecords.map(\.id))
+                    var merged = self.historyRecords
+                    for receipt in receipts where !existing.contains(receipt.id) {
+                        merged.append(ActivityItem(id: receipt.id, date: receipt.date, title: receipt.name,
+                                                   detail: "Sent to \(receipt.peerName)", isFile: true, incoming: false, bytes: receipt.bytes))
+                    }
+                    merged.sort { $0.date > $1.date }
+                    self.historyRecords = try self.historyStore.save(merged)
+                    self.publishHistory()
+                    for receipt in receipts { try journal.markImported(receipt.id) }
+                } catch { self.reportHistory("Sent activity could not be imported. Porthole will retry.") }
+            }
         }
     }
 
@@ -776,6 +755,16 @@ final class PullClient: ObservableObject {
         requestedPeer?.samePairing(as: peer) == true
     }
 
+    var savedPC: TrustedPeer? { widgetShortcutPairing }
+
+    var discoveryMessage: String {
+        if connecting || status.hasPrefix("Local Network access is disabled") { return status }
+        if savedPC != nil, !status.hasPrefix("Choose a PC"), !status.hasPrefix("Local Network access enabled") {
+            return status
+        }
+        return "Allow Local Network access to find your PC."
+    }
+
     var widgetShortcutPairing: TrustedPeer? { fileSendPeer?.remembered ?? savedPeer() }
 
     func reconnectForWidgetShortcut(_ peer: TrustedPeer) -> Bool {
@@ -788,14 +777,49 @@ final class PullClient: ObservableObject {
 
     var sharedPairingIssue: String? {
         guard fileSendPeer != nil, !sharedPairingReady else { return nil }
-        return "Sign Porthole, Broadcast, and Share with the same companion App Group to enable transfers and screen sharing."
+        return "This install is missing the App Group for Broadcast and Share. Reinstall with the matching App Group enabled for all three targets."
     }
 
     private func publishSharedPeer(_ peer: TrustedPeer) {
         sharedPairingReady = TrustedPeerStore.save(peer) && TrustedPeerStore.load() == peer
     }
 
-    func requestNotificationPermission(completion: @escaping () -> Void = {}) { PhoneNotice.arm(completion: completion) }
+    func refreshNotificationPermission(promptIfNeeded: Bool = false) {
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { settings in
+            DispatchQueue.main.async {
+                self.notificationAuthorization = settings.authorizationStatus
+                guard promptIfNeeded, self.foreground, self.fileNotificationsEnabled,
+                      settings.authorizationStatus == .notDetermined else { return }
+                self.requestNotificationPermission()
+            }
+        }
+    }
+
+    func setFileNotificationsEnabled(_ enabled: Bool) {
+        fileNotificationsEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: PhoneNotice.enabledKey)
+        if enabled {
+            if notificationAuthorization == .notDetermined {
+                requestNotificationPermission()
+            } else {
+                refreshNotificationPermission()
+            }
+        } else {
+            PhoneNotice.removePreviousFileAlerts()
+        }
+    }
+
+    private func requestNotificationPermission() {
+        guard !requestingNotificationPermission else { return }
+        requestingNotificationPermission = true
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in
+            DispatchQueue.main.async {
+                self.requestingNotificationPermission = false
+                self.refreshNotificationPermission()
+            }
+        }
+    }
 
     func refreshBroadcastStatus() {
         guard let snapshot = TrustedPeerStore.broadcastStatus(),
@@ -863,12 +887,12 @@ final class PullClient: ObservableObject {
     func loadLocalState() {
         loadSaved()
         publishWidgetPairing()
-        if hideLockScreenDetails { PhoneNotice.removeDetailedPreviews() }
         loadHistory()
         importSentReceipts()
         UserDefaults.standard.removeObject(forKey: "porthole.code")
         if !didReclaimStaging {
             didReclaimStaging = true
+            PhoneNotice.removePreviousFileAlerts()
             fileQueue.async {
                 self.fileStorage.reclaimOldPreviews()
                 TransferStaging.removeExpiredDirectories(in: FileManager.default.temporaryDirectory, prefix: "Original-",
@@ -876,7 +900,11 @@ final class PullClient: ObservableObject {
             }
         }
         recoverReceivedTransfers()
-        fileQueue.async { OutboundTransferJournal.shared()?.reclaimExpired() }
+        fileQueue.async {
+            for container in OutboundFileSender.storageContainers {
+                OutboundTransferJournal(container: container).reclaimExpired()
+            }
+        }
     }
 
     private func recoverReceivedTransfers() {
@@ -925,12 +953,15 @@ final class PullClient: ObservableObject {
     func cameForward() {
         foreground = true
         loadLocalState()
+        refreshNotificationPermission(promptIfNeeded: linked)
         refreshBroadcastStatus()
         if !disconnectedByPC, !linked, !connecting, requestedPeer != nil { connect() }
     }
 
     func enteredBackground() {
         foreground = false
+        reconnectWork?.cancel()
+        reconnectWork = nil
         cancelInputVerification(message: "Bluetooth verification was interrupted.")
     }
 
@@ -983,11 +1014,17 @@ final class PullClient: ObservableObject {
         considerLocal()
     }
 
+    private static func discardPendingSends(for peer: TrustedPeer) {
+        for container in OutboundFileSender.storageContainers {
+            OutboundTransferJournal(container: container).discard(for: peer)
+        }
+    }
+
     func forgetPC() {
         var forgotten = Set<String>()
         for peer in [requestedPeer, savedPeer(), PendingPairing.load()?.peer].compactMap({ $0 })
             where forgotten.insert(peer.credentialProfile).inserted {
-            fileQueue.async { OutboundTransferJournal.shared()?.discard(for: peer) }
+            fileQueue.async { Self.discardPendingSends(for: peer) }
             PairingCredential.remove(peer.credentialProfile)
             PendingPairing.clear(for: peer)
         }
@@ -1427,7 +1464,9 @@ final class PullClient: ObservableObject {
               TrustedPeer.isChannelTicket(String(fields[1])) else { return false }
         let advertisedName = fields.count == 3 ? Data(base64Encoded: String(fields[2]))
             .flatMap { String(data: $0, encoding: .utf8) }.flatMap { Self.displayName($0, maxBytes: 63) } : nil
-        var verified = TrustedPeer(host: peer.host, name: advertisedName ?? peer.host, fingerprint: peer.fingerprint,
+        let names = [advertisedName, peer.name].compactMap { $0 }
+        let name = names.first { !["unknown", "localhost", peer.host.lowercased()].contains($0.lowercased()) }
+        var verified = TrustedPeer(host: peer.host, name: name ?? "Your PC", fingerprint: peer.fingerprint,
                                    id: peer.id, pairingID: peer.stableID)
         verified.channelTicket = String(fields[1])
         transportPeer = verified
@@ -1458,7 +1497,7 @@ final class PullClient: ObservableObject {
             UserDefaults.standard.set(data, forKey: self.savedPeerKey)
             PendingPairing.clear(for: peer)
             if let previous, !previous.samePairing(as: peer) {
-                self.fileQueue.async { OutboundTransferJournal.shared()?.discard(for: previous) }
+                self.fileQueue.async { Self.discardPendingSends(for: previous) }
                 PairingCredential.remove(previous.credentialProfile)
                 PendingPairing.clear(for: previous)
             }
@@ -1471,7 +1510,8 @@ final class PullClient: ObservableObject {
             self.status = "Connected securely to \(peer.name)."
             self.publishSharedPeer(peer)
             self.publishWidgetPairing()
-            self.setPhoneAlias(self.phoneAlias)
+            self.sendSystemPhoneName()
+            self.refreshNotificationPermission(promptIfNeeded: true)
         }
         if peer.resumable { send("FILES 2\nFILES 3\n") }
         send("INBOX?\nIV?\n")
@@ -2062,7 +2102,7 @@ final class PullClient: ObservableObject {
                     DispatchQueue.main.async {
                         if self.receiveProgress?.transferID == transfer.id { self.setReceiveProgress(nil) }
                     }
-                    self.announce(saved, from: peer.name)
+                    self.announce(saved)
                 case .failure:
                     if sameSession { self.rejectPush(transfer, peer: peer) }
                 }
@@ -2176,14 +2216,14 @@ final class PullClient: ObservableObject {
         }
     }
 
-    private func announce(_ saved: ReceivedFileStorage.SavedFile, from device: String) {
+    private func announce(_ saved: ReceivedFileStorage.SavedFile) {
         let reference = saved.reference
         DispatchQueue.main.async {
             self.arrival = Arrival(name: reference.name, file: saved.localURL, reference: reference, warning: saved.warning)
             self.rememberReceivedFiles()
             self.status = saved.warning ?? "\(reference.name) received"
             if let warning = saved.warning { self.storageMessage = warning }
-            PhoneNotice.fileArrived(reference, from: device, privatePreview: self.hideLockScreenDetails)
+            PhoneNotice.fileArrived(reference)
             let arrivalID = self.arrival?.id
             DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
                 if self.arrival?.id == arrivalID { self.arrival = nil }
@@ -2378,7 +2418,7 @@ final class PullClient: ObservableObject {
     }
 
     private func scheduleReconnect() {
-        guard !disconnectedByPC, let peer = requestedPeer else { return }
+        guard foreground, !disconnectedByPC, let peer = requestedPeer else { return }
         reconnectWork?.cancel()
         if reconnectAttempt >= 4, PendingPairing.load()?.peer.samePairing(as: peer) == true {
             status = "Pairing could not finish. Tap Connect to retry, or use the current code shown on your PC."

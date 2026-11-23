@@ -50,7 +50,6 @@ private struct PortholeInboxWidgetView: View {
     @Environment(\.widgetFamily) private var family
     @Environment(\.widgetRenderingMode) private var renderingMode
     @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.showsWidgetContainerBackground) private var showsBackground
     @Environment(\.redactionReasons) private var redactionReasons
 
     let entry: PortholeInboxEntry
@@ -60,9 +59,7 @@ private struct PortholeInboxWidgetView: View {
     }
 
     private var summary: WidgetInboxSummary {
-        // StandBy (and CarPlay) render the small family without its container background.
-        entry.snapshot.summary(at: entry.date, exposed: isAccessory || (family == .systemSmall && !showsBackground),
-                               redacted: redactionReasons.contains(.privacy))
+        entry.snapshot.summary(at: entry.date, redacted: redactionReasons.contains(.privacy))
     }
 
     private var hidesDetails: Bool { summary == .privateReceived }

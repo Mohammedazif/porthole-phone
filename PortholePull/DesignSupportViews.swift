@@ -122,11 +122,10 @@ struct SendFilesSheet: View {
     private var remaining: Int { sender.items.filter { !$0.sent }.count }
     private var reviewingConnectedPeer: Bool {
         guard let connected = client.fileSendPeer else { return false }
-        return connected.samePairing(as: peer) && connected.resumable && client.sharedPairingReady
+        return connected.samePairing(as: peer) && connected.resumable
     }
 
     private var transferAvailability: String {
-        if let issue = client.sharedPairingIssue { return issue }
         if let connected = client.fileSendPeer {
             if !connected.samePairing(as: peer) { return "To send to another PC, close this transfer and select your files again." }
             return "Waiting for the PC to confirm file transfer support."

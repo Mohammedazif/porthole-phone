@@ -36,15 +36,7 @@ final class WidgetInboxPublisher {
         queue.async { self.persist(proposed, to: store) }
     }
 
-    func updatePrivacy(_ hidden: Bool) {
-        snapshot.hideLockScreenDetails = hidden
-        guard let store else { return }
-        let proposed = snapshot
-        // Finish any older publications and commit the setting before the app can suspend.
-        queue.sync { persist(proposed, to: store, forceReload: true) }
-    }
-
-    private func persist(_ proposed: WidgetInboxSnapshot, to store: WidgetInboxStore, forceReload: Bool = false) {
+    private func persist(_ proposed: WidgetInboxSnapshot, to store: WidgetInboxStore) {
         do {
             let changed = persisted != proposed
             if changed {
@@ -52,7 +44,7 @@ final class WidgetInboxPublisher {
                 persisted = proposed
             }
             // A previous app process may have saved successfully but exited before reloading.
-            guard changed || forceReload || !requestedInitialReload else { return }
+            guard changed || !requestedInitialReload else { return }
             requestedInitialReload = true
             DispatchQueue.main.async(execute: requestReload)
         } catch {
