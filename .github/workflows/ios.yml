@@ -63,14 +63,17 @@ jobs:
           PY_PATCH
           "$RUNNER_TEMP/xcodegen/bin/xcodegen" generate
           xcodebuild -quiet -project PortholePull.xcodeproj -scheme PortholePull -configuration Debug \
-            -sdk iphonesimulator -destination "generic/platform=iOS Simulator" -derivedDataPath sim-build \
+            -arch arm64 -sdk iphonesimulator -destination "generic/platform=iOS Simulator" -derivedDataPath sim-build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
       - name: Capture Connect on the iPhone simulator
         run: |
           xcrun simctl bootstatus "$PREVIEW_DEVICE" -b
           xcrun simctl ui "$PREVIEW_DEVICE" appearance dark
-          xcrun simctl status_bar "$PREVIEW_DEVICE" override --time '9:41' --dataNetwork wifi --wifiMode active --wifiBars 3 --cellularMode active --cellularBars 4 --batteryState unplugged --batteryLevel 100
-          xcrun simctl install "$PREVIEW_DEVICE" sim-build/Build/Products/Debug-iphonesimulator/Porthole.app
+          app=sim-build/Build/Products/Debug-iphonesimulator/Porthole.app
+          if ! xcrun simctl install "$PREVIEW_DEVICE" "$app"; then
+            codesign --force --deep --sign - "$app"
+            xcrun simctl install "$PREVIEW_DEVICE" "$app"
+          fi
           SIMCTL_CHILD_PORTHOLE_CONTROLS_PREVIEW=1 xcrun simctl launch "$PREVIEW_DEVICE" local.porthole.pull
           sleep 3
           xcrun simctl io "$PREVIEW_DEVICE" screenshot "$RUNNER_TEMP/porthole-connect-iphone-simulator.png"
