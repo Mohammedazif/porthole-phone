@@ -60,6 +60,8 @@ struct ContentView: View {
     @State private var copiedItemID: UUID?
     @State private var actionError: String?
     @State private var selectedTab = 0
+    @State private var editingIPhoneName = false
+    @State private var iPhoneNameDraft = ""
 
     private var visibleUnreadRecordIDs: Set<UUID> {
         guard selectedTab == 1, activityFilter == 0, scenePhase == .active,
@@ -165,6 +167,9 @@ struct ContentView: View {
 
     private var workflowTabs: some View {
         activeTabs
+        .background {
+            BluetoothAutoVerification(client: client, available: activeSheet == nil && lastSheet == nil && actionError == nil)
+        }
         .sheet(item: $activeSheet, onDismiss: sheetDidDismiss) { sheet in
             sheetContent(sheet)
         }
@@ -246,7 +251,7 @@ struct ContentView: View {
             if pairingScreenIsCaptured { pairingBlockedSheet } else { manualEntry }
         case .feature(let feature):
             NavigationStack {
-                ConnectionSettings(feature: feature, client: client, index: index, input: input)
+                ConnectionSettings(feature: feature, client: client, index: index, input: input, verifiesBluetooth: feature == .input)
                     .toolbar {
                         ToolbarItem(placement: .confirmationAction) { Button("Done") { activeSheet = nil } }
                     }
@@ -541,11 +546,11 @@ struct ContentView: View {
 
             VStack(spacing: 0) {
                 if let saved {
-                    pcRow(displayPCName(saved.name), detail: saved.host) { client.connect() }
+                    pcRow(TrustedPeer.computerName(saved.name) ?? saved.host, detail: saved.host) { client.connect() }
                 }
                 ForEach(nearby) { pc in
                     if saved != nil || pc.id != nearby.first?.id { Divider().padding(.leading, 52) }
-                    pcRow(displayPCName(pc.name), detail: pc.address) { prepareManualEntry(host: pc.address) }
+                    pcRow(pc.name, detail: pc.address) { prepareManualEntry(host: pc.address) }
                 }
                 if saved == nil && nearby.isEmpty {
                     Label("Looking for nearby PCs…", systemImage: "wifi")
@@ -580,12 +585,7 @@ struct ContentView: View {
     }
 
     private var deviceTitle: String {
-        displayPCName(client.deviceName.isEmpty ? client.savedPC?.name ?? "" : client.deviceName)
-    }
-
-    private func displayPCName(_ name: String) -> String {
-        let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        return ["", "unknown", "localhost"].contains(clean.lowercased()) ? "Your PC" : clean
+        client.computerName
     }
 
     private var connected: some View {
@@ -765,8 +765,16 @@ struct ContentView: View {
                     .buttonStyle(.plain)
                     .accessibilityHint(isPortholeBroadcasting ? "" : broadcastHelp)
                 } else {
-                    VStack(spacing: 1) {
-                        BroadcastPicker().frame(width: 88, height: 52)
+                    VStack(spacing: 2) {
+                        Image(systemName: "record.circle")
+                            .font(.system(size: 29, weight: .medium))
+                            .frame(width: 88, height: 52)
+                            .accessibilityHidden(true)
+                            .overlay {
+                                BroadcastPicker()
+                                    .opacity(0.02)
+                                    .accessibilityLabel("Share screen")
+                            }
                         Text("Share screen").font(.subheadline.weight(.semibold))
                             .accessibilityHidden(true)
                     }
@@ -810,7 +818,7 @@ struct ContentView: View {
         if client.sharedPairingIssue != nil { return "Screen sharing unavailable in this install." }
         if captured { return "Stop the current recording in Control Center first." }
         if !client.canStartBroadcast { return "Connect to your PC first." }
-        return "Select Start Broadcast. Audio stays on iPhone."
+        return "Select Start Broadcast."
     }
 
     private var broadcastLabel: String {
@@ -866,7 +874,7 @@ struct ContentView: View {
                 let layout = dynamicTypeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 10)) : AnyLayout(HStackLayout(spacing: 10))
                 layout {
                     statCard("Video", "Up to 24 fps")
-                    statCard("Audio", "On iPhone")
+                    statCard("Audio", client.fileSendPeer?.broadcastVersion == 2 ? "On PC" : "On iPhone")
                     statCard("Input", input.mouseConnected && input.keyboardConnected ? "Detected" : "Setup required")
                 }
                 receiveStatus
@@ -1139,6 +1147,17 @@ struct ContentView: View {
                 }
             }
 
+            Section("This iPhone") {
+                Button {
+                    iPhoneNameDraft = client.iPhoneName
+                    editingIPhoneName = true
+                } label: {
+                    LabeledContent {
+                        Text(client.iPhoneName)
+                    } label: { Label("iPhone name", systemImage: "iphone") }
+                }
+            }
+
             Section("Connection features") {
                 NavigationLink {
                     ConnectionSettings(feature: .input, client: client, index: index, input: input)
@@ -1207,6 +1226,16 @@ struct ContentView: View {
         .scrollContentBackground(.hidden)
         .background(phoneBackground)
         .navigationTitle("Settings")
+        .alert("iPhone name", isPresented: $editingIPhoneName) {
+            TextField("Name", text: $iPhoneNameDraft)
+                .textInputAutocapitalization(.words)
+                .autocorrectionDisabled()
+            Button("Save") { client.setIPhoneName(iPhoneNameDraft) }
+                .disabled(iPhoneNameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This name appears on computers connected to this iPhone.")
+        }
     }
 
     private var manualEntry: some View {

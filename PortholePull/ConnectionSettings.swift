@@ -26,8 +26,8 @@ struct ConnectionSettings: View {
     @ObservedObject var client: PullClient
     @ObservedObject var index: PhotoIndex
     @ObservedObject var input: InputDeviceMonitor
+    var verifiesBluetooth = false
     @State private var showingSelectedPhotos = false
-    @State private var showingBluetoothVerification = false
     @State private var choosingOriginal: OriginalSelection?
     @State private var settingsHelp: String?
 
@@ -51,9 +51,7 @@ struct ConnectionSettings: View {
                 index.requestAccessAndIndex(refresh: true)
             }
         }
-        .sheet(isPresented: $showingBluetoothVerification) {
-            VerifyBluetoothView(client: client)
-        }
+        .background { if verifiesBluetooth { BluetoothAutoVerification(client: client, available: true) } }
         .sheet(item: $choosingOriginal) { selection in
             OriginalPicker { identifier in
                 choosingOriginal = nil
@@ -88,9 +86,6 @@ struct ConnectionSettings: View {
                 ))
                 .disabled(!client.inputControlsEnabled)
                 LabeledContent("Status", value: client.inputControlSummary)
-                if client.canVerifyInput {
-                    Button("Verify Bluetooth") { showingBluetoothVerification = true }
-                }
             } header: {
                 Text("PC controls")
             } footer: {
@@ -107,8 +102,6 @@ struct ConnectionSettings: View {
                 Text("Select Set up controls in Porthole on \(client.computerName), then pair in Bluetooth settings.")
             } header: {
                 Text("Bluetooth pairing")
-            } footer: {
-                Text("Verify the Bluetooth connection after pairing.")
             }
             Section {
                 Button("AssistiveTouch settings") { openAccessibilitySettings(dwell: false) }
@@ -233,7 +226,7 @@ struct ClipboardActions: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             ClipboardSendButton(client: client)
-            Text(client.clipStatus.isEmpty ? "Paste to send to your PC." : client.clipStatus)
+            Text(client.clipStatus)
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 12)
@@ -262,12 +255,13 @@ private struct ClipboardPasteControl: UIViewRepresentable {
 
     func makeUIView(context: Context) -> UIPasteControl {
         let configuration = UIPasteControl.Configuration()
-        configuration.displayMode = .iconAndLabel
+        configuration.displayMode = .iconOnly
         configuration.cornerStyle = .capsule
         configuration.baseForegroundColor = .label
         configuration.baseBackgroundColor = .clear
         let control = UIPasteControl(configuration: configuration)
         control.target = context.coordinator
+        control.accessibilityLabel = "Send clipboard"
         return control
     }
 

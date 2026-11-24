@@ -15,6 +15,11 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let forceKey: Bool
     }
 
+    private struct SentPacket {
+        let deadline: DispatchTime
+        let video: Bool
+    }
+
     // Connection state and frame reservations belong to this queue. ReplayKit
     // invokes its handler methods serially, so it owns the encoder and pixel pool.
     private let queue = DispatchQueue(label: "porthole.broadcast")
@@ -31,13 +36,14 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var reconnectAt: DispatchTime?
     private var watchdog: DispatchSourceTimer?
     private var encoding: [UUID: DispatchTime] = [:]
-    private var awaitingACK: [DispatchTime] = []
+    private var awaitingACK: [SentPacket] = []
     private var lastReport: (phase: BroadcastPhase, message: String?, time: DispatchTime)?
     private var lastAcknowledgedFrame: DispatchTime?
     private var firstFrameDeadline: DispatchTime?
     private var ticketDeadline: DispatchTime?
     private var deliveryStopped = false
     private var lostFrames = 0
+    private var audio = BroadcastAudio()
 
     private var session: VTCompressionSession?
     private var sessionWidth = 0
@@ -89,6 +95,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             if !ready { disconnect() }
             report(.reconnecting, message: "Screen sharing paused.")
         }
+        audio = BroadcastAudio()
         resetEncoder()
     }
 
@@ -130,9 +137,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     private func connect() {
         guard active, !paused, !deliveryStopped, link == nil, let peer else { return }
-        guard let current = TrustedPeerStore.load(), current.samePairing(as: peer) else {
+        guard var current = TrustedPeerStore.load(), current.samePairing(as: peer) else {
             fail("The trusted PC changed. Start sharing again from Porthole.")
             return
+        }
+        if current.channelTicket == nil {
+            current.channelTicket = peer.channelTicket
+            current.broadcastVersion = peer.broadcastVersion
         }
         guard current.channelTicket != nil else {
             waitForTicket()
@@ -144,22 +155,24 @@ final class SampleHandler: RPBroadcastSampleHandler {
         reconnectAt = nil
         connectDeadline = .now() + .seconds(8)
         let id = connectionID
-        let connection = TrustedPeerTransport.connection(to: current, port: 47732)
+        let target = current
+        let connection = TrustedPeerTransport.connection(to: target, port: 47732)
         link = connection
         connection.stateUpdateHandler = { [weak self, weak connection] state in
             guard let self, let connection, self.active, self.link === connection,
                   self.connectionID == id else { return }
             switch state {
             case .ready:
-                TrustedPeerTransport.authenticate(connection: connection, peer: current) { [weak self, weak connection] authenticated in
+                TrustedPeerTransport.authenticate(connection: connection, peer: target) { [weak self, weak connection] authenticated in
                     guard let self, let connection, self.active, self.link === connection,
                           self.connectionID == id else { return }
-                    guard authenticated, TrustedPeerStore.load()?.id == current.id,
+                    guard authenticated, TrustedPeerStore.load()?.samePairing(as: target) == true,
                           !TrustedPeerStore.shouldStopBroadcast(peer: peer) else {
                         self.retry("The PC did not authenticate the screen connection.")
                         return
                     }
-                    connection.send(content: Data("PSCR 1\n".utf8), completion: .contentProcessed { [weak self, weak connection] error in
+                    let version = target.broadcastVersion == 2 ? 2 : 1
+                    connection.send(content: Data("PSCR \(version)\n".utf8), completion: .contentProcessed { [weak self, weak connection] error in
                         guard let self, let connection, self.active, self.link === connection,
                               self.connectionID == id else { return }
                         if error != nil {
@@ -190,11 +203,14 @@ final class SampleHandler: RPBroadcastSampleHandler {
                     self.retry("The PC sent an invalid screen acknowledgement.")
                     return
                 }
+                let acknowledgedVideo = self.awaitingACK.prefix(data.count).contains { $0.video }
                 self.awaitingACK.removeFirst(data.count)
                 self.attempts = 0
-                self.firstFrameDeadline = nil
-                self.lastAcknowledgedFrame = .now()
-                if !self.paused { self.report(.live) }
+                if acknowledgedVideo {
+                    self.firstFrameDeadline = nil
+                    self.lastAcknowledgedFrame = .now()
+                    if !self.paused { self.report(.live) }
+                }
             }
             if complete || error != nil {
                 self.retry("The PC closed the screen connection.")
@@ -224,12 +240,12 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private func retry(_ reason: String) {
         disconnect()
         guard active, !paused else { return }
-        guard attempts < 4 else {
+        guard attempts < 8 else {
             fail(reason)
             return
         }
         report(.reconnecting, message: reason)
-        reconnectAt = .now() + .seconds(max(1, attempts))
+        reconnectAt = .now() + .seconds(min(5, max(1, attempts)))
     }
 
     private func startWatchdog() {
@@ -266,12 +282,12 @@ final class SampleHandler: RPBroadcastSampleHandler {
             return
         }
         // A verified screen connection is independent of the foreground companion socket.
-        if !ready, current.channelTicket == nil {
+        if !ready, current.channelTicket == nil, peer.channelTicket == nil {
             if link != nil { disconnect() }
             waitForTicket()
             return
         }
-        if !ready, current.id != peer.id {
+        if !ready, current.channelTicket != nil, current.id != peer.id {
             disconnect()
             attempts = 0
             report(.reconnecting)
@@ -285,7 +301,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let now = DispatchTime.now()
         if let deadline = connectDeadline, now >= deadline {
             retry("Timed out connecting to the paired PC.")
-        } else if let expiry = awaitingACK.first, now >= expiry {
+        } else if let packet = awaitingACK.first, now >= packet.deadline {
             retry("The PC stopped acknowledging screen frames.")
         } else if let expiry = firstFrameDeadline, now >= expiry {
             retry("The PC did not acknowledge the first screen frame.")
@@ -340,6 +356,10 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with type: RPSampleBufferType) {
+        if type == .audioApp {
+            forwardAudio(sampleBuffer)
+            return
+        }
         guard type == .video, let image = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let seconds = CMTimeGetSeconds(timestamp)
@@ -384,7 +404,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private func reserveFrame(forceKey: Bool) -> FrameTicket? {
         // Keep ACKs in flight concurrently, but serialize compression output so
         // asynchronously delivered callbacks cannot reorder H.264 frames.
-        guard active, ready, !paused, encoding.isEmpty, awaitingACK.count < maxOutstanding else { return nil }
+        guard active, ready, !paused, encoding.isEmpty,
+              awaitingACK.lazy.filter(\.video).count < maxOutstanding else { return nil }
         let force = forceKey || needKey
         if force { needKey = true }
         let ticket = FrameTicket(connectionID: connectionID, forceKey: force)
@@ -411,16 +432,33 @@ final class SampleHandler: RPBroadcastSampleHandler {
         }
         lostFrames = 0
         if keyframe { needKey = false }
+        sendPacket(bytes, type: keyframe ? 2 : 1, link: link, id: ticket.connectionID)
+    }
+
+    private func forwardAudio(_ sample: CMSampleBuffer) {
+        let id: UUID? = queue.sync {
+            guard active, ready, !paused, peer?.broadcastVersion == 2,
+                  lastAcknowledgedFrame != nil, awaitingACK.lazy.filter({ !$0.video }).count < 2 else { return nil }
+            return connectionID
+        }
+        guard let id, let bytes = audio.encode(sample) else { return }
+        queue.sync {
+            guard active, ready, !paused, id == connectionID, let link else { return }
+            sendPacket(bytes, type: 3, link: link, id: id)
+        }
+    }
+
+    private func sendPacket(_ bytes: Data, type: UInt8, link: NWConnection, id: UUID) {
         var frame = Data(capacity: bytes.count + 5)
         let length = UInt32(bytes.count).bigEndian
         withUnsafeBytes(of: length) { frame.append(contentsOf: $0) }
-        frame.append(keyframe ? 2 : 1)
+        frame.append(type)
         frame.append(bytes)
-        awaitingACK.append(.now() + .seconds(5))
+        awaitingACK.append(SentPacket(deadline: .now() + .seconds(5), video: type != 3))
         link.send(content: frame, completion: .contentProcessed { [weak self, weak link] error in
-            guard let self, let link, self.link === link, self.connectionID == ticket.connectionID,
+            guard let self, let link, self.link === link, self.connectionID == id,
                   error != nil else { return }
-            self.retry("Could not send screen video to the paired PC.")
+            self.retry("Could not send the broadcast to the paired PC.")
         })
     }
 

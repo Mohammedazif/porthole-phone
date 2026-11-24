@@ -8,6 +8,9 @@ func require(_ condition: Bool, _ message: String) {
 }
 
 let pin = String(repeating: "a1", count: 32)
+require(TrustedPeer.computerName("  Studio-PC ") == "Studio-PC", "Use the computer name")
+require(TrustedPeer.computerName("Your PC") == nil && TrustedPeer.computerName("UNKNOWN") == nil,
+        "Use the network address when an older PC only advertises a placeholder")
 let standardGroup = "group.local.porthole.pull"
 let installerApp = "local.porthole.pull.A1B2C3D4E5"
 for bundleID in [installerApp, installerApp + ".broadcast", installerApp + ".share", installerApp + ".widgets"] {

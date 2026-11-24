@@ -93,11 +93,13 @@ struct NearbyPC: Identifiable, Equatable {
 }
 
 final class PullClient: ObservableObject {
+    private static let iPhoneNameKey = "porthole.iphoneName"
     @Published var status = "Choose a PC or scan its secure connection QR code."
     @Published var address = ""
     @Published private(set) var linked = false
     /// The PC's hostname, as advertised on this Wi-Fi.
     @Published private(set) var deviceName = ""
+    @Published private(set) var customIPhoneName: String?
     @Published private(set) var nearby: [NearbyPC] = []
     @Published private(set) var chosenOriginal = ""
     @Published private(set) var clipStatus = ""
@@ -264,6 +266,8 @@ final class PullClient: ObservableObject {
         .appendingPathComponent("PortholeIncoming", isDirectory: true))
 
     init() {
+        customIPhoneName = UserDefaults.standard.string(forKey: Self.iPhoneNameKey)
+            .flatMap { Self.displayName($0, maxBytes: 63) }
         saveFolderName = fileStorage.folderName
         usesCustomSaveFolder = fileStorage.usesCustomFolder
         clipboardSyncEnabled = clipboardPreference.generation != nil
@@ -277,7 +281,7 @@ final class PullClient: ObservableObject {
         if !inputControlSupported || !inputVerificationSupported { return "PC update required" }
         if !inputSettingsApplied { return "Applying settings" }
         if inputVerificationStatus.inProgress { return "Verifying Bluetooth" }
-        return inputVerificationStatus == .verified ? "Bluetooth verified" : "Verification required"
+        return inputVerificationStatus == .verified ? "Bluetooth verified" : "Waiting for Bluetooth"
     }
 
     var canVerifyInput: Bool {
@@ -423,11 +427,26 @@ final class PullClient: ObservableObject {
         }
     }
 
-    private func sendSystemPhoneName() {
-        let name = Self.displayName(UIDevice.current.name, maxBytes: 63) ?? "iPhone"
+    var iPhoneName: String {
+        customIPhoneName ?? Self.displayName(UIDevice.current.name, maxBytes: 63) ?? "iPhone"
+    }
+
+    func setIPhoneName(_ text: String) {
+        guard let name = Self.displayName(text, maxBytes: 63) else { return }
+        customIPhoneName = name
+        UserDefaults.standard.set(name, forKey: Self.iPhoneNameKey)
+        sendPhoneName()
+    }
+
+    private func sendPhoneName() {
+        let name = iPhoneName
+        let chosen = customIPhoneName != nil
+        guard chosen || name != "iPhone" else { return }
         guard let peer = fileSendPeer else { return }
+        // A second separator distinguishes a chosen name. Older PCs already trim it.
+        let announcement = chosen ? "NAME  \(name)\n" : "NAME \(name)\n"
         queue.async {
-            if self.transportPeer?.id == peer.id { self.send("NAME \(name)\n") }
+            if self.transportPeer?.id == peer.id { self.send(announcement) }
         }
     }
 
@@ -847,12 +866,7 @@ final class PullClient: ObservableObject {
 
     var computerName: String {
         let peer = fileSendPeer ?? savedPC
-        let fallbacks = ["", "your pc", "unknown", "localhost"]
-        for name in [deviceName, peer?.name, peer?.host].compactMap({ $0 }) {
-            let label = name.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !fallbacks.contains(label.lowercased()) { return label }
-        }
-        return "the computer"
+        return TrustedPeer.computerName(deviceName) ?? TrustedPeer.computerName(peer?.name) ?? peer?.host ?? "PC"
     }
 
     /// Callable from any queue; the list lives on the main thread.
@@ -1009,7 +1023,7 @@ final class PullClient: ObservableObject {
                 return
             }
         }
-        clipStatus = "Use Paste to transfer clipboard content to \(computerName)."
+        clipStatus = "Send clipboard to \(computerName)."
     }
 
     private static func discardPendingSends(for peer: TrustedPeer) {
@@ -1238,8 +1252,10 @@ final class PullClient: ObservableObject {
         finder.browseResultsChangedHandler = { [weak self] results, _ in
             var found: [NearbyPC] = []
             for result in results {
-                guard case .service(let name, _, _, _) = result.endpoint else { continue }
+                guard case .service(let instance, _, _, _) = result.endpoint else { continue }
                 guard case .bonjour(let txt) = result.metadata, let addr = txt["addr"], TrustedPeer.validHost(addr) else { continue }
+                let name = TrustedPeer.computerName(txt["name"].flatMap { Self.displayName($0, maxBytes: 63) })
+                    ?? TrustedPeer.computerName(instance) ?? addr
                 found.append(NearbyPC(name: name, address: addr))
             }
             found.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -1403,6 +1419,7 @@ final class PullClient: ObservableObject {
             finishFrameTimer()
             let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
             if !greeted {
+                if rejectPairing(text, peer: peer) { return }
                 if text == "DISCONNECTED" {
                     resetTransport()
                     DispatchQueue.main.async {
@@ -1456,15 +1473,43 @@ final class PullClient: ObservableObject {
         }
     }
 
+    private func rejectPairing(_ line: String, peer: TrustedPeer) -> Bool {
+        let message: String
+        switch line {
+        case "PAIR CODE": message = "That code did not match. Use the current code or scan the QR on \(peer.name)."
+        case "PAIR SAVED": message = "\(peer.name) has a saved pairing. Choose New code on the PC, then scan the QR."
+        case "PAIR CLOSED": message = "Open a new pairing code in Porthole on \(peer.name)."
+        case "PAIR LOCKED": message = "Too many attempts. Generate a fresh code on \(peer.name) or wait one minute."
+        default: return false
+        }
+        let recover = line == "PAIR SAVED" && enrolling
+        resetTransport()
+        DispatchQueue.main.async {
+            guard self.requestedPeer?.id == peer.id else { return }
+            self.connecting = false
+            self.setDisconnected()
+            self.reconnectWork?.cancel()
+            self.reconnectWork = nil
+            if recover, self.reconnectAttempt == 0,
+               PendingPairing.load()?.peer.samePairing(as: peer) == true {
+                // Recover a commit whose PAIRED acknowledgement was lost.
+                self.reconnectAttempt = 1
+                self.connectCurrentPeer()
+            } else {
+                self.status = message
+            }
+        }
+        return true
+    }
+
     private func acceptGreeting(_ line: String, peer: TrustedPeer) -> Bool {
         let fields = line.split(separator: " ")
         guard (2...3).contains(fields.count), fields[0] == "OK",
               TrustedPeer.isChannelTicket(String(fields[1])) else { return false }
         let advertisedName = fields.count == 3 ? Data(base64Encoded: String(fields[2]))
             .flatMap { String(data: $0, encoding: .utf8) }.flatMap { Self.displayName($0, maxBytes: 63) } : nil
-        let names = [advertisedName, peer.name].compactMap { $0 }
-        let name = names.first { !["unknown", "localhost", peer.host.lowercased()].contains($0.lowercased()) }
-        var verified = TrustedPeer(host: peer.host, name: name ?? "Your PC", fingerprint: peer.fingerprint,
+        let name = TrustedPeer.computerName(advertisedName) ?? TrustedPeer.computerName(peer.name) ?? peer.host
+        var verified = TrustedPeer(host: peer.host, name: name, fingerprint: peer.fingerprint,
                                    id: peer.id, pairingID: peer.stableID)
         verified.channelTicket = String(fields[1])
         transportPeer = verified
@@ -1508,11 +1553,11 @@ final class PullClient: ObservableObject {
             self.status = "Connected securely to \(peer.name)."
             self.publishSharedPeer(peer)
             self.publishWidgetPairing()
-            self.sendSystemPhoneName()
+            self.sendPhoneName()
             self.refreshNotificationPermission(promptIfNeeded: true)
         }
         if peer.resumable { send("FILES 2\nFILES 3\n") }
-        send("INBOX?\nIV?\n")
+        send("INBOX?\nIV?\nSCREEN?\n")
         let capabilities = pendingPairingCapabilities
         pendingPairingCapabilities.removeAll()
         for capability in capabilities { handle(capability) }
@@ -1558,6 +1603,17 @@ final class PullClient: ObservableObject {
             }
             return
         }
+        if line == "SCREEN 2" {
+            var capable = peer
+            capable.broadcastVersion = 2
+            transportPeer = capable
+            DispatchQueue.main.async {
+                guard self.fileSendPeer?.id == capable.id else { return }
+                self.fileSendPeer = capable
+                self.publishSharedPeer(capable)
+            }
+            return
+        }
         if line == "INPUT READY" {
             DispatchQueue.main.async {
                 guard self.fileSendPeer?.id == peer.id, !self.inputControlSupported else { return }
@@ -1582,6 +1638,10 @@ final class PullClient: ObservableObject {
                         ? .failed("The Bluetooth connection changed. Try again.")
                         : .required
                     self.endInputVerification(status)
+                    return
+                }
+                if line == "IV VERIFIED", self.inputControlsEnabled {
+                    self.endInputVerification(.verified)
                     return
                 }
                 guard let id = self.inputVerification?.id else { return }
@@ -2267,7 +2327,7 @@ final class PullClient: ObservableObject {
         if let text = board.string, !text.isEmpty { deliverText(text); return }
         if let url = board.url { deliverText(url.absoluteString); return }
         if board.hasStrings || board.hasImages || board.hasURLs {
-            clipStatus = "Use Paste to transfer clipboard content to \(peer.name)."
+            clipStatus = "Send clipboard to \(peer.name)."
             return
         }
         seenCount = board.changeCount

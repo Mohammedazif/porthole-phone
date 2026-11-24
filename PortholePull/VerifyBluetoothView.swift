@@ -1,97 +1,55 @@
 import SwiftUI
 import UIKit
 
-struct VerifyBluetoothView: View {
+struct BluetoothAutoVerification: View {
     @ObservedObject var client: PullClient
-    @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
-    @State private var captureRequested = true
-    @State private var focusFailed = false
+    let available: Bool
+    @State private var captureRequested = false
+
+    private var eligiblePeer: UUID? {
+        guard available, scenePhase == .active, client.inputControlsEnabled,
+              client.inputSettingsApplied, client.inputVerificationSupported,
+              client.inputVerificationStatus != .verified else { return nil }
+        return client.fileSendPeer?.id
+    }
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    switch client.inputVerificationStatus {
-                    case .required, .failed:
-                        idleContent
-                    case .waiting:
-                        ProgressView("Checking Bluetooth")
-                        Text("Keep this screen open while Porthole checks the connection to \(client.deviceName).")
-                    case .confirming:
-                        ProgressView("Confirming with your PC")
-                    case .verified:
-                        Label("Bluetooth verified", systemImage: "checkmark.circle")
-                        if client.inputScreenSharingOnly && client.broadcastStatus?.phase != .live {
-                            Text("Start screen sharing now to use your PC’s mouse and keyboard.")
-                        }
-                    }
-                }
-            }
-            .background {
-                if captureRequested {
-                    VerificationKeyCapture(onFocus: { focused in
-                        guard captureRequested else { return }
-                        if focused, scenePhase == .active, client.canVerifyInput {
-                            client.beginInputVerification()
-                        } else if !focused, client.inputVerificationStatus.inProgress {
-                            client.cancelInputVerification(message: "Bluetooth verification lost focus.")
-                        } else if !client.inputVerificationStatus.inProgress {
-                            captureRequested = false
-                            focusFailed = !focused
-                        }
-                    }, onKey: { client.captureInputVerificationKey($0) })
-                    .accessibilityHidden(true)
-                }
-            }
-            .navigationTitle("Verify Bluetooth")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button {
+        Color.clear.background {
+            if captureRequested {
+                VerificationKeyCapture(onFocus: { focused in
+                    guard captureRequested else { return }
+                    if focused, eligiblePeer != nil, client.canVerifyInput {
+                        client.beginInputVerification()
+                    } else if !focused {
+                        captureRequested = false
                         client.cancelInputVerification()
-                        dismiss()
-                    } label: {
-                        Image(systemName: "xmark")
                     }
-                    .accessibilityLabel(client.inputVerificationStatus.inProgress ? "Cancel" : "Close")
-                }
+                }, onKey: client.captureInputVerificationKey)
             }
         }
-        .interactiveDismissDisabled(captureRequested)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+        .task(id: eligiblePeer) {
+            guard let peer = eligiblePeer else { return }
+            // Let navigation and system Bluetooth dialogs return first responder before checking.
+            try? await Task.sleep(for: .milliseconds(500))
+            while !Task.isCancelled, eligiblePeer == peer {
+                if client.canVerifyInput { captureRequested = true }
+                try? await Task.sleep(for: .seconds(10))
+            }
+        }
         .onChange(of: client.inputVerificationStatus) { _, status in
             if !status.inProgress { captureRequested = false }
         }
-        .onChange(of: scenePhase) { _, phase in
-            if phase != .active {
+        .onChange(of: eligiblePeer) { _, peer in
+            if peer == nil, captureRequested {
                 captureRequested = false
-                client.cancelInputVerification(message: "Bluetooth verification was interrupted.")
+                client.cancelInputVerification()
             }
         }
-        .onDisappear { client.cancelInputVerification() }
-    }
-
-    @ViewBuilder private var idleContent: some View {
-        if captureRequested {
-            ProgressView("Preparing verification")
-        } else {
-            if focusFailed {
-                Text("Could not begin Bluetooth verification.")
-            } else if !client.linked {
-                Text("Reconnect to your PC to verify Bluetooth.")
-            } else if case .failed(let message) = client.inputVerificationStatus {
-                Text(message)
-                Text("Check Bluetooth on your iPhone and make sure PC controls are available in Porthole.")
-                    .foregroundStyle(.secondary)
-            } else {
-                Text("Bluetooth verification is required for PC controls.")
-            }
-            if client.canVerifyInput {
-                Button("Try again") {
-                    focusFailed = false
-                    captureRequested = true
-                }
-            }
+        .onDisappear {
+            if captureRequested { client.cancelInputVerification() }
         }
     }
 }

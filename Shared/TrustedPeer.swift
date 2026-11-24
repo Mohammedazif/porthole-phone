@@ -15,10 +15,17 @@ struct TrustedPeer: Codable, Equatable {
     // Legacy saved records already have an ID. Preserve it when upgrading.
     var pairingID: UUID?
     var inboxVersion: Int?
+    var broadcastVersion: Int?
 
     var stableID: UUID { pairingID ?? id }
     var receiveVersion: Int { inboxVersion == 3 ? 3 : resumable ? 2 : 1 }
     var credentialProfile: String { "\(stableID.uuidString.lowercased())/\(fingerprint)" }
+
+    static func computerName(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !["", "unknown", "localhost", "your pc"].contains(value.lowercased()) else { return nil }
+        return value
+    }
 
     func samePairing(as other: TrustedPeer) -> Bool {
         stableID == other.stableID && fingerprint == other.fingerprint
