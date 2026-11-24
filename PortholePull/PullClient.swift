@@ -255,7 +255,6 @@ final class PullClient: ObservableObject {
         .appendingPathComponent("PortholeIncoming", isDirectory: true))
 
     init() {
-            .flatMap { Self.displayName($0, maxBytes: 63) }
         saveFolderName = fileStorage.folderName
         usesCustomSaveFolder = fileStorage.usesCustomFolder
         clipboardSyncEnabled = clipboardPreference.generation != nil
