@@ -136,6 +136,9 @@ enum TrustedPeerStore {
         return current.resumable && current.channelTicket.map(TrustedPeer.isChannelTicket) == true ? current : nil
     }
 
+    static func broadcastAudioEnabled() -> Bool { read("broadcast-audio.json") ?? false }
+    static func setBroadcastAudioEnabled(_ enabled: Bool) -> Bool { write(enabled, "broadcast-audio.json") }
+
     static func broadcastStatus() -> TrustedBroadcastStatus? { read("broadcast.json") }
     static func publishBroadcast(peer: TrustedPeer?, phase: BroadcastPhase, message: String? = nil) {
         if let peer, load()?.samePairing(as: peer) != true { return }

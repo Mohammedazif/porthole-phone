@@ -44,6 +44,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var deliveryStopped = false
     private var lostFrames = 0
     private var audio = BroadcastAudio()
+    private var audioPreferenceCheckedAt: DispatchTime?
+    private var sendAppAudio = false
 
     private var session: VTCompressionSession?
     private var sessionWidth = 0
@@ -66,6 +68,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private static let maxFrameBytes = 8 * 1024 * 1024
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
+        audioPreferenceCheckedAt = nil
         queue.async {
             self.active = true
             self.paused = false
@@ -357,7 +360,14 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with type: RPSampleBufferType) {
         if type == .audioApp {
-            forwardAudio(sampleBuffer)
+            let now = DispatchTime.now()
+            if audioPreferenceCheckedAt.map({ now >= $0 + .milliseconds(250) }) ?? true {
+                let enabled = TrustedPeerStore.broadcastAudioEnabled()
+                if sendAppAudio && !enabled { audio = BroadcastAudio() }
+                sendAppAudio = enabled
+                audioPreferenceCheckedAt = now
+            }
+            if sendAppAudio { forwardAudio(sampleBuffer) }
             return
         }
         guard type == .video, let image = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }

@@ -60,6 +60,7 @@ struct ContentView: View {
     @State private var copiedItemID: UUID?
     @State private var actionError: String?
     @State private var selectedTab = 0
+    @State private var sendAudioToPC = TrustedPeerStore.broadcastAudioEnabled()
 
     private var visibleUnreadRecordIDs: Set<UUID> {
         guard selectedTab == 1, activityFilter == 0, scenePhase == .active,
@@ -1121,6 +1122,27 @@ struct ContentView: View {
                 } label: {
                     Label("Appearance", systemImage: "circle.lefthalf.filled")
                 }
+            }
+
+            Section {
+                Toggle(isOn: Binding(
+                    get: { sendAudioToPC },
+                    set: { enabled in
+                        guard TrustedPeerStore.setBroadcastAudioEnabled(enabled) else {
+                            actionError = "Porthole couldn’t save your audio setting. Try again."
+                            return
+                        }
+                        sendAudioToPC = enabled
+                    }
+                )) {
+                    Label("Send audio to PC", systemImage: "speaker.wave.2")
+                }
+            } header: {
+                Text("Screen and audio")
+            } footer: {
+                Text(client.linked && client.fileSendPeer?.broadcastVersion != 2
+                     ? "Update Porthole on your PC to receive app audio."
+                     : "Send app audio to your PC while sharing your screen.")
             }
 
             Section("Connection features") {
