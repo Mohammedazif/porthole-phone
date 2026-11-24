@@ -1553,7 +1553,7 @@ final class PullClient: ObservableObject {
             self.status = "Connected securely to \(peer.name)."
             self.publishSharedPeer(peer)
             self.publishWidgetPairing()
-            self.sendSystemPhoneName()
+            self.sendPhoneName()
             self.refreshNotificationPermission(promptIfNeeded: true)
         }
         if peer.resumable { send("FILES 2\nFILES 3\nQUEUE 1\n") }
