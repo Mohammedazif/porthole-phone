@@ -60,8 +60,6 @@ struct ContentView: View {
     @State private var copiedItemID: UUID?
     @State private var actionError: String?
     @State private var selectedTab = 0
-    @State private var editingIPhoneName = false
-    @State private var iPhoneNameDraft = ""
 
     private var visibleUnreadRecordIDs: Set<UUID> {
         guard selectedTab == 1, activityFilter == 0, scenePhase == .active,
@@ -492,34 +490,31 @@ struct ContentView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     VStack(alignment: .leading, spacing: 13) {
-                        ZStack(alignment: .bottomTrailing) {
-                            Image(systemName: "desktopcomputer")
-                                .font(.system(size: 28, weight: .medium))
-                                .frame(width: 72, height: 72)
-                                .background(cardFill, in: RoundedRectangle(cornerRadius: 22))
-                            Circle().fill(.green)
-                                .frame(width: 15, height: 15)
-                                .overlay { Circle().strokeBorder(cardFill, lineWidth: 3) }
-                        }
-                        .accessibilityHidden(true)
-                        .padding(.bottom, 8)
-                        Text("Find your PC").font(.largeTitle.bold())
-                        Text("Open Porthole on your PC.\nKeep both devices on the same Wi-Fi.")
+                        Image(systemName: "desktopcomputer")
+                            .font(.system(size: 28, weight: .medium))
+                            .frame(width: 72, height: 72)
+                            .background(cardFill, in: RoundedRectangle(cornerRadius: 22))
+                            .accessibilityHidden(true)
+                            .padding(.bottom, 8)
+                        Text("Connect to your PC").font(.largeTitle.bold())
+                        Text("Open Porthole on your PC. Connect both devices to the same local network.")
                             .font(.subheadline).foregroundStyle(.secondary)
                     }
                     .id(ConnectionJump.Target.connect)
 
-                    nearbyPCs
+                    if let saved = client.savedPC { savedPCRow(saved) }
                     receiveStatus.id(ConnectionJump.Target.transfer)
                     VStack(spacing: 12) {
                         GlassCapsuleButton(title: "Scan QR code", systemImage: "qrcode.viewfinder",
                                            prominent: true) { openScanner() }
                         GlassCapsuleButton(title: "Connect manually") { prepareManualEntry(host: client.address) }
                     }
-                    Text(client.discoveryMessage)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 12)
+                    if !client.status.isEmpty {
+                        Text(client.status)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 12)
+                    }
                 }
                 .padding(.horizontal, 20)
                 .padding(.vertical, 16)
@@ -528,37 +523,18 @@ struct ContentView: View {
                 scrollConnection(proxy, jump: jump, canShare: false)
             }
         }
-        .onAppear(perform: client.prepare)
         .toolbar(.hidden, for: .navigationBar)
     }
 
-    private var nearbyPCs: some View {
-        let saved = client.savedPC
-        let nearby = client.nearby.filter { $0.address != saved?.host }
-        return VStack(alignment: .leading, spacing: 9) {
-            HStack {
-                Text("Available PCs").textCase(.uppercase).foregroundStyle(.secondary)
-                Spacer()
-                Label("Nearby", systemImage: "wifi").foregroundStyle(.green)
-            }
-            .font(.caption.weight(.medium))
-            .padding(.horizontal, 12)
-
-            VStack(spacing: 0) {
-                if let saved {
-                    pcRow(TrustedPeer.computerName(saved.name) ?? saved.host, detail: saved.host) { client.connect() }
-                }
-                ForEach(nearby) { pc in
-                    if saved != nil || pc.id != nearby.first?.id { Divider().padding(.leading, 52) }
-                    pcRow(pc.name, detail: pc.address) { prepareManualEntry(host: pc.address) }
-                }
-                if saved == nil && nearby.isEmpty {
-                    Label("Looking for nearby PCs…", systemImage: "wifi")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(16)
-                }
+    private func savedPCRow(_ saved: TrustedPeer) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("Saved PC")
+                .font(.caption.weight(.medium))
+                .textCase(.uppercase)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+            pcRow(TrustedPeer.computerName(saved.name) ?? saved.host, detail: saved.host) {
+                client.connectSavedPC()
             }
             .background(cardFill, in: RoundedRectangle(cornerRadius: 22))
         }
@@ -1147,17 +1123,6 @@ struct ContentView: View {
                 }
             }
 
-            Section("This iPhone") {
-                Button {
-                    iPhoneNameDraft = client.iPhoneName
-                    editingIPhoneName = true
-                } label: {
-                    LabeledContent {
-                        Text(client.iPhoneName)
-                    } label: { Label("iPhone name", systemImage: "iphone") }
-                }
-            }
-
             Section("Connection features") {
                 NavigationLink {
                     ConnectionSettings(feature: .input, client: client, index: index, input: input)
@@ -1226,16 +1191,6 @@ struct ContentView: View {
         .scrollContentBackground(.hidden)
         .background(phoneBackground)
         .navigationTitle("Settings")
-        .alert("iPhone name", isPresented: $editingIPhoneName) {
-            TextField("Name", text: $iPhoneNameDraft)
-                .textInputAutocapitalization(.words)
-                .autocorrectionDisabled()
-            Button("Save") { client.setIPhoneName(iPhoneNameDraft) }
-                .disabled(iPhoneNameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This name appears on computers connected to this iPhone.")
-        }
     }
 
     private var manualEntry: some View {

@@ -39,11 +39,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
-	<key>NSBonjourServices</key>
-	<array>
-		<string>_porthole._tcp</string>
-		<string>_porthole-pc._tcp</string>
-	</array>
+	<key>PortholeDeviceNameEntitlementsSuffix</key>
+	<string>$(PORTHOLE_DEVICE_NAME_ENTITLEMENTS_SUFFIX)</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Porthole uses your local network to connect to your PC for screen sharing, file transfers, and clipboard synchronization.</string>
 	<key>NSCameraUsageDescription</key>

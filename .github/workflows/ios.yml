@@ -1,85 +1,181 @@
 name: iPhone app
-on: push
+
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish_preview:
+        description: Publish an unsigned preview release for this build
+        type: boolean
+        default: false
+
 permissions:
   contents: read
+
 jobs:
-  controls-preview:
+  build:
     runs-on: macos-26
-    timeout-minutes: 15
+    timeout-minutes: 90
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+    outputs:
+      artifact_id: ${{ steps.artifact.outputs.artifact-id }}
+      commit: ${{ steps.package.outputs.commit }}
+      version: ${{ steps.package.outputs.version }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Find and boot an iPhone simulator
+      - name: Check Xcode version
         run: |
-          xcrun simctl list --json devices > "$RUNNER_TEMP/devices.json"
-          python3 - "$RUNNER_TEMP/devices.json" >> "$GITHUB_ENV" <<'PY_SIM'
-          import json, sys
-          runtimes = json.load(open(sys.argv[1]))['devices']
-          devices = [d for runtime in sorted(runtimes, reverse=True) for d in runtimes[runtime] if d['isAvailable'] and d['name'].startswith('iPhone')]
-          assert devices, 'No iPhone simulator runtime is available'
-          device = next((d for d in devices if d['name'] == 'iPhone 17 Pro'), devices[0])
-          print('PREVIEW_DEVICE=' + device['udid'])
-          PY_SIM
-      - name: Build a simulator-only preview of the production controls
+          test -d "$DEVELOPER_DIR"
+          xcodebuild -version
+      - name: Run portable checks
+        run: bash scripts/test-settings.sh
+      - name: Generate the Xcode project
+        shell: bash
         run: |
-          xcrun simctl boot "$PREVIEW_DEVICE"
           archive="$RUNNER_TEMP/xcodegen.zip"
           curl -fsSL https://github.com/yonaskolb/XcodeGen/releases/download/2.48.0/xcodegen.zip -o "$archive"
           printf '620c9f0dc10849f94728ab5df52d225ebab8187439dd6fee1925e59e80dff892  %s\n' "$archive" | shasum -a 256 -c -
           unzip -q "$archive" -d "$RUNNER_TEMP"
-          python3 - <<'PY_PATCH'
-          from pathlib import Path
-          client = Path('PortholePull/PullClient.swift')
-          body = client.read_text()
-          start = '    var inputControlSummary: String {'
-          assert body.count(start) == 1
-          client.write_text(body.replace(start, """    func showControlsPreview() {
-                  let peer = TrustedPeer(host: "127.0.0.1", name: "STUDIO-PC",
-                                         fingerprint: String(repeating: "a", count: 64), id: UUID())
-                  fileSendPeer = peer
-                  deviceName = peer.name
-                  sharedPairingReady = true
-                  clipboardLinkReady = true
-                  linked = true
-                  UIPasteboard.general.string = "Porthole preview"
-              }
-
-          """ + start, 1))
-          view = Path('PortholePull/ContentView.swift')
-          body = view.read_text()
-          binding = '            client.bind(index: index)'
-          assert body.count(binding) == 1
-          body = body.replace(binding, """            if ProcessInfo.processInfo.environment["PORTHOLE_CONTROLS_PREVIEW"] == "1" {
-                          client.showControlsPreview()
-                          return
-                      }
-          """ + binding, 1)
-          phase = '        .onChange(of: scenePhase) { _, phase in'
-          assert body.count(phase) == 1
-          view.write_text(body.replace(phase, phase + '\n            guard ProcessInfo.processInfo.environment["PORTHOLE_CONTROLS_PREVIEW"] != "1" else { return }', 1))
-          PY_PATCH
           "$RUNNER_TEMP/xcodegen/bin/xcodegen" generate
-          xcodebuild -quiet -project PortholePull.xcodeproj -scheme PortholePull -configuration Debug \
-            -sdk iphonesimulator -destination "generic/platform=iOS Simulator" -derivedDataPath sim-build \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
-      - name: Capture Connect on the iPhone simulator
+      - name: Build the app and extensions
         run: |
-          xcrun simctl bootstatus "$PREVIEW_DEVICE" -b
-          xcrun simctl ui "$PREVIEW_DEVICE" appearance dark
-          app=sim-build/Build/Products/Debug-iphonesimulator/Porthole.app
-          if ! xcrun simctl install "$PREVIEW_DEVICE" "$app"; then
-            codesign --force --deep --sign - "$app"
-            xcrun simctl install "$PREVIEW_DEVICE" "$app"
-          fi
-          SIMCTL_CHILD_PORTHOLE_CONTROLS_PREVIEW=1 xcrun simctl launch "$PREVIEW_DEVICE" local.porthole.pull
-          sleep 3
-          xcrun simctl io "$PREVIEW_DEVICE" screenshot "$RUNNER_TEMP/porthole-connect-iphone-simulator.png"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+          xcodebuild -project PortholePull.xcodeproj -scheme PortholePull -configuration Release \
+            -sdk iphoneos -destination "generic/platform=iOS" -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            VALIDATE_PRODUCT=NO build
+      - name: Package the unsigned IPA
+        id: package
+        shell: bash
+        run: |
+          app="build/Build/Products/Release-iphoneos/Porthole.app"
+          test -d "$app/PlugIns/PortholeBroadcast.appex"
+          test -d "$app/PlugIns/PortholeShare.appex"
+          test -d "$app/PlugIns/PortholeWidgets.appex"
+          widgets="$app/PlugIns/PortholeWidgets.appex/Info.plist"
+          companion_group=$(/usr/libexec/PlistBuddy -c 'Print :PortholeAppGroup' "$app/Info.plist")
+          widget_group=$(/usr/libexec/PlistBuddy -c 'Print :PortholeWidgetAppGroup' "$app/Info.plist")
+          [[ "$widget_group" == group.* && "$companion_group" != "$widget_group" ]]
+          test "$widget_group" = "$(/usr/libexec/PlistBuddy -c 'Print :PortholeWidgetAppGroup' "$widgets")"
+          test -f "$app/PrivacyInfo.xcprivacy"
+          test -f "$app/PlugIns/PortholeShare.appex/PrivacyInfo.xcprivacy"
+          version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Info.plist")
+          [[ "$version" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]
+          mkdir -p Payload "$RUNNER_TEMP/porthole-package"
+          cp -R "$app" Payload/
+          zip -qry "$RUNNER_TEMP/porthole-package/porthole-${version}.ipa" Payload
+          cp CHANGELOG.md "$RUNNER_TEMP/porthole-package/CHANGELOG.md"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: artifact
         with:
-          name: porthole-connect-iphone-simulator
-          path: ${{ runner.temp }}/porthole-connect-iphone-simulator.png
+          name: porthole-ios-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/porthole-package
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 7
+          compression-level: 0
+      - name: Package the iLoader IPA
+        env:
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import plistlib
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          version = os.environ["VERSION"]
+          source = root / "porthole-package" / f"porthole-{version}.ipa"
+          target = root / f"porthole-iloader-{version}.ipa"
+          app = "Payload/Porthole.app"
+          widget = f"{app}/PlugIns/PortholeWidgets.appex"
+          plists = {f"{app}/Info.plist", f"{widget}/Info.plist",
+                    f"{app}/PlugIns/PortholeBroadcast.appex/Info.plist",
+                    f"{app}/PlugIns/PortholeShare.appex/Info.plist"}
+          with ZipFile(source) as original, ZipFile(target, "w") as package:
+              assert plists <= set(original.namelist())
+              companion_group = plistlib.loads(original.read(f"{app}/Info.plist"))["PortholeAppGroup"]
+              for entry in original.infolist():
+                  data = original.read(entry)
+                  if entry.filename in plists:
+                      info = plistlib.loads(data)
+                      info["PortholeUseInstallerAppGroup"] = True
+                      info["PortholeAppGroup"] = companion_group
+                      info.pop("PortholeWidgetAppGroup", None)
+                      data = plistlib.dumps(info, fmt=plistlib.FMT_BINARY)
+                  package.writestr(entry, data)
+          with ZipFile(target) as package:
+              assert package.testzip() is None
+              for name in plists:
+                  info = plistlib.loads(package.read(name))
+                  assert info["PortholeUseInstallerAppGroup"] is True
+                  assert info["PortholeAppGroup"] == companion_group
+              widget_info = plistlib.loads(package.read(f"{widget}/Info.plist"))
+              assert widget_info["NSExtension"]["NSExtensionPointIdentifier"] == "com.apple.widgetkit-extension"
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: porthole-iloader-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/porthole-iloader-*.ipa
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    needs: build
+    if: >-
+      (github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_preview)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: iphone-release-${{ github.event_name == 'push' && github.ref_name || 'preview' }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: release-files
+      - name: Publish the checked build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BUILD_COMMIT: ${{ needs.build.outputs.commit }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          [[ "$BUILD_COMMIT" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]
+          ipa="release-files/porthole-${VERSION}.ipa"
+          test -s "$ipa"
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            tag="$GITHUB_REF_NAME"
+            [[ "$tag" == v* ]]
+            tag_commit=$(gh api "repos/$GH_REPO/commits/tags/$tag" --jq .sha)
+            if [[ "$tag_commit" != "$BUILD_COMMIT" ]]; then
+              echo "The release tag no longer identifies the commit that was built." >&2
+              exit 1
+            fi
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release upload "$tag" "$ipa"
+            else
+              gh release create "$tag" "$ipa" --verify-tag \
+                --title "Porthole phone ${tag#v}" --notes-file release-files/CHANGELOG.md
+            fi
+          else
+            tag="ios-preview-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            gh api --method POST "repos/$GH_REPO/git/refs" \
+              -f "ref=refs/tags/$tag" -f "sha=$BUILD_COMMIT" --silent
+            gh release create "$tag" "$ipa" --verify-tag --prerelease --latest=false \
+              --title "Porthole phone $VERSION preview (${BUILD_COMMIT:0:12})" \
+              --notes "Unsigned build from commit $BUILD_COMMIT. Sign the app and extensions with the companion and widget App Groups described in the README before testing."
+          fi

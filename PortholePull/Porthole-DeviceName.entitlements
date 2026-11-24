@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>$(PORTHOLE_APP_GROUP)</string>
+        <string>$(PORTHOLE_WIDGET_APP_GROUP)</string>
+    </array>
+    <key>com.apple.developer.device-information.user-assigned-device-name</key>
+    <true/>
+</dict>
+</plist>

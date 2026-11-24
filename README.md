@@ -5,7 +5,7 @@ Porthole connects an iPhone to one verified PC for screen sharing, clipboard syn
 ## Connect and share
 
 1. Open a matching Porthole build on your PC and connect both devices to the same Wi-Fi network.
-2. On the iPhone, scan the secure QR from Porthole on the PC. You can also choose **Connect manually** and enter the PC address, eight-character code, and SHA-256 certificate fingerprint shown on the PC. Available PCs appear when Local Network access is allowed.
+2. On the iPhone, scan the secure QR from Porthole on the PC. You can also choose **Connect manually** and enter the PC address, eight-character code, and SHA-256 certificate fingerprint shown on the PC. Allow Local Network when iOS asks. After pairing, the PC appears under **Saved PC** for reconnecting. If its address changes, use its updated pairing details.
 3. Once the PC is verified, use the broadcast button in **Share screen** and select **Start Broadcast** in the iOS picker. The PC can see the screen and visible notifications while sharing. Audio stays on the iPhone. Use **Stop sharing** and confirm, or stop from Control Center. With the matching desktop build, an active broadcast continues when you switch apps.
 
 Pairing and transport use the pinned PC certificate over TLS 1.3. The companion, screen, and file inbox ports are 47731, 47732, and 47733. The screen and inbox channels require tickets from the currently authenticated companion session. Use the desktop build that implements the [secure companion contract](SECURE-COMPANION.md).

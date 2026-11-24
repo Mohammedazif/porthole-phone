@@ -86,21 +86,12 @@ final class NoticeDelegate: NSObject, UNUserNotificationCenterDelegate {
     }
 }
 
-struct NearbyPC: Identifiable, Equatable {
-    let name: String
-    let address: String
-    var id: String { "\(name) \(address)" }
-}
-
 final class PullClient: ObservableObject {
-    private static let iPhoneNameKey = "porthole.iphoneName"
-    @Published var status = "Choose a PC or scan its secure connection QR code."
+    @Published var status = ""
     @Published var address = ""
     @Published private(set) var linked = false
     /// The PC's hostname, as advertised on this Wi-Fi.
     @Published private(set) var deviceName = ""
-    @Published private(set) var customIPhoneName: String?
-    @Published private(set) var nearby: [NearbyPC] = []
     @Published private(set) var chosenOriginal = ""
     @Published private(set) var clipStatus = ""
     @Published private(set) var clipboardSyncEnabled = true
@@ -207,13 +198,11 @@ final class PullClient: ObservableObject {
     }()
     private let queue = DispatchQueue(label: "porthole.pull")
     private var connection: NWConnection?
-    private var browser: NWBrowser?
-    private var finder: NWBrowser?
-    private var announcer: NWListener?
     private var buffer = Data()
     private var greeted = false
     private var transportPeer: TrustedPeer?
     private var handshakeTimer: DispatchWorkItem?
+    private var waitingForLocalNetwork = false
     private var frameTimer: DispatchWorkItem?
     private var inputReceiptTimer: DispatchWorkItem?
     private var matching = false
@@ -266,7 +255,6 @@ final class PullClient: ObservableObject {
         .appendingPathComponent("PortholeIncoming", isDirectory: true))
 
     init() {
-        customIPhoneName = UserDefaults.standard.string(forKey: Self.iPhoneNameKey)
             .flatMap { Self.displayName($0, maxBytes: 63) }
         saveFolderName = fileStorage.folderName
         usesCustomSaveFolder = fileStorage.usesCustomFolder
@@ -427,24 +415,13 @@ final class PullClient: ObservableObject {
         }
     }
 
-    var iPhoneName: String {
-        customIPhoneName ?? Self.displayName(UIDevice.current.name, maxBytes: 63) ?? "iPhone"
-    }
-
-    func setIPhoneName(_ text: String) {
-        guard let name = Self.displayName(text, maxBytes: 63) else { return }
-        customIPhoneName = name
-        UserDefaults.standard.set(name, forKey: Self.iPhoneNameKey)
-        sendPhoneName()
-    }
-
-    private func sendPhoneName() {
-        let name = iPhoneName
-        let chosen = customIPhoneName != nil
-        guard chosen || name != "iPhone" else { return }
-        guard let peer = fileSendPeer else { return }
-        // A second separator distinguishes a chosen name. Older PCs already trim it.
-        let announcement = chosen ? "NAME  \(name)\n" : "NAME \(name)\n"
+    private func sendSystemPhoneName() {
+        guard let peer = fileSendPeer,
+              let name = Self.displayName(UIDevice.current.name, maxBytes: 63) else { return }
+        let hasNameEntitlement = Bundle.main.object(forInfoDictionaryKey: "PortholeDeviceNameEntitlementsSuffix")
+            as? String == "-DeviceName"
+        guard hasNameEntitlement || name != "iPhone" else { return }
+        let announcement = hasNameEntitlement ? "NAME  \(name)\n" : "NAME \(name)\n"
         queue.async {
             if self.transportPeer?.id == peer.id { self.send(announcement) }
         }
@@ -777,14 +754,6 @@ final class PullClient: ObservableObject {
 
     var savedPC: TrustedPeer? { widgetShortcutPairing }
 
-    var discoveryMessage: String {
-        if connecting || status.hasPrefix("Local Network access is disabled") { return status }
-        if savedPC != nil, !status.hasPrefix("Choose a PC"), !status.hasPrefix("Local Network access enabled") {
-            return status
-        }
-        return "Allow Local Network access to find your PC."
-    }
-
     var widgetShortcutPairing: TrustedPeer? { fileSendPeer?.remembered ?? savedPeer() }
 
     func reconnectForWidgetShortcut(_ peer: TrustedPeer) -> Bool {
@@ -902,7 +871,6 @@ final class PullClient: ObservableObject {
         return flat.count > 60 ? String(flat.prefix(60)) + "…" : flat
     }
 
-    /// Bonjour is what makes iOS show Local Network. A plain TCP connect often does not.
     func loadLocalState() {
         loadSaved()
         publishWidgetPairing()
@@ -943,37 +911,12 @@ final class PullClient: ObservableObject {
         }
     }
 
-    func prepare() {
-        loadLocalState()
-        guard browser == nil else { return }
-        let parameters = NWParameters.tcp
-        let browser = NWBrowser(for: .bonjour(type: "_porthole._tcp", domain: nil), using: parameters)
-        browser.stateUpdateHandler = { [weak self] state in
-            DispatchQueue.main.async { self?.noteBrowse(state) }
-        }
-        browser.start(queue: queue)
-        self.browser = browser
-        startFinder()
-        do {
-            let listener = try NWListener(using: .tcp)
-            listener.service = NWListener.Service(name: "Porthole", type: "_porthole._tcp")
-            listener.newConnectionHandler = { $0.cancel() }
-            listener.stateUpdateHandler = { [weak self] state in
-                DispatchQueue.main.async { self?.noteAnnounce(state) }
-            }
-            listener.start(queue: queue)
-            announcer = listener
-        } catch {
-            show("Unable to request Local Network access.")
-        }
-        show("Allow Local Network access to discover and connect to your PC.")
-    }
-
     func cameForward() {
         foreground = true
         loadLocalState()
         refreshNotificationPermission(promptIfNeeded: linked)
         refreshBroadcastStatus()
+        if linked { sendSystemPhoneName() }
         if !disconnectedByPC, !linked, !connecting, requestedPeer != nil { connect() }
     }
 
@@ -1054,7 +997,7 @@ final class PullClient: ObservableObject {
         UserDefaults.standard.removeObject(forKey: "porthole.code")
         UserDefaults.standard.removeObject(forKey: "porthole.device")
         publishWidgetPairing()
-        status = "Choose a PC or scan its secure connection QR code."
+        status = ""
     }
 
     private func setDisconnected() {
@@ -1075,6 +1018,7 @@ final class PullClient: ObservableObject {
     }
 
     private func resetTransport() {
+        waitingForLocalNetwork = false
         connection?.cancel()
         connection = nil
         transportPeer = nil
@@ -1154,6 +1098,17 @@ final class PullClient: ObservableObject {
         return true
     }
 
+    func connectSavedPC() {
+        guard !connecting, let saved = savedPeer() else { return }
+        if let pending = PendingPairing.load(), !pending.peer.samePairing(as: saved) {
+            PendingPairing.clear(for: pending.peer)
+        }
+        requestedPeer = saved
+        address = saved.host
+        reconnectAttempt = 0
+        connectCurrentPeer()
+    }
+
     func connect() {
         if reconnectAttempt >= 4, let requestedPeer,
            PendingPairing.load()?.peer.samePairing(as: requestedPeer) == true {
@@ -1183,16 +1138,8 @@ final class PullClient: ObservableObject {
             status = "Pair this PC again with its secure QR code."
             return
         }
-        var candidates = [requestedPeer.host]
-        if pending == nil {
-            if let saved = savedPeer(), saved.samePairing(as: requestedPeer) { candidates[0] = saved.host }
-            startFinder()
-            for service in nearby where !candidates.contains(service.address) {
-                candidates.append(service.address)
-            }
-        }
-        let token = credentials[(reconnectAttempt / candidates.count) % credentials.count]
-        let peer = requestedPeer.newSession(host: candidates[reconnectAttempt % candidates.count])
+        let token = credentials[reconnectAttempt % credentials.count]
+        let peer = requestedPeer.newSession(host: requestedPeer.host)
         self.requestedPeer = peer
         reconnectWork?.cancel()
         reconnectWork = nil
@@ -1217,12 +1164,7 @@ final class PullClient: ObservableObject {
                 guard let self, let link, self.connection === link else { return }
                 self.noteLink(state, token: token, peer: peer)
             }
-            let timeout = DispatchWorkItem { [weak self, weak link] in
-                guard let self, let link, self.connection === link, !self.pairingCommitted else { return }
-                self.disconnect(peer, message: "The PC did not complete secure pairing. Check its certificate and connection code.")
-            }
-            self.handshakeTimer = timeout
-            self.queue.asyncAfter(deadline: .now() + 12, execute: timeout)
+            self.armHandshakeTimeout(for: link, peer: peer)
             link.start(queue: self.queue)
         }
     }
@@ -1246,59 +1188,42 @@ final class PullClient: ObservableObject {
         return upgraded
     }
 
-    private func startFinder() {
-        guard finder == nil else { return }
-        let finder = NWBrowser(for: .bonjourWithTXTRecord(type: "_porthole-pc._tcp", domain: nil), using: .tcp)
-        finder.browseResultsChangedHandler = { [weak self] results, _ in
-            var found: [NearbyPC] = []
-            for result in results {
-                guard case .service(let instance, _, _, _) = result.endpoint else { continue }
-                guard case .bonjour(let txt) = result.metadata, let addr = txt["addr"], TrustedPeer.validHost(addr) else { continue }
-                let name = TrustedPeer.computerName(txt["name"].flatMap { Self.displayName($0, maxBytes: 63) })
-                    ?? TrustedPeer.computerName(instance) ?? addr
-                found.append(NearbyPC(name: name, address: addr))
-            }
-            found.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-            DispatchQueue.main.async {
-                self?.nearby = found
-            }
+    private func armHandshakeTimeout(for link: NWConnection, peer: TrustedPeer) {
+        handshakeTimer?.cancel()
+        let waiting = waitingForLocalNetwork
+        let timeout = DispatchWorkItem { [weak self, weak link] in
+            guard let self, let link, self.connection === link, !self.pairingCommitted else { return }
+            let message = waiting
+                ? "Allow Porthole in Settings › Privacy & Security › Local Network, then connect again."
+                : "The PC did not complete secure pairing. Check its address, certificate and connection code."
+            self.disconnect(peer, message: message, retry: !waiting)
         }
-        finder.stateUpdateHandler = { [weak self] state in
-            DispatchQueue.main.async { self?.noteBrowse(state) }
-        }
-        finder.start(queue: queue)
-        self.finder = finder
-    }
-
-    private func noteBrowse(_ state: NWBrowser.State) {
-        if case .waiting(let error) = state, isDenied(error) {
-            show("Local Network access is disabled. Enable Porthole in Settings › Privacy & Security › Local Network.")
-        }
-    }
-
-    private func noteAnnounce(_ state: NWListener.State) {
-        switch state {
-        case .ready:
-            if !linked, !connecting {
-                show("Local Network access enabled. Select a PC or enter its address and connection code.")
-            }
-        case .waiting(let error), .failed(let error):
-            if isDenied(error) {
-                show("Local Network access is disabled. Enable Porthole in Settings › Privacy & Security › Local Network.")
-            }
-        default:
-            break
-        }
+        handshakeTimer = timeout
+        queue.asyncAfter(deadline: .now() + .seconds(waiting ? 60 : 12), execute: timeout)
     }
 
     private func noteLink(_ state: NWConnection.State, token: String, peer: TrustedPeer) {
+        guard let link = connection else { return }
         switch state {
         case .ready:
+            if waitingForLocalNetwork {
+                waitingForLocalNetwork = false
+                armHandshakeTimeout(for: link, peer: peer)
+                DispatchQueue.main.async {
+                    guard self.requestedPeer?.id == peer.id, self.connecting else { return }
+                    self.status = "Connecting to \(peer.name)…"
+                }
+            }
             send("HELLO \(token)\n")
             receive()
-        case .waiting(let error):
-            if isDenied(error) {
-                disconnect(peer, message: "Allow Porthole in Local Network settings to connect.")
+        case .waiting where link.currentPath?.unsatisfiedReason == .localNetworkDenied:
+            if !waitingForLocalNetwork {
+                waitingForLocalNetwork = true
+                armHandshakeTimeout(for: link, peer: peer)
+                DispatchQueue.main.async {
+                    guard self.requestedPeer?.id == peer.id, self.connecting else { return }
+                    self.status = "Allow Local Network access to connect to this PC."
+                }
             }
         case .failed:
             disconnect(peer, message: "Unable to verify or reach this PC. Check that it supports secure pairing and that its certificate is unchanged.")
@@ -1306,7 +1231,7 @@ final class PullClient: ObservableObject {
         }
     }
 
-    private func disconnect(_ peer: TrustedPeer, message: String) {
+    private func disconnect(_ peer: TrustedPeer, message: String, retry: Bool = true) {
         resetTransport()
         DispatchQueue.main.async {
             guard self.requestedPeer?.id == peer.id else { return }
@@ -1316,18 +1241,8 @@ final class PullClient: ObservableObject {
             }
             self.connecting = false
             self.status = message
-            self.scheduleReconnect()
+            if retry { self.scheduleReconnect() }
         }
-    }
-
-    private func isDenied(_ error: NWError) -> Bool {
-        if case .dns(let code) = error, code == -65570 { return true }
-        return false
-    }
-
-    private func show(_ text: String) {
-        if linked || connecting { return }
-        status = text
     }
 
     private func send(_ text: String, queued: (() -> Void)? = nil) {
@@ -1553,7 +1468,7 @@ final class PullClient: ObservableObject {
             self.status = "Connected securely to \(peer.name)."
             self.publishSharedPeer(peer)
             self.publishWidgetPairing()
-            self.sendPhoneName()
+            self.sendSystemPhoneName()
             self.refreshNotificationPermission(promptIfNeeded: true)
         }
         if peer.resumable { send("FILES 2\nFILES 3\nQUEUE 1\n") }
