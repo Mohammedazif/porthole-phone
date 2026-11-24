@@ -1,5 +1,6 @@
 import Accessibility
 import AVFoundation
+import AVKit
 import ImageIO
 import Photos
 import PhotosUI
@@ -41,6 +42,19 @@ private struct BroadcastPicker: UIViewRepresentable {
     }
 
     func updateUIView(_ picker: RPSystemBroadcastPickerView, context: Context) { }
+}
+
+private struct AudioOutputPicker: UIViewRepresentable {
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let picker = AVRoutePickerView()
+        picker.prioritizesVideoDevices = false
+        picker.tintColor = .label
+        picker.activeTintColor = .systemGreen
+        picker.accessibilityLabel = "Choose audio output"
+        return picker
+    }
+
+    func updateUIView(_ picker: AVRoutePickerView, context: Context) { }
 }
 
 struct ContentView: View {
@@ -835,6 +849,21 @@ struct ContentView: View {
         return client.broadcastStatus?.audioSent == true ? "Sending" : "Waiting"
     }
 
+    private var audioOutputRow: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Audio output")
+                    .font(.subheadline.weight(.semibold))
+                Text("Choose Porthole for PC-only audio.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            AudioOutputPicker()
+                .frame(width: 44, height: 44)
+        }
+    }
+
     private var sharingScreen: some View {
         ScrollView {
             VStack(spacing: 22) {
@@ -877,9 +906,13 @@ struct ContentView: View {
                 let layout = dynamicTypeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 10)) : AnyLayout(HStackLayout(spacing: 10))
                 layout {
                     statCard("Video", "Up to 24 fps")
-                    statCard("Audio", broadcastAudioLabel)
+                    statCard("Broadcast audio", broadcastAudioLabel)
                     statCard("Input", input.mouseConnected && input.keyboardConnected ? "Detected" : "Setup required")
                 }
+                audioOutputRow
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .background(cardFill, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                 receiveStatus
                 Text(client.broadcastStatus?.message ?? "Your screen and notifications stay visible until you stop sharing.")
                     .font(.subheadline)
@@ -1161,8 +1194,9 @@ struct ContentView: View {
                         sendAudioToPC = enabled
                     }
                 )) {
-                    Label("Send audio to PC", systemImage: "speaker.wave.2")
+                    Label("Include app audio", systemImage: "speaker.wave.2")
                 }
+                audioOutputRow
             } header: {
                 Text("Screen and audio")
             } footer: {
@@ -1173,7 +1207,7 @@ struct ContentView: View {
                          ? "App audio is being sent to the PC."
                          : "Waiting for app audio. Some apps restrict audio capture.")
                 } else {
-                    Text("Share screen sends app audio to your PC using the same connection.")
+                    Text("Include app audio sends the shared app’s sound to this PC.")
                 }
             }
 
