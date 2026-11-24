@@ -1161,9 +1161,15 @@ struct ContentView: View {
             } header: {
                 Text("Screen and audio")
             } footer: {
-                Text(client.linked && client.fileSendPeer?.broadcastVersion != 2
-                     ? "Update Porthole on your PC to receive app audio."
-                     : "Send app audio to your PC while sharing your screen.")
+                if client.linked && client.fileSendPeer?.broadcastVersion != 2 {
+                    Text("Update Porthole on your PC to receive app audio.")
+                } else if isPortholeBroadcasting && sendAudioToPC {
+                    Text(client.broadcastStatus?.audioSent == true
+                         ? "App audio is being sent to the PC."
+                         : "Waiting for audio from the app you’re sharing.")
+                } else {
+                    Text("Send app audio to your PC while sharing your screen.")
+                }
             }
 
             Section("Connection features") {

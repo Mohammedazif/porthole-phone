@@ -8,7 +8,7 @@ enum TrustedPeerTransport {
 
     /// The fingerprint comes from the desktop QR or an explicit manual entry.
     /// A pinned leaf identifies this peer even on a local IP or with a self-signed cert.
-    static func connection(to peer: TrustedPeer, port: NWEndpoint.Port) -> NWConnection {
+    static func connection(to peer: TrustedPeer, port: NWEndpoint.Port, wifiOnly: Bool = false) -> NWConnection {
         let options = NWProtocolTLS.Options()
         let security = options.securityProtocolOptions
         sec_protocol_options_set_min_tls_protocol_version(security, .TLSv13)
@@ -23,7 +23,9 @@ enum TrustedPeerTransport {
             let presented = digest.map { String(format: "%02x", $0) }.joined()
             complete(presented == fingerprint)
         }, trustQueue)
-        return NWConnection(host: NWEndpoint.Host(peer.host), port: port, using: NWParameters(tls: options, tcp: .init()))
+        let parameters = NWParameters(tls: options, tcp: .init())
+        if wifiOnly { parameters.requiredInterfaceType = .wifi }
+        return NWConnection(host: NWEndpoint.Host(peer.host), port: port, using: parameters)
     }
 
     /// Call once after TLS becomes ready, with the caller's connection deadline active.

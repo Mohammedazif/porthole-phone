@@ -9,14 +9,16 @@ final class BroadcastAudio {
     private var converter: AVAudioConverter?
 
     func encode(_ sample: CMSampleBuffer) -> Data? {
+        let frames = CMSampleBufferGetNumSamples(sample)
         guard let description = CMSampleBufferGetFormatDescription(sample),
               let stream = CMAudioFormatDescriptionGetStreamBasicDescription(description),
               stream.pointee.mFormatID == kAudioFormatLinearPCM,
               let format = AVAudioFormat(streamDescription: stream),
-              (1...2_048).contains(CMSampleBufferGetNumSamples(sample)),
+              (1...8192).contains(frames), (8000...192000).contains(format.sampleRate),
               let input = AVAudioPCMBuffer(pcmFormat: format,
-                                           frameCapacity: AVAudioFrameCount(CMSampleBufferGetNumSamples(sample))),
-              let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: 2_048) else { return nil }
+                                           frameCapacity: AVAudioFrameCount(frames)) else { return nil }
+        let capacity = AVAudioFrameCount(ceil(Double(frames) * outputFormat.sampleRate / format.sampleRate)) + 32
+        guard let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else { return nil }
         input.frameLength = input.frameCapacity
         guard CMSampleBufferCopyPCMDataIntoAudioBufferList(sample, at: 0, frameCount: Int32(input.frameLength),
                                                           into: input.mutableAudioBufferList) == noErr else { return nil }

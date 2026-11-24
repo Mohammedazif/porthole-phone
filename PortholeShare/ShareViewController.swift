@@ -94,7 +94,7 @@ final class ShareViewController: UIViewController {
         guard !started else { return }
         started = true
         guard TrustedPeerStore.available else {
-            status.text = "Share is unavailable in this install. Use Send files in Porthole."
+            status.text = "This install did not grant Share access to the Porthole App Group."
             finished = true
             configureButton("Done", enabled: true)
             return
@@ -238,6 +238,7 @@ private final class ShareTransfer {
     private let queue = DispatchQueue(label: "porthole.share")
     private let preparation = Preparation()
     private var connection: NWConnection?
+    private var savedPCSearch: SavedPCConnection?
     private var deadline: DispatchWorkItem?
     private var activeHandle: FileHandle?
     private var files: [Item] = []
@@ -267,7 +268,7 @@ private final class ShareTransfer {
 
     func send() {
         queue.async {
-            guard !self.stopped, self.connection == nil else { return }
+            guard !self.stopped, self.connection == nil, self.savedPCSearch == nil else { return }
             guard !self.files.contains(where: { $0.bytes > TransferStaging.desktopFileBytes }) else {
                 self.fail(TransferStaging.Failure.desktopFileLimit.localizedDescription, retry: false)
                 return
@@ -418,39 +419,52 @@ private final class ShareTransfer {
     private func connect(to peer: TrustedPeer, version: Int) {
         batch = files.indices.filter { !acknowledged.contains($0) }
         if batch.isEmpty { sent(sessionClosed: true); return }
-        let link = TrustedPeerTransport.connection(to: peer, port: 47733)
+        let search = SavedPCConnection(peer: peer, port: 47733, queue: queue)
+        savedPCSearch = search
+        updateStatus("Finding \(peer.name) on Wi-Fi…", progress: Double(acknowledged.count) / Double(files.count))
+        search.start { [weak self] result in
+            guard let self, !self.stopped else { return }
+            self.savedPCSearch = nil
+            switch result {
+            case .success(let destination):
+                self.sendBatch(to: destination.peer, on: destination.link, version: version)
+            case .failure(.localNetworkDenied):
+                self.fail("Allow Porthole in Settings › Privacy & Security › Local Network.")
+            case .failure(.unavailable):
+                self.fail("Could not reach \(peer.name). Keep Porthole running on the PC and connect both devices to the same Wi-Fi network.")
+            }
+        }
+    }
+
+    private func sendBatch(to peer: TrustedPeer, on link: NWConnection, version: Int) {
         connection = link
         buffer = Data()
-        updateStatus("Connecting to \(peer.name)…", progress: Double(acknowledged.count) / Double(files.count))
         armTimeout(link)
         link.stateUpdateHandler = { [weak self, weak link] state in
             guard let self, let link, self.connection === link else { return }
             switch state {
-            case .ready:
-                self.armTimeout(link)
-                TrustedPeerTransport.authenticate(connection: link, peer: peer) { authorized in
-                    self.queue.async {
-                        guard self.connection === link else { return }
-                        guard authorized else {
-                            self.fail("Open Porthole on the PC and confirm this iPhone is the selected device.")
-                            return
-                        }
-                        guard TrustedPeerStore.load()?.samePairing(as: peer) == true else {
-                            self.fail("The paired PC changed before the transfer started.", retry: false)
-                            return
-                        }
-                        self.write(Data("PSHR \(version) \(self.batch.count)\n".utf8), on: link) {
-                            self.sendFile(at: 0, on: link)
-                        }
-                    }
-                }
             case .failed, .cancelled:
                 self.fail("The secure connection to \(peer.name) ended.")
             default:
                 break
             }
         }
-        link.start(queue: queue)
+        TrustedPeerTransport.authenticate(connection: link, peer: peer) { authorized in
+            self.queue.async {
+                guard self.connection === link else { return }
+                guard authorized else {
+                    self.fail("The PC rejected this pairing. Check that this iPhone is selected in Porthole on the PC.")
+                    return
+                }
+                guard TrustedPeerStore.load()?.samePairing(as: peer) == true else {
+                    self.fail("The paired PC changed before the transfer started.", retry: false)
+                    return
+                }
+                self.write(Data("PSHR \(version) \(self.batch.count)\n".utf8), on: link) {
+                    self.sendFile(at: 0, on: link)
+                }
+            }
+        }
     }
 
     private func sendFile(at cursor: Int, on link: NWConnection) {
@@ -595,6 +609,8 @@ private final class ShareTransfer {
     }
 
     private func disconnect() {
+        savedPCSearch?.cancel()
+        savedPCSearch = nil
         deadline?.cancel(); deadline = nil
         let link = connection
         connection = nil

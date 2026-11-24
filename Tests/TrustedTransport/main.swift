@@ -12,6 +12,21 @@ require(TrustedPeer.computerName("  Studio-PC ") == "Studio-PC", "Use the comput
 require(TrustedPeer.computerName("Your PC") == nil && TrustedPeer.computerName("UNKNOWN") == nil,
         "Use the network address when an older PC only advertises a placeholder")
 let standardGroup = "group.local.porthole.pull"
+let profileGroup = standardGroup + ".A1B2C3D4E5"
+let xml = try PropertyListSerialization.data(
+    fromPropertyList: ["Entitlements": ["com.apple.security.application-groups": [profileGroup]]],
+    format: .xml, options: 0)
+require(PortholeAppGroup.appGroups(inProvisioningProfile: Data([0x30, 0x80]) + xml + Data([0, 0])) == [profileGroup],
+        "Read the provisioned app group from an embedded signing profile")
+require(PortholeAppGroup.appGroups(inProvisioningProfile: Data([0, 1, 2])).isEmpty,
+        "Ignore a missing or unsupported signing profile")
+let alternatives = SavedPCLAN.alternateAddresses(for: "192.168.0.50", localAddresses: ["192.168.0.49"])
+require(Array(alternatives.prefix(3)) == ["192.168.0.51", "192.168.0.48", "192.168.0.52"],
+        "Try the saved PC's closest alternate addresses, excluding the phone")
+require(SavedPCLAN.alternateAddresses(for: "192.168.0.50", localAddresses: ["192.168.1.49"]).isEmpty,
+        "Only recover an address in the saved network range")
+require(SavedPCLAN.alternateAddresses(for: "desk.local", localAddresses: ["192.168.0.51"]).isEmpty,
+        "Do not scan a subnet when the saved hostname uses DNS")
 let installerApp = "local.porthole.pull.A1B2C3D4E5"
 for bundleID in [installerApp, installerApp + ".broadcast", installerApp + ".share", installerApp + ".widgets"] {
     require(PortholeAppGroup.installerGroup(for: bundleID, configuredGroup: standardGroup) == "group." + installerApp,

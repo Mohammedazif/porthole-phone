@@ -37,8 +37,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var watchdog: DispatchSourceTimer?
     private var encoding: [UUID: DispatchTime] = [:]
     private var awaitingACK: [SentPacket] = []
-    private var lastReport: (phase: BroadcastPhase, message: String?, time: DispatchTime)?
+    private var lastReport: (phase: BroadcastPhase, message: String?, audioSent: Bool, time: DispatchTime)?
     private var lastAcknowledgedFrame: DispatchTime?
+    private var lastAcknowledgedAudio: DispatchTime?
     private var firstFrameDeadline: DispatchTime?
     private var ticketDeadline: DispatchTime?
     private var deliveryStopped = false
@@ -204,12 +205,17 @@ final class SampleHandler: RPBroadcastSampleHandler {
                     return
                 }
                 let acknowledgedVideo = self.awaitingACK.prefix(data.count).contains { $0.video }
+                if self.awaitingACK.prefix(data.count).contains(where: { !$0.video }) {
+                    self.lastAcknowledgedAudio = .now()
+                }
                 self.awaitingACK.removeFirst(data.count)
                 self.attempts = 0
                 if acknowledgedVideo {
                     self.firstFrameDeadline = nil
                     self.lastAcknowledgedFrame = .now()
                     if !self.paused { self.report(.live) }
+                } else if let report = self.lastReport, report.phase == .live {
+                    self.report(.live)
                 }
             }
             if complete || error != nil {
@@ -230,6 +236,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         firstFrameDeadline = nil
         reconnectAt = nil
         lastAcknowledgedFrame = nil
+        lastAcknowledgedAudio = nil
         lostFrames = 0
         encoding.removeAll()
         awaitingACK.removeAll()
@@ -323,10 +330,11 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     private func report(_ phase: BroadcastPhase, message: String? = nil) {
         let now = DispatchTime.now()
-        if let lastReport, lastReport.phase == phase, lastReport.message == message,
+        let audioSent = lastAcknowledgedAudio.map { now < $0 + .seconds(2) } ?? false
+        if let lastReport, lastReport.phase == phase, lastReport.message == message, lastReport.audioSent == audioSent,
            now < lastReport.time + .seconds(2) { return }
-        lastReport = (phase, message, now)
-        TrustedPeerStore.publishBroadcast(peer: peer, phase: phase, message: message)
+        lastReport = (phase, message, audioSent, now)
+        TrustedPeerStore.publishBroadcast(peer: peer, phase: phase, message: message, audioSent: audioSent)
     }
 
     private func stopRequestedBroadcast() {
@@ -446,13 +454,17 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private func forwardAudio(_ sample: CMSampleBuffer) {
         let id: UUID? = queue.sync {
             guard active, ready, !paused, peer?.broadcastVersion == 2,
-                  lastAcknowledgedFrame != nil, awaitingACK.lazy.filter({ !$0.video }).count < 2 else { return nil }
+                  lastAcknowledgedFrame != nil, awaitingACK.lazy.filter({ !$0.video }).count < 8 else { return nil }
             return connectionID
         }
         guard let id, let bytes = audio.encode(sample) else { return }
         queue.sync {
             guard active, ready, !paused, id == connectionID, let link else { return }
-            sendPacket(bytes, type: 3, link: link, id: id)
+            let available = 8 - awaitingACK.lazy.filter({ !$0.video }).count
+            for start in stride(from: 0, to: bytes.count, by: 8192).prefix(available) {
+                let part = bytes.subdata(in: start..<min(start + 8192, bytes.count))
+                sendPacket(part, type: 3, link: link, id: id)
+            }
         }
     }
 

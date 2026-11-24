@@ -35,6 +35,16 @@ struct TrustedPeer: Codable, Equatable {
         TrustedPeer(host: host, name: name, fingerprint: fingerprint, id: UUID(), pairingID: stableID)
     }
 
+    func reached(at host: String) -> TrustedPeer {
+        var peer = TrustedPeer(host: host, name: name == self.host ? host : name,
+                               fingerprint: fingerprint, id: id, pairingID: stableID)
+        peer.resumable = resumable
+        peer.channelTicket = channelTicket
+        peer.inboxVersion = inboxVersion
+        peer.broadcastVersion = broadcastVersion
+        return peer
+    }
+
     var remembered: TrustedPeer {
         TrustedPeer(host: host, name: name, fingerprint: fingerprint, id: stableID, pairingID: stableID)
     }
@@ -110,6 +120,7 @@ struct TrustedBroadcastStatus: Codable, Equatable {
     let phase: BroadcastPhase
     let message: String?
     let updatedAt: Date
+    var audioSent: Bool?
 }
 
 enum TrustedPeerStore {
@@ -162,9 +173,11 @@ enum TrustedPeerStore {
     static func setBroadcastAudioEnabled(_ enabled: Bool) -> Bool { write(enabled, "broadcast-audio.json") }
 
     static func broadcastStatus() -> TrustedBroadcastStatus? { read("broadcast.json") }
-    static func publishBroadcast(peer: TrustedPeer?, phase: BroadcastPhase, message: String? = nil) {
+    static func publishBroadcast(peer: TrustedPeer?, phase: BroadcastPhase, message: String? = nil,
+                                 audioSent: Bool? = nil) {
         if let peer, load()?.samePairing(as: peer) != true { return }
-        write(TrustedBroadcastStatus(peerID: peer?.stableID, phase: phase, message: message, updatedAt: Date()), "broadcast.json")
+        write(TrustedBroadcastStatus(peerID: peer?.stableID, phase: phase, message: message,
+                                     updatedAt: Date(), audioSent: audioSent), "broadcast.json")
     }
 
     static func requestBroadcastStop(peer: TrustedPeer) -> Bool {

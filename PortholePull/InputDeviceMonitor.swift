@@ -5,6 +5,8 @@ import SwiftUI
 final class InputDeviceMonitor: ObservableObject {
     @Published private(set) var mouseConnected = false
     @Published private(set) var keyboardConnected = false
+    @Published private(set) var mouseNames: [String] = []
+    @Published private(set) var keyboardName: String?
     private var observers: [NSObjectProtocol] = []
 
     init() {
@@ -31,7 +33,13 @@ final class InputDeviceMonitor: ObservableObject {
     }
 
     func refresh() {
-        mouseConnected = !GCMouse.mice().isEmpty
-        keyboardConnected = GCKeyboard.coalesced != nil
+        let mice = GCMouse.mice()
+        let keyboard = GCKeyboard.coalesced
+        mouseConnected = !mice.isEmpty
+        keyboardConnected = keyboard != nil
+        mouseNames = mice.compactMap { $0.vendorName?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let name = keyboard?.vendorName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        keyboardName = name?.isEmpty == false ? name : nil
     }
 }

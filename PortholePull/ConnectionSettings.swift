@@ -93,8 +93,10 @@ struct ConnectionSettings: View {
                 }
             }
             Section("Input devices on iPhone") {
-                LabeledContent("Mouse", value: input.mouseConnected ? "Connected" : "Not detected")
-                LabeledContent("Keyboard", value: input.keyboardConnected ? "Connected" : "Not detected")
+                LabeledContent("Mouse", value: input.mouseNames.isEmpty
+                               ? (input.mouseConnected ? "Connected" : "Not detected")
+                               : input.mouseNames.joined(separator: ", "))
+                LabeledContent("Keyboard", value: input.keyboardName ?? (input.keyboardConnected ? "Connected" : "Not detected"))
                 Button("Refresh device status") { input.refresh() }
             }
             Section {

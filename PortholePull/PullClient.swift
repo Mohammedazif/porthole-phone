@@ -106,6 +106,7 @@ final class PullClient: ObservableObject {
     private var acceptedClipboardGeneration: Int?
     private var clipboardReceiptTimer: DispatchWorkItem?
     private var pairingKey: String?
+    private var savedPCSearch: SavedPCConnection?
     private var pairingCommitted = false
     private var enrolling = false
     private var pendingPairingCapabilities: [String] = []
@@ -979,6 +980,8 @@ final class PullClient: ObservableObject {
     }
 
     private func resetTransport() {
+        savedPCSearch?.cancel()
+        savedPCSearch = nil
         waitingForLocalNetwork = false
         connection?.cancel()
         connection = nil
@@ -1100,6 +1103,7 @@ final class PullClient: ObservableObject {
             return
         }
         let token = credentials[reconnectAttempt % credentials.count]
+        let recoverAddress = reconnectAttempt <= 1 || reconnectAttempt % 4 == 0
         let peer = requestedPeer.newSession(host: requestedPeer.host)
         self.requestedPeer = peer
         reconnectWork?.cancel()
@@ -1119,15 +1123,39 @@ final class PullClient: ObservableObject {
                 return
             }
             self.transportPeer = peer
-            let link = TrustedPeerTransport.connection(to: peer, port: 47731)
-            self.connection = link
-            link.stateUpdateHandler = { [weak self, weak link] state in
-                guard let self, let link, self.connection === link else { return }
-                self.noteLink(state, token: token, peer: peer)
+            if savedKey != nil {
+                let search = SavedPCConnection(peer: peer, port: 47731, queue: self.queue,
+                                               recoverAddress: recoverAddress)
+                self.savedPCSearch = search
+                search.start { [weak self] result in
+                    guard let self else { return }
+                    self.savedPCSearch = nil
+                    switch result {
+                    case .success(let destination):
+                        self.openTransport(destination.link, to: destination.peer, token: token, ready: true)
+                    case .failure(.localNetworkDenied):
+                        self.disconnect(peer, message: "Allow Porthole in Settings › Privacy & Security › Local Network, then connect again.", retry: false)
+                    case .failure(.unavailable):
+                        self.disconnect(peer, message: "Could not reach the saved PC. Check that Porthole is running and both devices are on the same Wi-Fi network.")
+                    }
+                }
+            } else {
+                let link = TrustedPeerTransport.connection(to: peer, port: 47731)
+                self.openTransport(link, to: peer, token: token, ready: false)
             }
-            self.armHandshakeTimeout(for: link, peer: peer)
-            link.start(queue: self.queue)
         }
+    }
+
+    private func openTransport(_ link: NWConnection, to peer: TrustedPeer, token: String, ready: Bool) {
+        transportPeer = peer
+        connection = link
+        link.stateUpdateHandler = { [weak self, weak link] state in
+            guard let self, let link, self.connection === link else { return }
+            self.noteLink(state, token: token, peer: peer)
+        }
+        armHandshakeTimeout(for: link, peer: peer)
+        if ready { noteLink(.ready, token: token, peer: peer) }
+        else { link.start(queue: queue) }
     }
 
     private func savedPeer() -> TrustedPeer? {
@@ -1426,6 +1454,7 @@ final class PullClient: ObservableObject {
                 PendingPairing.clear(for: previous)
             }
             self.reconnectAttempt = 0
+            self.requestedPeer = peer
             self.connecting = false
             self.fileSendPeer = peer
             self.deviceName = peer.name

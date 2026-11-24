@@ -34,6 +34,7 @@ swiftc -swift-version 5 \
 swiftc -swift-version 5 \
     "$task_root/Shared/PortholeAppGroup.swift" \
     "$task_root/Shared/TrustedPeer.swift" \
+    "$task_root/Shared/SavedPCConnection.swift" \
     "$task_root/Shared/OutboundTransferJournal.swift" \
     "$task_root/PortholePull/ShareReceiptJournal.swift" \
     "$task_root/PortholePull/ReceivedFileStorage.swift" \
