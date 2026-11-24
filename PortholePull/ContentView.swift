@@ -9,14 +9,34 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
+private final class BroadcastPickerTrigger: ObservableObject {
+    static let extensionIdentifier: String? = {
+        guard let url = Bundle.main.builtInPlugInsURL?.appendingPathComponent("PortholeBroadcast.appex"),
+              let bundle = Bundle(url: url),
+              let info = bundle.object(forInfoDictionaryKey: "NSExtension") as? [String: Any],
+              info["NSExtensionPointIdentifier"] as? String == "com.apple.broadcast-services-upload" else { return nil }
+        return bundle.bundleIdentifier
+    }()
+
+    weak var picker: RPSystemBroadcastPickerView?
+
+    func present() -> Bool {
+        guard let picker, picker.window != nil,
+              let button = picker.subviews.compactMap({ $0 as? UIButton }).first,
+              button.isEnabled else { return false }
+        button.sendActions(for: .touchUpInside)
+        return true
+    }
+}
+
 private struct BroadcastPicker: UIViewRepresentable {
+    let trigger: BroadcastPickerTrigger
+
     func makeUIView(context: Context) -> RPSystemBroadcastPickerView {
-        let picker = RPSystemBroadcastPickerView(frame: CGRect(x: 0, y: 0, width: 88, height: 52))
-        // The broadcast extension uses the containing app's bundle identifier plus this suffix.
-        picker.preferredExtension = (Bundle.main.bundleIdentifier ?? "local.porthole.pull") + ".broadcast"
+        let picker = RPSystemBroadcastPickerView(frame: CGRect(x: 0, y: 0, width: 44, height: 44))
+        picker.preferredExtension = BroadcastPickerTrigger.extensionIdentifier
         picker.showsMicrophoneButton = false
-        picker.overrideUserInterfaceStyle = .dark
-        picker.tintColor = .white
+        trigger.picker = picker
         return picker
     }
 
@@ -25,6 +45,7 @@ private struct BroadcastPicker: UIViewRepresentable {
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
+    @StateObject private var broadcastPicker = BroadcastPickerTrigger()
     @StateObject private var index = PhotoIndex()
     @StateObject private var client = PullClient()
     @StateObject private var input = InputDeviceMonitor()
@@ -166,6 +187,13 @@ struct ContentView: View {
 
     private var workflowTabs: some View {
         activeTabs
+        .background(alignment: .topLeading) {
+            BroadcastPicker(trigger: broadcastPicker)
+                .frame(width: 44, height: 44)
+                .opacity(0.02)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
         .background {
             BluetoothAutoVerification(client: client, available: activeSheet == nil && lastSheet == nil && actionError == nil)
         }
@@ -534,20 +562,21 @@ struct ContentView: View {
                 .textCase(.uppercase)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 12)
-            pcRow(TrustedPeer.computerName(saved.name) ?? saved.host, detail: saved.host) {
+            pcRow(TrustedPeer.computerName(saved.name) ?? saved.host,
+                  detail: saved.name == saved.host ? nil : saved.host) {
                 client.connectSavedPC()
             }
             .background(cardFill, in: RoundedRectangle(cornerRadius: 22))
         }
     }
 
-    private func pcRow(_ title: String, detail: String, action: @escaping () -> Void) -> some View {
+    private func pcRow(_ title: String, detail: String?, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 13) {
                 Image(systemName: "desktopcomputer").frame(width: 24)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(title).font(.subheadline.weight(.semibold))
-                    Text(detail).font(.footnote).foregroundStyle(.secondary)
+                    if let detail { Text(detail).font(.footnote).foregroundStyle(.secondary) }
                 }
                 Spacer(minLength: 4)
                 Text("Connect").font(.footnote).foregroundStyle(.secondary)
@@ -728,35 +757,16 @@ struct ContentView: View {
     }
 
     private func shareStage(height: CGFloat) -> some View {
-        let available = client.canStartBroadcast && !captured
         let diameter = min(218, max(122, height - 82))
         return VStack(spacing: 10) {
-            PortholeLens(diameter: diameter) {
-                if isPortholeBroadcasting || !available {
-                    Button {
-                        if isPortholeBroadcasting { hideSharing = false }
-                        else { actionError = client.sharedPairingIssue ?? broadcastHelp }
-                    } label: {
-                        shareLensLabel(active: isPortholeBroadcasting)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityHint(isPortholeBroadcasting ? "" : broadcastHelp)
-                } else {
-                    VStack(spacing: 2) {
-                        Image(systemName: "record.circle")
-                            .font(.system(size: 29, weight: .medium))
-                            .frame(width: 88, height: 52)
-                            .accessibilityHidden(true)
-                            .overlay {
-                                BroadcastPicker()
-                                    .opacity(0.02)
-                                    .accessibilityLabel("Share screen")
-                            }
-                        Text("Share screen").font(.subheadline.weight(.semibold))
-                            .accessibilityHidden(true)
-                    }
+            Button(action: activateShareScreen) {
+                PortholeLens(diameter: diameter) {
+                    shareLensLabel(active: isPortholeBroadcasting)
                 }
+                .contentShape(Circle())
             }
+            .buttonStyle(.plain)
+            .accessibilityHint(broadcastHelp)
             .foregroundStyle(.white)
             .environment(\.colorScheme, .dark)
             Text(broadcastHelp)
@@ -778,8 +788,8 @@ struct ContentView: View {
 
     private func shareLensLabel(active: Bool) -> some View {
         VStack(spacing: 5) {
-            Image(systemName: active ? "rectangle.on.rectangle" : "arrow.up.square")
-                .font(.title3.weight(.medium))
+            Image(systemName: active ? "rectangle.on.rectangle" : "record.circle")
+                .font(.system(size: 29, weight: .medium))
                 .accessibilityHidden(true)
             Text(active ? "Show broadcast" : "Share screen").font(.subheadline.weight(.semibold))
                 .multilineTextAlignment(.center)
@@ -788,10 +798,21 @@ struct ContentView: View {
         .contentShape(Rectangle())
     }
 
+    private func activateShareScreen() {
+        if isPortholeBroadcasting {
+            hideSharing = false
+        } else if captured || BroadcastPickerTrigger.extensionIdentifier == nil || !client.canStartBroadcast {
+            actionError = client.sharedPairingIssue ?? broadcastHelp
+        } else if !broadcastPicker.present() {
+            actionError = "In Control Center, touch and hold Screen Recording, then choose Porthole."
+        }
+    }
+
     private var broadcastHelp: String {
         if deliveryStopped { return "Finish in Control Center." }
         if isPortholeBroadcasting { return "View or stop screen sharing." }
         if let status = client.broadcastStatus, status.phase == .failed, let message = status.message { return message }
+        if BroadcastPickerTrigger.extensionIdentifier == nil { return "This install is missing the Broadcast extension." }
         if client.sharedPairingIssue != nil { return "Screen sharing unavailable in this install." }
         if captured { return "Stop the current recording in Control Center first." }
         if !client.canStartBroadcast { return "Connect to your PC first." }

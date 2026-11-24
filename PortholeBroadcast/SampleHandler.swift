@@ -77,8 +77,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
             self.lastReport = nil
             self.ticketDeadline = nil
             self.attempts = 0
-            guard let peer = TrustedPeerStore.load(), let ticket = peer.channelTicket,
-                  TrustedPeer.isChannelTicket(ticket) else {
+            guard let pairing = TrustedPeerStore.load(),
+                  let peer = TrustedPeerStore.broadcastPeer(matching: pairing) else {
                 self.fail("Pair with a trusted PC in Porthole before sharing your screen.")
                 return
             }
@@ -144,10 +144,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             fail("The trusted PC changed. Start sharing again from Porthole.")
             return
         }
-        if current.channelTicket == nil {
-            current.channelTicket = peer.channelTicket
-            current.broadcastVersion = peer.broadcastVersion
-        }
+        current = TrustedPeerStore.broadcastPeer(matching: current) ?? peer
         guard current.channelTicket != nil else {
             waitForTicket()
             return
@@ -280,17 +277,18 @@ final class SampleHandler: RPBroadcastSampleHandler {
             stopRequestedBroadcast()
             return
         }
-        guard let current = TrustedPeerStore.load(), current.samePairing(as: peer) else {
+        guard let pairing = TrustedPeerStore.load(), pairing.samePairing(as: peer) else {
             fail("The trusted PC changed. Start sharing again from Porthole.")
             return
         }
+        let current = TrustedPeerStore.broadcastPeer(matching: pairing) ?? pairing
         // A verified screen connection is independent of the foreground companion socket.
         if !ready, current.channelTicket == nil, peer.channelTicket == nil {
             if link != nil { disconnect() }
             waitForTicket()
             return
         }
-        if !ready, current.channelTicket != nil, current.id != peer.id {
+        if !ready, let ticket = current.channelTicket, ticket != peer.channelTicket {
             disconnect()
             attempts = 0
             report(.reconnecting)

@@ -1,7 +1,6 @@
 import Photos
 import SwiftUI
 import UIKit
-import UniformTypeIdentifiers
 #if compiler(>=6.2)
 import Accessibility
 #endif
@@ -240,49 +239,10 @@ struct ClipboardSendButton: View {
     private var enabled: Bool { client.linked && client.clipboardSyncEnabled && client.clipboardLinkReady }
 
     var body: some View {
-        ClipboardPasteControl(enabled: enabled, onPaste: client.sendPasted)
-            .frame(maxWidth: .infinity, minHeight: 48, maxHeight: 48)
-            .glassPanel(Capsule())
+        GlassCapsuleButton(title: "Send clipboard", systemImage: "clipboard", compact: true,
+                           action: client.sendClipboardNow)
+            .disabled(!enabled)
             .accessibilityHint("Sends the clipboard to your PC.")
-    }
-}
-
-private struct ClipboardPasteControl: UIViewRepresentable {
-    let enabled: Bool
-    let onPaste: ([NSItemProvider]) -> Void
-
-    func makeCoordinator() -> Coordinator { Coordinator(onPaste: onPaste) }
-
-    func makeUIView(context: Context) -> UIPasteControl {
-        let configuration = UIPasteControl.Configuration()
-        configuration.displayMode = .iconOnly
-        configuration.cornerStyle = .capsule
-        configuration.baseForegroundColor = .label
-        configuration.baseBackgroundColor = .clear
-        let control = UIPasteControl(configuration: configuration)
-        control.target = context.coordinator
-        control.accessibilityLabel = "Send clipboard"
-        return control
-    }
-
-    func updateUIView(_ control: UIPasteControl, context: Context) {
-        context.coordinator.onPaste = onPaste
-        control.isEnabled = enabled
-    }
-
-    final class Coordinator: UIResponder {
-        var onPaste: ([NSItemProvider]) -> Void
-
-        init(onPaste: @escaping ([NSItemProvider]) -> Void) {
-            self.onPaste = onPaste
-            super.init()
-            pasteConfiguration = UIPasteConfiguration(acceptableTypeIdentifiers:
-                [UTType.plainText, .utf8PlainText, .image, .url].map(\.identifier))
-        }
-
-        override func paste(itemProviders: [NSItemProvider]) {
-            onPaste(itemProviders)
-        }
     }
 }
 

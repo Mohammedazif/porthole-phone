@@ -431,7 +431,7 @@ final class PullClient: ObservableObject {
         let name = String(String.UnicodeScalarView(clean)).trimmingCharacters(in: .whitespacesAndNewlines)
         var result = ""
         var remaining = maxBytes
-        for character in name.prefix(40) {
+        for character in name {
             let length = String(character).utf8.count
             guard length <= remaining else { break }
             result.append(character)
@@ -926,46 +926,8 @@ final class PullClient: ObservableObject {
         cancelInputVerification(message: "Bluetooth verification was interrupted.")
     }
 
-    /// A Paste button handed over text or a picture. iOS only reveals another
-    /// app's copy through that button, so this is what puts it on the PC.
-    func sendPasted(_ providers: [NSItemProvider]) {
-        guard canSendClipboard(), let peer = fileSendPeer, let generation = clipboardPreference.generation else { return }
-        for provider in providers {
-            if let type = provider.registeredTypeIdentifiers.first(where: { UTType($0)?.conforms(to: .image) == true }) {
-                provider.loadFileRepresentation(forTypeIdentifier: type) { url, _ in
-                    let png = url.flatMap { source -> Data? in
-                        guard let size = (try? source.resourceValues(forKeys: [.fileSizeKey]))?.fileSize,
-                              (1...32 * 1024 * 1024).contains(size),
-                              let image = CGImageSourceCreateWithURL(source as CFURL, nil) else { return nil }
-                        return Self.boundedClipboardPNG(image)
-                    }
-                    DispatchQueue.main.async { self.deliverPreparedClipboardImage(png, peer: peer, generation: generation) }
-                }
-                return
-            }
-            if provider.hasItemConformingToTypeIdentifier(UTType.url.identifier) {
-                provider.loadObject(ofClass: URL.self) { object, _ in
-                    guard let url = object as? URL else { return }
-                    DispatchQueue.main.async {
-                        guard self.fileSendPeer?.id == peer.id, self.clipboardPreference.allows(generation) else { return }
-                        self.deliverText(url.absoluteString)
-                    }
-                }
-                return
-            }
-            if provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier)
-                || provider.hasItemConformingToTypeIdentifier(UTType.utf8PlainText.identifier) {
-                provider.loadObject(ofClass: NSString.self) { object, _ in
-                    guard let text = object as? String, !text.isEmpty else { return }
-                    DispatchQueue.main.async {
-                        guard self.fileSendPeer?.id == peer.id, self.clipboardPreference.allows(generation) else { return }
-                        self.deliverText(text)
-                    }
-                }
-                return
-            }
-        }
-        clipStatus = "Send clipboard to \(computerName)."
+    func sendClipboardNow() {
+        considerLocal()
     }
 
     private static func discardPendingSends(for peer: TrustedPeer) {
@@ -1194,7 +1156,7 @@ final class PullClient: ObservableObject {
             guard let self, let link, self.connection === link, !self.pairingCommitted else { return }
             let message = waiting
                 ? "Allow Porthole in Settings › Privacy & Security › Local Network, then connect again."
-                : "The PC did not complete secure pairing. Check its address, certificate and connection code."
+                : "The PC took too long to respond. Check that Porthole is running and both devices are on the same local network."
             self.disconnect(peer, message: message, retry: !waiting)
         }
         handshakeTimer = timeout
@@ -1271,7 +1233,7 @@ final class PullClient: ObservableObject {
             }
             guard self.connection === link else { return }
             if complete || error != nil {
-                self.disconnect(peer, message: self.greeted ? "Disconnected. Reconnecting…" : "The PC closed secure pairing. Verify its connection code.")
+                self.disconnect(peer, message: self.greeted ? "Disconnected. Reconnecting…" : "The PC closed the connection before pairing finished.")
             } else {
                 self.receive()
             }
@@ -1394,6 +1356,7 @@ final class PullClient: ObservableObject {
         case "PAIR SAVED": message = "\(peer.name) has a saved pairing. Choose New code on the PC, then scan the QR."
         case "PAIR CLOSED": message = "Open a new pairing code in Porthole on \(peer.name)."
         case "PAIR LOCKED": message = "Too many attempts. Generate a fresh code on \(peer.name) or wait one minute."
+        case "PAIR REVOKED": message = "This pairing was removed on the PC. Scan its current QR code."
         default: return false
         }
         let recover = line == "PAIR SAVED" && enrolling
@@ -1404,6 +1367,10 @@ final class PullClient: ObservableObject {
             self.setDisconnected()
             self.reconnectWork?.cancel()
             self.reconnectWork = nil
+            if line == "PAIR REVOKED" {
+                TrustedPeerStore.clear()
+                self.disconnectedByPC = true
+            }
             if recover, self.reconnectAttempt == 0,
                PendingPairing.load()?.peer.samePairing(as: peer) == true {
                 // Recover a commit whose PAIRED acknowledgement was lost.
@@ -1511,6 +1478,14 @@ final class PullClient: ObservableObject {
             DispatchQueue.main.async {
                 guard self.fileSendPeer?.id == peer.id else { return }
                 TrustedPeerStore.saveFileShareTicket(ticket, for: peer)
+            }
+            return
+        }
+        if line.hasPrefix("SCREENKEY ") {
+            let ticket = String(line.dropFirst("SCREENKEY ".count))
+            DispatchQueue.main.async {
+                guard self.fileSendPeer?.id == peer.id else { return }
+                TrustedPeerStore.saveScreenTicket(ticket, for: peer)
             }
             return
         }
@@ -2253,7 +2228,7 @@ final class PullClient: ObservableObject {
             return
         }
         seenCount = board.changeCount
-        if announceEmpty { clipStatus = "Clipboard is empty. Copy text or an image, then select Paste." }
+        if announceEmpty { clipStatus = "Clipboard is empty. Copy text, a link, or an image first." }
     }
 
     private func deliverText(_ text: String) {
@@ -2389,8 +2364,8 @@ final class PullClient: ObservableObject {
         if let pending = PendingPairing.load() {
             requestedPeer = pending.peer
             address = pending.peer.host
-            // The PC may have stored the key before the app received PAIRED.
-            reconnectAttempt = 1
+            // Use the current code first; PAIR SAVED recovers a lost PAIRED acknowledgement.
+            reconnectAttempt = pending.activeCode != nil ? 0 : 1
         } else if let saved = savedPeer() {
             requestedPeer = saved
             address = saved.host

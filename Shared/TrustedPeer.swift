@@ -84,7 +84,7 @@ struct TrustedPeer: Codable, Equatable {
 
 enum BroadcastPhase: String, Codable { case connecting, live, waitingForFrames, reconnecting, deliveryStopped, ended, failed }
 
-struct FileShareAuthorization: Codable {
+struct PairedChannelAuthorization: Codable {
     let pairingID: UUID
     let fingerprint: String
     let ticket: String
@@ -101,8 +101,6 @@ struct FileShareAuthorization: Codable {
               TrustedPeer.isChannelTicket(ticket) else { return nil }
         var destination = current
         destination.channelTicket = ticket
-        destination.resumable = true
-        destination.inboxVersion = 3
         return destination
     }
 }
@@ -122,18 +120,42 @@ enum TrustedPeerStore {
 
     static func load() -> TrustedPeer? { read("peer.json") }
     @discardableResult static func save(_ peer: TrustedPeer) -> Bool { write(peer, "peer.json") }
-    static func clear() { remove("peer.json"); remove("file-share.json"); remove("broadcast-stop.json") }
+    static func clear() {
+        remove("peer.json")
+        remove("file-share.json")
+        remove("screen-share.json")
+        remove("broadcast-stop.json")
+    }
 
     static func saveFileShareTicket(_ ticket: String, for peer: TrustedPeer) {
-        guard load()?.id == peer.id, let authorization = FileShareAuthorization(peer: peer, ticket: ticket) else { return }
+        guard load()?.id == peer.id, let authorization = PairedChannelAuthorization(peer: peer, ticket: ticket) else { return }
         write(authorization, "file-share.json")
     }
 
     static func fileSharePeer(matching reviewed: TrustedPeer) -> TrustedPeer? {
         guard let current = load(), current.samePairing(as: reviewed) else { return nil }
-        let authorization: FileShareAuthorization? = read("file-share.json")
-        if let destination = authorization?.connectionPeer(for: current) { return destination }
+        let authorization: PairedChannelAuthorization? = read("file-share.json")
+        if var destination = authorization?.connectionPeer(for: current) {
+            destination.resumable = true
+            destination.inboxVersion = 3
+            return destination
+        }
         return current.resumable && current.channelTicket.map(TrustedPeer.isChannelTicket) == true ? current : nil
+    }
+
+    static func saveScreenTicket(_ ticket: String, for peer: TrustedPeer) {
+        guard load()?.id == peer.id, let authorization = PairedChannelAuthorization(peer: peer, ticket: ticket) else { return }
+        write(authorization, "screen-share.json")
+    }
+
+    static func broadcastPeer(matching reviewed: TrustedPeer) -> TrustedPeer? {
+        guard let current = load(), current.samePairing(as: reviewed) else { return nil }
+        let authorization: PairedChannelAuthorization? = read("screen-share.json")
+        if var destination = authorization?.connectionPeer(for: current) {
+            destination.broadcastVersion = 2
+            return destination
+        }
+        return current.channelTicket.map(TrustedPeer.isChannelTicket) == true ? current : nil
     }
 
     static func broadcastAudioEnabled() -> Bool { read("broadcast-audio.json") ?? false }

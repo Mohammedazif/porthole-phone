@@ -5,6 +5,12 @@ enum PortholeAppGroup {
         #if os(iOS)
         let identifier = Bundle.main.object(forInfoDictionaryKey: "PortholeAppGroup") as? String
             ?? "group.local.porthole.pull"
+        // iLoader supplies the provisioned App Group in each signed bundle.
+        for group in installerGroups where group.hasPrefix("group.") {
+            if let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) {
+                return url
+            }
+        }
         if usesInstallerGroup,
            let bundleID = Bundle.main.bundleIdentifier,
            let group = installerGroup(for: bundleID, configuredGroup: identifier) {
@@ -17,7 +23,11 @@ enum PortholeAppGroup {
     }
 
     static var usesInstallerGroup: Bool {
-        Bundle.main.object(forInfoDictionaryKey: "PortholeUseInstallerAppGroup") as? Bool == true
+        !installerGroups.isEmpty || Bundle.main.object(forInfoDictionaryKey: "PortholeUseInstallerAppGroup") as? Bool == true
+    }
+
+    private static var installerGroups: [String] {
+        Bundle.main.object(forInfoDictionaryKey: "ALTAppGroups") as? [String] ?? []
     }
 
     static func installerGroup(for bundleID: String, configuredGroup: String) -> String? {
