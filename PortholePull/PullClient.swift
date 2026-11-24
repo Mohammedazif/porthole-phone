@@ -1471,7 +1471,7 @@ final class PullClient: ObservableObject {
             self.refreshNotificationPermission(promptIfNeeded: true)
         }
         if peer.resumable { send("FILES 2\nFILES 3\nQUEUE 1\n") }
-        send("INBOX?\nSHARE?\nIV?\nSCREEN?\n")
+        send("INBOX?\nSHARE?\nIV?\nSCREEN? 2\n")
         let capabilities = pendingPairingCapabilities
         pendingPairingCapabilities.removeAll()
         for capability in capabilities { handle(capability) }
