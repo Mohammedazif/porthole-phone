@@ -169,7 +169,16 @@ enum TrustedPeerStore {
         return current.channelTicket.map(TrustedPeer.isChannelTicket) == true ? current : nil
     }
 
-    static func broadcastAudioEnabled() -> Bool { read("broadcast-audio.json") ?? false }
+    static func broadcastAudioEnabled() -> Bool {
+        guard let url = directory?.appendingPathComponent("broadcast-audio.json") else { return false }
+        do {
+            return try JSONDecoder().decode(Bool.self, from: Data(contentsOf: url))
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
+            return true
+        } catch {
+            return false
+        }
+    }
     static func setBroadcastAudioEnabled(_ enabled: Bool) -> Bool { write(enabled, "broadcast-audio.json") }
 
     static func broadcastStatus() -> TrustedBroadcastStatus? { read("broadcast.json") }

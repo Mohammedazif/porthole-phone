@@ -830,6 +830,11 @@ struct ContentView: View {
         }
     }
 
+    private var broadcastAudioLabel: String {
+        if !sendAudioToPC { return "Off" }
+        return client.broadcastStatus?.audioSent == true ? "Sending" : "Waiting"
+    }
+
     private var sharingScreen: some View {
         ScrollView {
             VStack(spacing: 22) {
@@ -872,7 +877,7 @@ struct ContentView: View {
                 let layout = dynamicTypeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 10)) : AnyLayout(HStackLayout(spacing: 10))
                 layout {
                     statCard("Video", "Up to 24 fps")
-                    statCard("Audio", client.fileSendPeer?.broadcastVersion == 2 ? "On PC" : "On iPhone")
+                    statCard("Audio", broadcastAudioLabel)
                     statCard("Input", input.mouseConnected && input.keyboardConnected ? "Detected" : "Setup required")
                 }
                 receiveStatus
@@ -1166,9 +1171,9 @@ struct ContentView: View {
                 } else if isPortholeBroadcasting && sendAudioToPC {
                     Text(client.broadcastStatus?.audioSent == true
                          ? "App audio is being sent to the PC."
-                         : "Waiting for audio from the app you’re sharing.")
+                         : "Waiting for app audio. Some apps restrict audio capture.")
                 } else {
-                    Text("Send app audio to your PC while sharing your screen.")
+                    Text("Share screen sends app audio to your PC using the same connection.")
                 }
             }
 

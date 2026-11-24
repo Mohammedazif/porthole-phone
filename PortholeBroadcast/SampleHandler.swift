@@ -18,6 +18,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private struct SentPacket {
         let deadline: DispatchTime
         let video: Bool
+        let hasAudioSignal: Bool
     }
 
     // Connection state and frame reservations belong to this queue. ReplayKit
@@ -205,7 +206,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
                     return
                 }
                 let acknowledgedVideo = self.awaitingACK.prefix(data.count).contains { $0.video }
-                if self.awaitingACK.prefix(data.count).contains(where: { !$0.video }) {
+                if self.awaitingACK.prefix(data.count).contains(where: \.hasAudioSignal) {
                     self.lastAcknowledgedAudio = .now()
                 }
                 self.awaitingACK.removeFirst(data.count)
@@ -463,18 +464,21 @@ final class SampleHandler: RPBroadcastSampleHandler {
             let available = 8 - awaitingACK.lazy.filter({ !$0.video }).count
             for start in stride(from: 0, to: bytes.count, by: 8192).prefix(available) {
                 let part = bytes.subdata(in: start..<min(start + 8192, bytes.count))
-                sendPacket(part, type: 3, link: link, id: id)
+                sendPacket(part, type: 3, link: link, id: id,
+                           hasAudioSignal: BroadcastAudio.containsSignal(part))
             }
         }
     }
 
-    private func sendPacket(_ bytes: Data, type: UInt8, link: NWConnection, id: UUID) {
+    private func sendPacket(_ bytes: Data, type: UInt8, link: NWConnection, id: UUID,
+                            hasAudioSignal: Bool = false) {
         var frame = Data(capacity: bytes.count + 5)
         let length = UInt32(bytes.count).bigEndian
         withUnsafeBytes(of: length) { frame.append(contentsOf: $0) }
         frame.append(type)
         frame.append(bytes)
-        awaitingACK.append(SentPacket(deadline: .now() + .seconds(5), video: type != 3))
+        awaitingACK.append(SentPacket(deadline: .now() + .seconds(5), video: type != 3,
+                                      hasAudioSignal: hasAudioSignal))
         link.send(content: frame, completion: .contentProcessed { [weak self, weak link] error in
             guard let self, let link, self.link === link, self.connectionID == id,
                   error != nil else { return }

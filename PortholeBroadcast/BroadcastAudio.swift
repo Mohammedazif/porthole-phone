@@ -8,6 +8,16 @@ final class BroadcastAudio {
                                              channels: 2, interleaved: true)!
     private var converter: AVAudioConverter?
 
+    static func containsSignal(_ pcm: Data) -> Bool {
+        pcm.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+            for offset in stride(from: 0, to: bytes.count - 1, by: 2) {
+                let sample = Int16(bitPattern: UInt16(bytes[offset]) | UInt16(bytes[offset + 1]) << 8)
+                if sample > 8 || sample < -8 { return true }
+            }
+            return false
+        }
+    }
+
     func encode(_ sample: CMSampleBuffer) -> Data? {
         let frames = CMSampleBufferGetNumSamples(sample)
         guard let description = CMSampleBufferGetFormatDescription(sample),

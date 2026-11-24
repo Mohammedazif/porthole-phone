@@ -220,6 +220,7 @@ final class PullClient: ObservableObject {
     private let lineLimit = 24 * 1024
     private var reconnectAttempt = 0
     private var reconnectWork: DispatchWorkItem?
+    private var backgroundAudio: CompanionBackgroundAudio?
     private weak var index: PhotoIndex?
     // Accessed only on queue. Explicit selection bypasses visual matching once.
     private var chosenIdentifier: String?
@@ -913,6 +914,7 @@ final class PullClient: ObservableObject {
 
     func cameForward() {
         foreground = true
+        backgroundAudio?.setRequested(false)
         loadLocalState()
         refreshNotificationPermission(promptIfNeeded: linked)
         refreshBroadcastStatus()
@@ -922,9 +924,26 @@ final class PullClient: ObservableObject {
 
     func enteredBackground() {
         foreground = false
-        reconnectWork?.cancel()
-        reconnectWork = nil
         cancelInputVerification(message: "Bluetooth verification was interrupted.")
+        updateBackgroundConnection()
+        if backgroundAudio?.requested == true && !linked && !connecting && reconnectWork == nil {
+            scheduleReconnect()
+        }
+    }
+
+    private func updateBackgroundConnection() {
+        if !foreground, !disconnectedByPC, let requestedPeer,
+           savedPeer()?.samePairing(as: requestedPeer) == true,
+           PairingCredential.load(requestedPeer.credentialProfile) != nil {
+            if backgroundAudio == nil { backgroundAudio = CompanionBackgroundAudio() }
+            backgroundAudio?.setRequested(true)
+        } else {
+            backgroundAudio?.setRequested(false)
+            if !foreground {
+                reconnectWork?.cancel()
+                reconnectWork = nil
+            }
+        }
     }
 
     func sendClipboardNow() {
@@ -947,6 +966,7 @@ final class PullClient: ObservableObject {
         }
         PairingCredential.remove(savedPeerKey)
         requestedPeer = nil
+        backgroundAudio?.setRequested(false)
         reconnectWork?.cancel()
         reconnectWork = nil
         connecting = false
@@ -1082,10 +1102,14 @@ final class PullClient: ObservableObject {
     }
 
     private func connectCurrentPeer() {
-        disconnectedByPC = false
         guard !connecting, let requestedPeer else { return }
         let profile = requestedPeer.credentialProfile
         let savedKey = PairingCredential.load(profile)
+        if !foreground && (backgroundAudio?.requested != true || savedKey == nil) {
+            backgroundAudio?.setRequested(false)
+            return
+        }
+        disconnectedByPC = false
         let pending = PendingPairing.load().flatMap { $0.peer.samePairing(as: requestedPeer) ? $0 : nil }
         let pendingKey = pending?.key ?? PairingCredential.load("pending/" + profile)
         let credentials: [String]
@@ -1231,6 +1255,7 @@ final class PullClient: ObservableObject {
             self.connecting = false
             self.status = message
             if retry { self.scheduleReconnect() }
+            else { self.backgroundAudio?.setRequested(false) }
         }
     }
 
@@ -1329,7 +1354,9 @@ final class PullClient: ObservableObject {
                     DispatchQueue.main.async {
                         guard self.requestedPeer?.id == peer.id else { return }
                         self.disconnectedByPC = true
+                        self.backgroundAudio?.setRequested(false)
                         self.reconnectWork?.cancel()
+                        self.reconnectWork = nil
                         self.setDisconnected()
                         self.connecting = false
                         TrustedPeerStore.clear()
@@ -1393,6 +1420,7 @@ final class PullClient: ObservableObject {
             guard self.requestedPeer?.id == peer.id else { return }
             self.connecting = false
             self.setDisconnected()
+            self.backgroundAudio?.setRequested(false)
             self.reconnectWork?.cancel()
             self.reconnectWork = nil
             if line == "PAIR REVOKED" {
@@ -1461,6 +1489,7 @@ final class PullClient: ObservableObject {
             self.address = peer.host
             self.linked = true
             self.status = "Connected securely to \(peer.name)."
+            self.updateBackgroundConnection()
             self.publishSharedPeer(peer)
             self.publishWidgetPairing()
             self.sendSystemPhoneName()
@@ -2402,7 +2431,8 @@ final class PullClient: ObservableObject {
     }
 
     private func scheduleReconnect() {
-        guard foreground, !disconnectedByPC, let peer = requestedPeer else { return }
+        guard (foreground || backgroundAudio?.requested == true), !disconnectedByPC,
+              let peer = requestedPeer else { return }
         reconnectWork?.cancel()
         if reconnectAttempt >= 4, PendingPairing.load()?.peer.samePairing(as: peer) == true {
             status = "Pairing could not finish. Tap Connect to retry, or use the current code shown on your PC."
@@ -2411,7 +2441,10 @@ final class PullClient: ObservableObject {
         let delay = min(2 << min(reconnectAttempt, 3), 15)
         reconnectAttempt += 1
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.requestedPeer?.id == peer.id, !self.linked, !self.connecting else { return }
+            guard let self, self.requestedPeer?.id == peer.id else { return }
+            self.reconnectWork = nil
+            guard (self.foreground || self.backgroundAudio?.requested == true), !self.disconnectedByPC,
+                  !self.linked, !self.connecting else { return }
             self.connectCurrentPeer()
         }
         reconnectWork = work
