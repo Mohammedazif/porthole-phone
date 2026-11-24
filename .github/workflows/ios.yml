@@ -63,7 +63,7 @@ jobs:
           PY_PATCH
           "$RUNNER_TEMP/xcodegen/bin/xcodegen" generate
           xcodebuild -quiet -project PortholePull.xcodeproj -scheme PortholePull -configuration Debug \
-            -arch arm64 -sdk iphonesimulator -destination "generic/platform=iOS Simulator" -derivedDataPath sim-build \
+            -sdk iphonesimulator -destination "generic/platform=iOS Simulator" -derivedDataPath sim-build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
       - name: Capture Connect on the iPhone simulator
         run: |
