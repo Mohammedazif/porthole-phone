@@ -1553,11 +1553,11 @@ final class PullClient: ObservableObject {
             self.status = "Connected securely to \(peer.name)."
             self.publishSharedPeer(peer)
             self.publishWidgetPairing()
-            self.sendPhoneName()
+            self.sendSystemPhoneName()
             self.refreshNotificationPermission(promptIfNeeded: true)
         }
-        if peer.resumable { send("FILES 2\nFILES 3\n") }
-        send("INBOX?\nIV?\nSCREEN?\n")
+        if peer.resumable { send("FILES 2\nFILES 3\nQUEUE 1\n") }
+        send("INBOX?\nSHARE?\nIV?\nSCREEN?\n")
         let capabilities = pendingPairingCapabilities
         pendingPairingCapabilities.removeAll()
         for capability in capabilities { handle(capability) }
@@ -1578,7 +1578,7 @@ final class PullClient: ObservableObject {
                 if let pairingKey { send("PAIR \(pairingKey)\n") }
                 return
             }
-            send("FILES 2\nFILES 3\n")
+            send("FILES 2\nFILES 3\nQUEUE 1\n")
             DispatchQueue.main.async {
                 guard self.fileSendPeer?.id == resumable.id else { return }
                 self.fileSendPeer = resumable
@@ -1589,6 +1589,14 @@ final class PullClient: ObservableObject {
         guard pairingCommitted else {
             if line == "SYNC READY" || line == "INPUT READY", !pendingPairingCapabilities.contains(line) {
                 pendingPairingCapabilities.append(line)
+            }
+            return
+        }
+        if line.hasPrefix("SHAREKEY ") {
+            let ticket = String(line.dropFirst("SHAREKEY ".count))
+            DispatchQueue.main.async {
+                guard self.fileSendPeer?.id == peer.id else { return }
+                TrustedPeerStore.saveFileShareTicket(ticket, for: peer)
             }
             return
         }

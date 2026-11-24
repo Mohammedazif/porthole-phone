@@ -106,8 +106,8 @@ final class ShareViewController: UIViewController {
             return
         }
         destinationLabel.text = peer.name
-        guard peer.channelTicket != nil else {
-            status.text = "Open Porthole to reconnect, then share again."
+        guard TrustedPeerStore.fileSharePeer(matching: peer) != nil else {
+            status.text = "Open Porthole once to finish setting up Share for this PC."
             finished = true
             configureButton("Done", enabled: true)
             return
@@ -280,9 +280,13 @@ private final class ShareTransfer {
                 self.fail("The paired PC changed. Close Share and review the new destination.", retry: false)
                 return
             }
-            let version = self.protocolVersion ?? current.receiveVersion
-            guard current.channelTicket != nil, current.resumable, current.receiveVersion >= version else {
-                self.fail("Reconnect to the reviewed PC in Porthole and retry.")
+            guard let destination = TrustedPeerStore.fileSharePeer(matching: current) else {
+                self.fail("Open Porthole to finish setting up Share for this PC.")
+                return
+            }
+            let version = self.protocolVersion ?? destination.receiveVersion
+            guard destination.receiveVersion >= version else {
+                self.fail("Update Porthole on the PC to resume this transfer.")
                 return
             }
             guard let batch = self.journalBatch, var manifest = self.manifest else {
@@ -294,7 +298,7 @@ private final class ShareTransfer {
             catch { self.fail("Unable to save the transfer state on this iPhone."); return }
             self.manifest = manifest
             self.protocolVersion = version
-            self.connect(to: current, version: version)
+            self.connect(to: destination, version: version)
         }
     }
 
@@ -428,10 +432,10 @@ private final class ShareTransfer {
                     self.queue.async {
                         guard self.connection === link else { return }
                         guard authorized else {
-                            self.fail("The PC did not authorize this transfer. Open Porthole on both devices and retry.")
+                            self.fail("Open Porthole on the PC and confirm this iPhone is the selected device.")
                             return
                         }
-                        guard TrustedPeerStore.load()?.id == peer.id else {
+                        guard TrustedPeerStore.load()?.samePairing(as: peer) == true else {
                             self.fail("The paired PC changed before the transfer started.", retry: false)
                             return
                         }
@@ -451,6 +455,10 @@ private final class ShareTransfer {
 
     private func sendFile(at cursor: Int, on link: NWConnection) {
         guard connection === link else { return }
+        guard TrustedPeerStore.load()?.samePairing(as: peer) == true else {
+            fail("The paired PC changed. Review the new destination before sending.", retry: false)
+            return
+        }
         guard cursor < batch.count else {
             write(Data("DONE\n".utf8), on: link) {
                 self.readLine(on: link) { response in

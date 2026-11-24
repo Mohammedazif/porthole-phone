@@ -38,6 +38,14 @@ let newSession = firstPeer.newSession(host: "192.168.0.51")
 require(newSession.id != firstPeer.id && newSession.samePairing(as: firstPeer), "Change transport identity while retaining the same approved pairing")
 require(newSession.credentialProfile == firstPeer.credentialProfile, "Preserve the credential profile after an address change")
 let replacement = TrustedPeer(host: firstPeer.host, name: "PC", fingerprint: pin, id: UUID())
+let fileAuthorization = FileShareAuthorization(peer: firstPeer, ticket: pin)!
+require(fileAuthorization.connectionPeer(for: newSession.remembered)?.channelTicket == pin &&
+        fileAuthorization.connectionPeer(for: newSession.remembered)?.receiveVersion == 3,
+        "Share can connect after the foreground ticket has been discarded")
+require(fileAuthorization.connectionPeer(for: replacement) == nil,
+        "A Share credential cannot be reused for a replacement pairing")
+require(FileShareAuthorization(peer: firstPeer, ticket: "malformed") == nil,
+        "Reject an invalid Share credential")
 require(!replacement.samePairing(as: firstPeer), "Explicit pairing has a new authorization identity")
 require(replacement.credentialProfile != firstPeer.credentialProfile, "Explicit pairing cannot reuse the previous credential")
 require(IncomingTransfer.chunkLength("CHUNK 65536", remaining: 65536) == 65536, "Accept a full interleaved chunk")

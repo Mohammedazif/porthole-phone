@@ -84,6 +84,29 @@ struct TrustedPeer: Codable, Equatable {
 
 enum BroadcastPhase: String, Codable { case connecting, live, waitingForFrames, reconnecting, deliveryStopped, ended, failed }
 
+struct FileShareAuthorization: Codable {
+    let pairingID: UUID
+    let fingerprint: String
+    let ticket: String
+
+    init?(peer: TrustedPeer, ticket: String) {
+        guard TrustedPeer.isChannelTicket(ticket) else { return nil }
+        pairingID = peer.stableID
+        fingerprint = peer.fingerprint
+        self.ticket = ticket
+    }
+
+    func connectionPeer(for current: TrustedPeer) -> TrustedPeer? {
+        guard current.stableID == pairingID, current.fingerprint == fingerprint,
+              TrustedPeer.isChannelTicket(ticket) else { return nil }
+        var destination = current
+        destination.channelTicket = ticket
+        destination.resumable = true
+        destination.inboxVersion = 3
+        return destination
+    }
+}
+
 struct TrustedBroadcastStatus: Codable, Equatable {
     let peerID: UUID?
     let phase: BroadcastPhase
@@ -99,7 +122,19 @@ enum TrustedPeerStore {
 
     static func load() -> TrustedPeer? { read("peer.json") }
     @discardableResult static func save(_ peer: TrustedPeer) -> Bool { write(peer, "peer.json") }
-    static func clear() { remove("peer.json"); remove("broadcast-stop.json") }
+    static func clear() { remove("peer.json"); remove("file-share.json"); remove("broadcast-stop.json") }
+
+    static func saveFileShareTicket(_ ticket: String, for peer: TrustedPeer) {
+        guard load()?.id == peer.id, let authorization = FileShareAuthorization(peer: peer, ticket: ticket) else { return }
+        write(authorization, "file-share.json")
+    }
+
+    static func fileSharePeer(matching reviewed: TrustedPeer) -> TrustedPeer? {
+        guard let current = load(), current.samePairing(as: reviewed) else { return nil }
+        let authorization: FileShareAuthorization? = read("file-share.json")
+        if let destination = authorization?.connectionPeer(for: current) { return destination }
+        return current.resumable && current.channelTicket.map(TrustedPeer.isChannelTicket) == true ? current : nil
+    }
 
     static func broadcastStatus() -> TrustedBroadcastStatus? { read("broadcast.json") }
     static func publishBroadcast(peer: TrustedPeer?, phase: BroadcastPhase, message: String? = nil) {
