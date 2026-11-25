@@ -14,7 +14,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let connectionID: UUID
         let forceKey: Bool
         let ptsNs: UInt64
-        let orientation: CGImagePropertyOrientation
+        /// The PSCR 4 turn message: how the phone is turned (for the PC's
+        /// pointer), then iOS's own tag and the captured size, for the PC log.
+        let turn: Data
     }
 
     private struct SentPacket {
@@ -49,7 +51,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var deliveryStopped = false
     private var broadcastEndAction: (() -> Void)?
     private var lostFrames = 0
-    private var sentOrientation: CGImagePropertyOrientation?
+    private var sentTurn: Data?
     private var audio = BroadcastAudio()
     private var preferencesCheckedAt: DispatchTime?
     private var sendAppAudio = false
@@ -260,7 +262,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         reconnectAt = nil
         lastAcknowledgedFrame = nil
         lastKeyframeSent = nil
-        sentOrientation = nil
+        sentTurn = nil
         lastAcknowledgedAudio = nil
         lostFrames = 0
         encoding.removeAll()
@@ -443,12 +445,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
         guard seconds.isFinite else { return }
         if let lastTimestamp, seconds >= lastTimestamp, seconds - lastTimestamp < minInterval { return }
 
-        let orientation = Self.orientation(sampleBuffer, image: image)
+        let turned = Self.orientation(sampleBuffer, image: image)
+        let orientation = turned.pixels
         let orientationChanged = lastOrientation != orientation
         let timestampDiscontinuity = lastTimestamp.map { seconds < $0 } == true
         guard let ticket = queue.sync(execute: {
             reserveFrame(forceKey: orientationChanged || timestampDiscontinuity, ptsNs: Self.nanoseconds(timestamp),
-                         orientation: orientation)
+                         turn: Self.turnMessage(turned, image: image))
         }) else { return }
         lastTimestamp = seconds
         lastOrientation = orientation
@@ -482,7 +485,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         if status != noErr || flags.contains(.frameDropped) { loseFrame(ticket) }
     }
 
-    private func reserveFrame(forceKey: Bool, ptsNs: UInt64, orientation: CGImagePropertyOrientation) -> FrameTicket? {
+    private func reserveFrame(forceKey: Bool, ptsNs: UInt64, turn: Data) -> FrameTicket? {
         // Keep ACKs in flight concurrently, but serialize compression output so
         // asynchronously delivered callbacks cannot reorder H.264 frames.
         guard active, ready, !paused, encoding.isEmpty,
@@ -490,8 +493,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let now = DispatchTime.now()
         let force = forceKey || needKey || lastKeyframeSent.map { now >= $0 + .milliseconds(1200) } == true
         if force { needKey = true }
-        let ticket = FrameTicket(connectionID: connectionID, forceKey: force, ptsNs: ptsNs,
-                                 orientation: orientation)
+        let ticket = FrameTicket(connectionID: connectionID, forceKey: force, ptsNs: ptsNs, turn: turn)
         encoding[ticket.id] = .now()
         return ticket
     }
@@ -520,10 +522,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
         }
         // The PC turns its pointer positions back with this: the iPhone places
         // an absolute pointer on its screen as mounted, not as turned.
-        if (peer?.screenProtocolVersion ?? 1) >= 4, sentOrientation != ticket.orientation {
-            sentOrientation = ticket.orientation
-            sendPacket(Data([UInt8(truncatingIfNeeded: ticket.orientation.rawValue)]), type: 5,
-                       ptsNs: ticket.ptsNs, link: link, id: ticket.connectionID)
+        if (peer?.screenProtocolVersion ?? 1) >= 4, sentTurn != ticket.turn {
+            sentTurn = ticket.turn
+            sendPacket(ticket.turn, type: 5, ptsNs: ticket.ptsNs, link: link, id: ticket.connectionID)
         }
         sendPacket(bytes, type: keyframe ? 2 : 1, ptsNs: ticket.ptsNs, link: link, id: ticket.connectionID)
     }
@@ -585,37 +586,49 @@ final class SampleHandler: RPBroadcastSampleHandler {
         return UInt64(max(1, time.value))
     }
 
-    /// The rotation that turns this frame upright.
+    /// How to turn this frame upright (`pixels`), and how the phone itself is
+    /// turned (`pointer`). They differ when iOS already supplies the screen
+    /// turned: the picture then needs no turn, but the phone still places an
+    /// absolute pointer on its screen as mounted.
     ///
     /// ReplayKit's `RPVideoSampleOrientationKey` names the opposite quarter-turn
     /// from Core Image: WebRTC's ReplayKit capturer (react-native-webrtc,
     /// used for Jitsi screen sharing) turns `.left` 90° clockwise and `.right`
     /// 270°, while `CIImage.oriented(.left)` turns 90° counterclockwise. Passing
     /// the tag straight to Core Image left both landscape directions upside down.
-    private static func orientation(_ sample: CMSampleBuffer, image: CVImageBuffer) -> CGImagePropertyOrientation {
+    private static func orientation(_ sample: CMSampleBuffer, image: CVImageBuffer)
+        -> (pixels: CGImagePropertyOrientation, pointer: CGImagePropertyOrientation, tag: UInt32) {
         let key = kCGImagePropertyOrientation
         let sampleOrientation = CMGetAttachment(sample, key: key, attachmentModeOut: nil) as? NSNumber
         let pixelOrientation = CVBufferCopyAttachment(image, key, nil) as? NSNumber
         let fromSample = sampleOrientation.flatMap { CGImagePropertyOrientation(rawValue: $0.uint32Value) }
         let fromImage = pixelOrientation.flatMap { CGImagePropertyOrientation(rawValue: $0.uint32Value) }
-        if let explicit = fromSample ?? fromImage { return explicit }
-        let replayKit = (CMGetAttachment(sample, key: RPVideoSampleOrientationKey as CFString,
-                                         attachmentModeOut: nil) as? NSNumber)
-            .flatMap { CGImagePropertyOrientation(rawValue: $0.uint32Value) } ?? .up
-        let quarterTurn: Bool
+        if let explicit = fromSample ?? fromImage { return (explicit, explicit, explicit.rawValue) }
+        let tagValue = (CMGetAttachment(sample, key: RPVideoSampleOrientationKey as CFString,
+                                        attachmentModeOut: nil) as? NSNumber)?.uint32Value ?? 0
+        let replayKit = CGImagePropertyOrientation(rawValue: tagValue) ?? .up
+        let turned: CGImagePropertyOrientation
         switch replayKit {
-        case .left, .right, .leftMirrored, .rightMirrored: quarterTurn = true
-        default: quarterTurn = false
+        case .left: turned = .right
+        case .right: turned = .left
+        case .leftMirrored: turned = .rightMirrored
+        case .rightMirrored: turned = .leftMirrored
+        default: turned = replayKit
         }
+        let quarterTurn = turned != replayKit
         // Pixels that already have the landscape axes need no quarter-turn.
-        if quarterTurn && CVPixelBufferGetWidth(image) > CVPixelBufferGetHeight(image) { return .up }
-        switch replayKit {
-        case .left: return .right
-        case .right: return .left
-        case .leftMirrored: return .rightMirrored
-        case .rightMirrored: return .leftMirrored
-        default: return replayKit
-        }
+        let pixels: CGImagePropertyOrientation =
+            quarterTurn && CVPixelBufferGetWidth(image) > CVPixelBufferGetHeight(image) ? .up : turned
+        return (pixels, turned, tagValue)
+    }
+
+    private static func turnMessage(_ turned: (pixels: CGImagePropertyOrientation, pointer: CGImagePropertyOrientation, tag: UInt32),
+                                    image: CVImageBuffer) -> Data {
+        let width = UInt16(clamping: CVPixelBufferGetWidth(image))
+        let height = UInt16(clamping: CVPixelBufferGetHeight(image))
+        return Data([UInt8(truncatingIfNeeded: turned.pointer.rawValue), UInt8(truncatingIfNeeded: turned.tag),
+                     UInt8(truncatingIfNeeded: turned.pixels.rawValue),
+                     UInt8(width >> 8), UInt8(width & 0xff), UInt8(height >> 8), UInt8(height & 0xff)])
     }
 
     private func makeSession(width: Int, height: Int) {

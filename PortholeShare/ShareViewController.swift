@@ -2,11 +2,72 @@ import Network
 import UIKit
 import UniformTypeIdentifiers
 
+/// A document page with its file type on a colored tag, as in the design.
+private final class FileTile: UIView {
+    private let badge = UILabel()
+
+    init(fileExtension: String) {
+        super.init(frame: .zero)
+        let kind = fileExtension.uppercased()
+        backgroundColor = .white
+        layer.cornerRadius = 5
+        layer.cornerCurve = .continuous
+        layer.borderWidth = 1
+        isAccessibilityElement = false
+        badge.text = String(kind.prefix(4))
+        badge.font = .systemFont(ofSize: 8, weight: .bold)
+        badge.textColor = .white
+        badge.textAlignment = .center
+        badge.backgroundColor = Self.color(for: kind)
+        badge.layer.cornerRadius = 3
+        badge.layer.masksToBounds = true
+        badge.isHidden = kind.isEmpty
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(badge)
+        translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 32),
+            heightAnchor.constraint(equalToConstant: 40),
+            badge.leadingAnchor.constraint(equalTo: leadingAnchor, constant: -3),
+            badge.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -5),
+            badge.heightAnchor.constraint(equalToConstant: 13),
+            badge.widthAnchor.constraint(greaterThanOrEqualToConstant: 24),
+        ])
+        updateBorder()
+        registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (tile: FileTile, _: UITraitCollection) in
+            tile.updateBorder()
+        }
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    private func updateBorder() {
+        layer.borderColor = (traitCollection.userInterfaceStyle == .dark
+            ? UIColor(red: 0x3A / 255, green: 0x3A / 255, blue: 0x3C / 255, alpha: 1)
+            : UIColor(red: 0xD5 / 255, green: 0xD8 / 255, blue: 0xDD / 255, alpha: 1)).cgColor
+    }
+
+    private static func color(for kind: String) -> UIColor {
+        func rgb(_ value: Int) -> UIColor {
+            UIColor(red: CGFloat(value >> 16 & 0xff) / 255, green: CGFloat(value >> 8 & 0xff) / 255,
+                    blue: CGFloat(value & 0xff) / 255, alpha: 1)
+        }
+        switch kind {
+        case "PDF": return rgb(0xB42318)
+        case "ZIP", "RAR", "7Z", "TAR", "GZ": return rgb(0x7A5A12)
+        case "M4A", "MP3", "WAV", "AAC", "FLAC": return rgb(0x5B3E8A)
+        case "HEIC", "JPG", "JPEG", "PNG", "GIF", "MOV", "MP4", "WEBP": return rgb(0x2F5F8A)
+        default: return rgb(0x4A4E55)
+        }
+    }
+}
+
 /// Sends the files chosen in the system share sheet to the reviewed, paired PC.
 final class ShareViewController: UIViewController {
     private let titleLabel = UILabel()
     private let destinationLabel = UILabel()
     private let status = UILabel()
+    private let statusDot = UIView()
     private let bar = UIProgressView(progressViewStyle: .bar)
     private let button = UIButton(type: .system)
     private let fileStack = UIStackView()
@@ -17,22 +78,25 @@ final class ShareViewController: UIViewController {
     private var closing = false
     private var started = false
 
+    private static func card() -> UIStackView {
+        let card = UIStackView()
+        card.axis = .vertical
+        card.backgroundColor = .secondarySystemGroupedBackground
+        card.layer.cornerRadius = 16
+        card.layer.cornerCurve = .continuous
+        card.clipsToBounds = true
+        return card
+    }
+
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .systemGroupedBackground
-        preferredContentSize = CGSize(width: 420, height: 500)
+        preferredContentSize = CGSize(width: 420, height: 600)
         titleLabel.text = "Send to PC"
-        titleLabel.font = .preferredFont(forTextStyle: .title2)
+        titleLabel.font = UIFontMetrics(forTextStyle: .headline).scaledFont(for: .systemFont(ofSize: 17, weight: .semibold))
         titleLabel.adjustsFontForContentSizeCategory = true
-        titleLabel.numberOfLines = 0
+        titleLabel.textAlignment = .center
         titleLabel.accessibilityTraits.insert(.header)
-        destinationLabel.font = .preferredFont(forTextStyle: .headline)
-        destinationLabel.adjustsFontForContentSizeCategory = true
-        destinationLabel.numberOfLines = 0
-        status.font = .preferredFont(forTextStyle: .subheadline)
-        status.adjustsFontForContentSizeCategory = true
-        status.textColor = .secondaryLabel
-        status.numberOfLines = 0
 
         let closeButton = UIButton(type: .close)
         closeButton.accessibilityLabel = "Close Porthole"
@@ -44,20 +108,67 @@ final class ShareViewController: UIViewController {
             closeButton.configuration = glass
         }
         #endif
-        closeButton.setContentCompressionResistancePriority(.required, for: .horizontal)
-        let header = UIStackView(arrangedSubviews: [titleLabel, closeButton])
+        let balance = UIView()
+        let header = UIStackView(arrangedSubviews: [closeButton, titleLabel, balance])
         header.alignment = .center
-        header.spacing = 12
-        closeButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
-        closeButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+        header.spacing = 8
+        NSLayoutConstraint.activate([
+            closeButton.widthAnchor.constraint(equalToConstant: 44),
+            closeButton.heightAnchor.constraint(equalToConstant: 44),
+            balance.widthAnchor.constraint(equalToConstant: 44),
+        ])
 
+        // Files, one row each.
         fileStack.axis = .vertical
-        fileStack.backgroundColor = .secondarySystemGroupedBackground
-        fileStack.layer.cornerRadius = 18
-        fileStack.layer.cornerCurve = .continuous
-        let details = UIStackView(arrangedSubviews: [destinationLabel, status, fileStack])
+        let files = Self.card()
+        files.addArrangedSubview(fileStack)
+
+        // The paired PC and what is happening with it.
+        let icon = UIImageView(image: UIImage(systemName: "desktopcomputer",
+                                              withConfiguration: UIImage.SymbolConfiguration(pointSize: 15, weight: .medium)))
+        icon.tintColor = .white
+        icon.contentMode = .center
+        icon.backgroundColor = UIColor { $0.userInterfaceStyle == .dark
+            ? UIColor(red: 0x3A / 255, green: 0x3A / 255, blue: 0x3C / 255, alpha: 1)
+            : UIColor(red: 0x11 / 255, green: 0x11 / 255, blue: 0x11 / 255, alpha: 1) }
+        icon.layer.cornerRadius = 9
+        icon.layer.cornerCurve = .continuous
+        icon.clipsToBounds = true
+        icon.isAccessibilityElement = false
+        destinationLabel.font = UIFontMetrics(forTextStyle: .subheadline).scaledFont(for: .systemFont(ofSize: 15, weight: .semibold))
+        destinationLabel.adjustsFontForContentSizeCategory = true
+        destinationLabel.numberOfLines = 0
+        status.font = .preferredFont(forTextStyle: .footnote)
+        status.adjustsFontForContentSizeCategory = true
+        status.textColor = .secondaryLabel
+        status.numberOfLines = 0
+        statusDot.backgroundColor = .systemGreen
+        statusDot.layer.cornerRadius = 3.5
+        statusDot.isHidden = true
+        let statusLine = UIStackView(arrangedSubviews: [statusDot, status])
+        statusLine.alignment = .center
+        statusLine.spacing = 6
+        let names = UIStackView(arrangedSubviews: [destinationLabel, statusLine])
+        names.axis = .vertical
+        names.spacing = 2
+        let pcRow = UIStackView(arrangedSubviews: [icon, names])
+        pcRow.alignment = .center
+        pcRow.spacing = 12
+        pcRow.layoutMargins = UIEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
+        pcRow.isLayoutMarginsRelativeArrangement = true
+        let destination = Self.card()
+        destination.addArrangedSubview(pcRow)
+        NSLayoutConstraint.activate([
+            icon.widthAnchor.constraint(equalToConstant: 32),
+            icon.heightAnchor.constraint(equalToConstant: 32),
+            statusDot.widthAnchor.constraint(equalToConstant: 7),
+            statusDot.heightAnchor.constraint(equalToConstant: 7),
+            pcRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 58),
+        ])
+
+        let details = UIStackView(arrangedSubviews: [files, destination])
         details.axis = .vertical
-        details.spacing = 12
+        details.spacing = 16
         details.translatesAutoresizingMaskIntoConstraints = false
         let scroll = UIScrollView()
         scroll.alwaysBounceVertical = true
@@ -71,7 +182,7 @@ final class ShareViewController: UIViewController {
         button.addTarget(self, action: #selector(sendTapped), for: .touchUpInside)
         let body = UIStackView(arrangedSubviews: [header, scroll, bar, button])
         body.axis = .vertical
-        body.spacing = 12
+        body.spacing = 16
         body.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(body)
         let safe = view.safeAreaLayoutGuide
@@ -85,7 +196,7 @@ final class ShareViewController: UIViewController {
             details.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
             details.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
             details.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor),
-            button.heightAnchor.constraint(greaterThanOrEqualToConstant: 48),
+            button.heightAnchor.constraint(greaterThanOrEqualToConstant: 54),
         ])
     }
 
@@ -122,6 +233,7 @@ final class ShareViewController: UIViewController {
                                          guard let self, !self.closing else { return }
                                          self.readyToSend = retry
                                          self.finished = !retry
+                                         self.statusDot.isHidden = title != "Done"
                                          self.configureButton(title, enabled: true)
                                      })
         self.transfer = transfer
@@ -168,42 +280,51 @@ final class ShareViewController: UIViewController {
 
     private func presentFiles(_ items: [ShareTransfer.Item]) {
         guard !closing else { return }
-        for item in items {
-            let glyph = UIImageView(image: UIImage(systemName: "doc"))
-            glyph.tintColor = .secondaryLabel
-            glyph.isAccessibilityElement = false
+        for (index, item) in items.enumerated() {
+            let tile = FileTile(fileExtension: (item.name as NSString).pathExtension)
             let name = UILabel()
-            name.font = .preferredFont(forTextStyle: .subheadline)
+            name.font = UIFontMetrics(forTextStyle: .subheadline).scaledFont(for: .systemFont(ofSize: 15, weight: .medium))
             name.adjustsFontForContentSizeCategory = true
-            name.numberOfLines = 0
+            name.lineBreakMode = .byTruncatingMiddle
             name.text = item.name
             let size = UILabel()
             size.font = .preferredFont(forTextStyle: .footnote)
             size.adjustsFontForContentSizeCategory = true
-            size.numberOfLines = 0
             size.textColor = .secondaryLabel
             size.text = ByteCountFormatter.string(fromByteCount: item.bytes, countStyle: .file)
             let labels = UIStackView(arrangedSubviews: [name, size])
             labels.axis = .vertical
-            labels.spacing = 2
+            labels.spacing = 1
             let mark = UIImageView(image: UIImage(systemName: "checkmark.circle.fill"))
             mark.tintColor = .systemGreen
             mark.isHidden = true
             mark.isAccessibilityElement = true
             mark.accessibilityLabel = "Saved on PC"
             marks.append(mark)
-            let row = UIStackView(arrangedSubviews: [glyph, labels, mark])
+            let row = UIStackView(arrangedSubviews: [tile, labels, mark])
             row.alignment = .center
-            row.spacing = 10
-            row.layoutMargins = UIEdgeInsets(top: 9, left: 12, bottom: 9, right: 12)
+            row.spacing = 12
+            row.layoutMargins = UIEdgeInsets(top: 9, left: 14, bottom: 9, right: 14)
             row.isLayoutMarginsRelativeArrangement = true
-            glyph.setContentHuggingPriority(.required, for: .horizontal)
+            row.heightAnchor.constraint(greaterThanOrEqualToConstant: 58).isActive = true
             mark.setContentHuggingPriority(.required, for: .horizontal)
+            labels.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
             fileStack.addArrangedSubview(row)
+            if index < items.count - 1 {
+                let rule = UIView()
+                rule.backgroundColor = .separator
+                rule.heightAnchor.constraint(equalToConstant: 1 / UIScreen.main.scale).isActive = true
+                let inset = UIStackView(arrangedSubviews: [rule])
+                inset.layoutMargins = UIEdgeInsets(top: 0, left: 14, bottom: 0, right: 0)
+                inset.isLayoutMarginsRelativeArrangement = true
+                fileStack.addArrangedSubview(inset)
+            }
         }
-        status.text = "Review the destination and files before sending."
+        status.text = "Paired PC"
         readyToSend = true
-        configureButton(items.count == 1 ? "Send file" : "Send \(items.count) files", enabled: true)
+        let total = ByteCountFormatter.string(fromByteCount: items.reduce(0) { $0 + $1.bytes }, countStyle: .file)
+        configureButton(items.count == 1 ? "Send 1 file · \(total)" : "Send \(items.count) files · \(total)",
+                        enabled: true)
     }
 
     private func updateStatus(_ text: String, progress: Double?, announce: Bool) {
