@@ -16,7 +16,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     private struct SentPacket {
-        let deadline: DispatchTime
+        let sentAt: DispatchTime
         let video: Bool
         let hasAudioSignal: Bool
     }
@@ -63,6 +63,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     private let minInterval = 1.0 / 24.0
     private let maxOutstanding = 2
+    private let videoBacklogLimit = DispatchTimeInterval.milliseconds(240)
+    private let packetTimeout = DispatchTimeInterval.seconds(5)
     private let longEdge = 1080
     private let frameRate = 24
     private let bitrate = 3_500_000
@@ -310,11 +312,11 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let now = DispatchTime.now()
         if let deadline = connectDeadline, now >= deadline {
             retry("Timed out connecting to the paired PC.")
-        } else if let packet = awaitingACK.first, now >= packet.deadline {
+        } else if let packet = awaitingACK.first, now >= packet.sentAt + packetTimeout {
             retry("The PC stopped acknowledging screen frames.")
         } else if let expiry = firstFrameDeadline, now >= expiry {
             retry("The PC did not acknowledge the first screen frame.")
-        } else if encoding.values.contains(where: { now >= $0 }) {
+        } else if encoding.values.contains(where: { now >= $0 + packetTimeout }) {
             // ReplayKit owns the encoder. End the broadcast rather than leaving
             // a stuck compression callback attached across reconnect attempts.
             fail("The video encoder stopped returning frames.")
@@ -426,7 +428,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let force = forceKey || needKey
         if force { needKey = true }
         let ticket = FrameTicket(connectionID: connectionID, forceKey: force)
-        encoding[ticket.id] = .now() + .seconds(5)
+        encoding[ticket.id] = .now()
         return ticket
     }
 
@@ -452,16 +454,26 @@ final class SampleHandler: RPBroadcastSampleHandler {
         sendPacket(bytes, type: keyframe ? 2 : 1, link: link, id: ticket.connectionID)
     }
 
+    private func availableAudioPackets(now: DispatchTime) -> Int {
+        guard active, ready, !paused, peer?.broadcastVersion == 2,
+              lastAcknowledgedFrame != nil else { return 0 }
+        // A still screen may have no new frames. Only a pending video frame
+        // that has fallen behind should interrupt otherwise continuous audio.
+        if encoding.values.contains(where: { now >= $0 + videoBacklogLimit }) ||
+            awaitingACK.contains(where: { $0.video && now >= $0.sentAt + videoBacklogLimit }) {
+            return 0
+        }
+        return 4 - awaitingACK.lazy.filter({ !$0.video }).count
+    }
+
     private func forwardAudio(_ sample: CMSampleBuffer) {
         let id: UUID? = queue.sync {
-            guard active, ready, !paused, peer?.broadcastVersion == 2,
-                  lastAcknowledgedFrame != nil, awaitingACK.lazy.filter({ !$0.video }).count < 8 else { return nil }
-            return connectionID
+            availableAudioPackets(now: .now()) > 0 ? connectionID : nil
         }
         guard let id, let bytes = audio.encode(sample) else { return }
         queue.sync {
-            guard active, ready, !paused, id == connectionID, let link else { return }
-            let available = 8 - awaitingACK.lazy.filter({ !$0.video }).count
+            let available = availableAudioPackets(now: .now())
+            guard available > 0, id == connectionID, let link else { return }
             for start in stride(from: 0, to: bytes.count, by: 8192).prefix(available) {
                 let part = bytes.subdata(in: start..<min(start + 8192, bytes.count))
                 sendPacket(part, type: 3, link: link, id: id,
@@ -477,7 +489,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         withUnsafeBytes(of: length) { frame.append(contentsOf: $0) }
         frame.append(type)
         frame.append(bytes)
-        awaitingACK.append(SentPacket(deadline: .now() + .seconds(5), video: type != 3,
+        awaitingACK.append(SentPacket(sentAt: .now(), video: type != 3,
                                       hasAudioSignal: hasAudioSignal))
         link.send(content: frame, completion: .contentProcessed { [weak self, weak link] error in
             guard let self, let link, self.link === link, self.connectionID == id,
@@ -513,10 +525,12 @@ final class SampleHandler: RPBroadcastSampleHandler {
                              value: kVTProfileLevel_H264_Baseline_AutoLevel)
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_AverageBitRate,
                              value: NSNumber(value: bitrate))
-        // One frame of bitrate budget. A one-second window is what holds the picture back.
-        let bytesPerFrame = bitrate / 8 / frameRate
+        // Keep the average bitrate while giving scene changes and keyframes
+        // room to use more than a single frame's worth of bits.
+        let peakWindow = 0.25
+        let peakBytes = Int(Double(bitrate) * 2 / 8 * peakWindow)
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_DataRateLimits,
-                             value: [NSNumber(value: bytesPerFrame), NSNumber(value: 1.0 / Double(frameRate))] as CFArray)
+                             value: [NSNumber(value: peakBytes), NSNumber(value: peakWindow)] as CFArray)
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_ExpectedFrameRate,
                              value: NSNumber(value: frameRate))
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
