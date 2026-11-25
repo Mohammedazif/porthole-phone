@@ -1216,7 +1216,7 @@ struct ContentView: View {
             } header: {
                 Text("Screen and audio")
             } footer: {
-                if client.linked && client.fileSendPeer?.broadcastVersion != 2 {
+                if client.linked && (client.fileSendPeer?.screenProtocolVersion ?? 1) < 2 {
                     Text("Update Porthole on your PC to receive app audio.")
                 } else if isPortholeBroadcasting && sendAudioToPC {
                     Text(client.broadcastStatus?.audioSent == true

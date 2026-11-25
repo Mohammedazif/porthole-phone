@@ -1496,7 +1496,7 @@ final class PullClient: ObservableObject {
             self.refreshNotificationPermission(promptIfNeeded: true)
         }
         if peer.resumable { send("FILES 2\nFILES 3\nQUEUE 1\n") }
-        send("INBOX?\nSHARE?\nIV?\nSCREEN? 2\n")
+        send("INBOX?\nSHARE?\nIV?\nSCREEN? 2\nSCREEN? 3\n")
         let capabilities = pendingPairingCapabilities
         pendingPairingCapabilities.removeAll()
         for capability in capabilities { handle(capability) }
@@ -1558,9 +1558,9 @@ final class PullClient: ObservableObject {
             }
             return
         }
-        if line == "SCREEN 2" {
+        if line == "SCREEN 2" || line == "SCREEN 3" {
             var capable = peer
-            capable.broadcastVersion = 2
+            capable.broadcastVersion = line == "SCREEN 3" ? 3 : max(2, peer.screenProtocolVersion)
             transportPeer = capable
             DispatchQueue.main.async {
                 guard self.fileSendPeer?.id == capable.id else { return }

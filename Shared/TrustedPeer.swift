@@ -18,6 +18,7 @@ struct TrustedPeer: Codable, Equatable {
     var broadcastVersion: Int?
 
     var stableID: UUID { pairingID ?? id }
+    var screenProtocolVersion: Int { broadcastVersion == 3 ? 3 : broadcastVersion == 2 ? 2 : 1 }
     var receiveVersion: Int { inboxVersion == 3 ? 3 : resumable ? 2 : 1 }
     var credentialProfile: String { "\(stableID.uuidString.lowercased())/\(fingerprint)" }
 
@@ -163,7 +164,7 @@ enum TrustedPeerStore {
         guard let current = load(), current.samePairing(as: reviewed) else { return nil }
         let authorization: PairedChannelAuthorization? = read("screen-share.json")
         if var destination = authorization?.connectionPeer(for: current) {
-            destination.broadcastVersion = 2
+            destination.broadcastVersion = current.broadcastVersion ?? 2
             return destination
         }
         return current.channelTicket.map(TrustedPeer.isChannelTicket) == true ? current : nil

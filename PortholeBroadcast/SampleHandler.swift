@@ -13,6 +13,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let id = UUID()
         let connectionID: UUID
         let forceKey: Bool
+        let ptsNs: UInt64
     }
 
     private struct SentPacket {
@@ -40,6 +41,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var awaitingACK: [SentPacket] = []
     private var lastReport: (phase: BroadcastPhase, message: String?, audioSent: Bool, time: DispatchTime)?
     private var lastAcknowledgedFrame: DispatchTime?
+    private var lastKeyframeSent: DispatchTime?
     private var lastAcknowledgedAudio: DispatchTime?
     private var firstFrameDeadline: DispatchTime?
     private var ticketDeadline: DispatchTime?
@@ -62,7 +64,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private lazy var imageContext = CIContext(options: [.cacheIntermediates: false])
 
     private let minInterval = 1.0 / 24.0
-    private let maxOutstanding = 2
+    private let maxOutstanding = 3
     private let videoBacklogLimit = DispatchTimeInterval.milliseconds(240)
     private let packetTimeout = DispatchTimeInterval.seconds(5)
     private let longEdge = 1080
@@ -175,7 +177,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
                         self.retry("The PC did not authenticate the screen connection.")
                         return
                     }
-                    let version = target.broadcastVersion == 2 ? 2 : 1
+                    let version = target.screenProtocolVersion
                     connection.send(content: Data("PSCR \(version)\n".utf8), completion: .contentProcessed { [weak self, weak connection] error in
                         guard let self, let connection, self.active, self.link === connection,
                               self.connectionID == id else { return }
@@ -239,6 +241,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         firstFrameDeadline = nil
         reconnectAt = nil
         lastAcknowledgedFrame = nil
+        lastKeyframeSent = nil
         lastAcknowledgedAudio = nil
         lostFrames = 0
         encoding.removeAll()
@@ -387,7 +390,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
         let orientation = Self.orientation(sampleBuffer)
         let reset = lastOrientation != orientation || lastTimestamp.map { seconds < $0 || seconds - $0 > 2 } == true
-        guard let ticket = queue.sync(execute: { reserveFrame(forceKey: reset) }) else { return }
+        guard let ticket = queue.sync(execute: { reserveFrame(forceKey: reset, ptsNs: Self.nanoseconds(timestamp)) }) else { return }
         lastTimestamp = seconds
         lastOrientation = orientation
 
@@ -420,14 +423,15 @@ final class SampleHandler: RPBroadcastSampleHandler {
         if status != noErr || flags.contains(.frameDropped) { loseFrame(ticket) }
     }
 
-    private func reserveFrame(forceKey: Bool) -> FrameTicket? {
+    private func reserveFrame(forceKey: Bool, ptsNs: UInt64) -> FrameTicket? {
         // Keep ACKs in flight concurrently, but serialize compression output so
         // asynchronously delivered callbacks cannot reorder H.264 frames.
         guard active, ready, !paused, encoding.isEmpty,
               awaitingACK.lazy.filter(\.video).count < maxOutstanding else { return nil }
-        let force = forceKey || needKey
+        let now = DispatchTime.now()
+        let force = forceKey || needKey || lastKeyframeSent.map { now >= $0 + .milliseconds(1200) } == true
         if force { needKey = true }
-        let ticket = FrameTicket(connectionID: connectionID, forceKey: force)
+        let ticket = FrameTicket(connectionID: connectionID, forceKey: force, ptsNs: ptsNs)
         encoding[ticket.id] = .now()
         return ticket
     }
@@ -450,12 +454,15 @@ final class SampleHandler: RPBroadcastSampleHandler {
             return
         }
         lostFrames = 0
-        if keyframe { needKey = false }
-        sendPacket(bytes, type: keyframe ? 2 : 1, link: link, id: ticket.connectionID)
+        if keyframe {
+            needKey = false
+            lastKeyframeSent = .now()
+        }
+        sendPacket(bytes, type: keyframe ? 2 : 1, ptsNs: ticket.ptsNs, link: link, id: ticket.connectionID)
     }
 
     private func availableAudioPackets(now: DispatchTime) -> Int {
-        guard active, ready, !paused, peer?.broadcastVersion == 2,
+        guard active, ready, !paused, (peer?.screenProtocolVersion ?? 1) >= 2,
               lastAcknowledgedFrame != nil else { return 0 }
         // A still screen may have no new frames. Only a pending video frame
         // that has fallen behind should interrupt otherwise continuous audio.
@@ -470,24 +477,32 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let id: UUID? = queue.sync {
             availableAudioPackets(now: .now()) > 0 ? connectionID : nil
         }
-        guard let id, let bytes = audio.encode(sample) else { return }
+        let timestamp = CMSampleBufferGetPresentationTimeStamp(sample)
+        guard let id, timestamp.isNumeric, let bytes = audio.encode(sample) else { return }
+        let ptsNs = Self.nanoseconds(timestamp)
         queue.sync {
             let available = availableAudioPackets(now: .now())
             guard available > 0, id == connectionID, let link else { return }
             for start in stride(from: 0, to: bytes.count, by: 8192).prefix(available) {
                 let part = bytes.subdata(in: start..<min(start + 8192, bytes.count))
-                sendPacket(part, type: 3, link: link, id: id,
+                let packetPts = ptsNs + UInt64(start / 4) * 1_000_000_000 / 44_100
+                sendPacket(part, type: 3, ptsNs: packetPts, link: link, id: id,
                            hasAudioSignal: BroadcastAudio.containsSignal(part))
             }
         }
     }
 
-    private func sendPacket(_ bytes: Data, type: UInt8, link: NWConnection, id: UUID,
+    private func sendPacket(_ bytes: Data, type: UInt8, ptsNs: UInt64, link: NWConnection, id: UUID,
                             hasAudioSignal: Bool = false) {
-        var frame = Data(capacity: bytes.count + 5)
+        let useTimestamps = peer?.screenProtocolVersion == 3
+        var frame = Data(capacity: bytes.count + (useTimestamps ? 13 : 5))
         let length = UInt32(bytes.count).bigEndian
         withUnsafeBytes(of: length) { frame.append(contentsOf: $0) }
         frame.append(type)
+        if useTimestamps {
+            let wirePts = ptsNs.bigEndian
+            withUnsafeBytes(of: wirePts) { frame.append(contentsOf: $0) }
+        }
         frame.append(bytes)
         awaitingACK.append(SentPacket(sentAt: .now(), video: type != 3,
                                       hasAudioSignal: hasAudioSignal))
@@ -496,6 +511,11 @@ final class SampleHandler: RPBroadcastSampleHandler {
                   error != nil else { return }
             self.retry("Could not send the broadcast to the paired PC.")
         })
+    }
+
+    private static func nanoseconds(_ timestamp: CMTime) -> UInt64 {
+        let time = CMTimeConvertScale(timestamp, timescale: 1_000_000_000, method: .roundHalfAwayFromZero)
+        return UInt64(max(1, time.value))
     }
 
     private static func orientation(_ sample: CMSampleBuffer) -> CGImagePropertyOrientation {
@@ -508,21 +528,32 @@ final class SampleHandler: RPBroadcastSampleHandler {
         if let session {
             VTCompressionSessionInvalidate(session)
         }
-        session = nil
+        session = makeEncoder(width: width, height: height, lowLatency: true)
+            ?? makeEncoder(width: width, height: height, lowLatency: false)
+        sessionWidth = width
+        sessionHeight = height
+    }
+
+    private func makeEncoder(width: Int, height: Int, lowLatency: Bool) -> VTCompressionSession? {
         var created: VTCompressionSession?
+        let specification = lowLatency
+            ? [kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String: true] as CFDictionary
+            : nil
         let status = VTCompressionSessionCreate(allocator: nil, width: Int32(width), height: Int32(height),
-                                                codecType: kCMVideoCodecType_H264, encoderSpecification: nil,
+                                                codecType: kCMVideoCodecType_H264, encoderSpecification: specification,
                                                 imageBufferAttributes: nil, compressedDataAllocator: nil,
                                                 outputCallback: nil, refcon: nil,
                                                 compressionSessionOut: &created)
-        guard status == noErr, let made = created else { return }
+        guard status == noErr, let made = created else { return nil }
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: NSNumber(value: 0))
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
                              value: kCFBooleanTrue)
-        VTSessionSetProperty(made, key: kVTCompressionPropertyKey_ProfileLevel,
-                             value: kVTProfileLevel_H264_Baseline_AutoLevel)
+        if !lowLatency {
+            VTSessionSetProperty(made, key: kVTCompressionPropertyKey_ProfileLevel,
+                                 value: kVTProfileLevel_H264_Baseline_AutoLevel)
+        }
         VTSessionSetProperty(made, key: kVTCompressionPropertyKey_AverageBitRate,
                              value: NSNumber(value: bitrate))
         // Keep the average bitrate while giving scene changes and keyframes
@@ -537,11 +568,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
                              value: NSNumber(value: 2))
         guard VTCompressionSessionPrepareToEncodeFrames(made) == noErr else {
             VTCompressionSessionInvalidate(made)
-            return
+            return nil
         }
-        session = made
-        sessionWidth = width
-        sessionHeight = height
+        return made
     }
 
     /// Longer side at most `longEdge`, both sides even, so the PC draws the same size it
