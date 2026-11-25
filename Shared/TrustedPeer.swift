@@ -97,6 +97,27 @@ struct TrustedPeer: Codable, Equatable {
 
 enum BroadcastPhase: String, Codable { case connecting, live, waitingForFrames, reconnecting, deliveryStopped, ended, failed }
 
+/// Where the shared app's sound plays while sharing. The raw values are the
+/// PC's protocol words.
+enum SoundMode: String, Codable, CaseIterable, Identifiable {
+    case pc, both, iPhone = "iphone"
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .pc: return "PC"
+        case .both: return "Both"
+        case .iPhone: return "iPhone"
+        }
+    }
+    var help: String {
+        switch self {
+        case .pc: return "iPhone is muted. Its volume buttons control the PC."
+        case .both: return "Plays on iPhone and PC."
+        case .iPhone: return "Plays on iPhone only."
+        }
+    }
+}
+
 struct PairedChannelAuthorization: Codable {
     let pairingID: UUID
     let fingerprint: String
@@ -183,6 +204,19 @@ enum TrustedPeerStore {
         }
     }
     static func setBroadcastAudioEnabled(_ enabled: Bool) -> Bool { write(enabled, "broadcast-audio.json") }
+
+    /// Where the shared app's sound plays, chosen on the iPhone or the PC.
+    /// Before a choice exists, the older app-audio setting decides.
+    static func soundMode() -> SoundMode {
+        if let mode: SoundMode = read("sound-mode.json") { return mode }
+        return broadcastAudioEnabled() ? .both : .iPhone
+    }
+
+    /// Only "Both" sends the shared app's sound with the screen: with "PC" the
+    /// PC is the iPhone's speaker, and with "iPhone" the sound stays here.
+    @discardableResult static func setSoundMode(_ mode: SoundMode) -> Bool {
+        write(mode, "sound-mode.json") && setBroadcastAudioEnabled(mode == .both)
+    }
 
     static func broadcastStatus() -> TrustedBroadcastStatus? { read("broadcast.json") }
     static func publishBroadcast(peer: TrustedPeer?, phase: BroadcastPhase, message: String? = nil,

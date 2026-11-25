@@ -225,8 +225,8 @@ final class PullClient: ObservableObject {
     // Accessed only on queue. Explicit selection bypasses visual matching once.
     private var chosenIdentifier: String?
     private var syncReady = false
-    // Accessed only on queue. The PC accepts the "Include app audio" setting.
-    private var audioPreferenceReady = false
+    // Accessed only on queue. The PC accepts the sound choice.
+    private var soundReady = false
     private var didReclaimStaging = false
     private var receivingRecoveryScheduled = false
     private var foreground = true
@@ -418,20 +418,19 @@ final class PullClient: ObservableObject {
         }
     }
 
-    /// Tells the PC whether "Include app audio" is on, so it stops playing the
-    /// phone's sound while sharing (including sound sent to it over AirPlay).
-    func setAppAudio(_ enabled: Bool) {
+    /// Tells the PC where the shared app's sound plays, so both devices show the same choice.
+    func setSoundMode(_ mode: SoundMode) {
         queue.async {
-            guard self.audioPreferenceReady else { return }
-            self.sendAudioPreference(enabled)
+            guard self.soundReady else { return }
+            self.sendSoundMode(mode)
         }
     }
 
     // Called on queue.
-    private func sendAudioPreference(_ enabled: Bool = TrustedPeerStore.broadcastAudioEnabled()) {
+    private func sendSoundMode(_ mode: SoundMode) {
         guard greeted else { return }
         let id = UUID().uuidString.lowercased()
-        send("AUDIO \(id) \(enabled ? 1 : 0)\n")
+        send("SOUND \(id) \(mode.rawValue)\n")
     }
 
     private func sendSystemPhoneName() {
@@ -1047,7 +1046,7 @@ final class PullClient: ObservableObject {
         deferredLines.removeAll()
         greeted = false
         syncReady = false
-        audioPreferenceReady = false
+        soundReady = false
         proposedClipboardGeneration = nil
         acceptedClipboardGeneration = nil
         pendingData = nil
@@ -1545,7 +1544,7 @@ final class PullClient: ObservableObject {
             return
         }
         guard pairingCommitted else {
-            if line == "SYNC READY" || line == "INPUT READY" || line == "AUDIO READY",
+            if line == "SYNC READY" || line == "INPUT READY" || line == "SOUND READY",
                !pendingPairingCapabilities.contains(line) {
                 pendingPairingCapabilities.append(line)
             }
@@ -1638,15 +1637,14 @@ final class PullClient: ObservableObject {
             }
             return
         }
-        if line == "AUDIO READY" {
-            audioPreferenceReady = true
-            sendAudioPreference()
+        if line == "SOUND READY" {
+            soundReady = true
+            sendSoundMode(TrustedPeerStore.soundMode())
             return
         }
-        // The PC's sound switch changed. The broadcast extension and the
-        // Settings switch both read this saved setting.
-        if line == "AUDIO SET 0" || line == "AUDIO SET 1" {
-            _ = TrustedPeerStore.setBroadcastAudioEnabled(line == "AUDIO SET 1")
+        // Chosen on the PC. The broadcast extension and Settings read the saved choice.
+        if line.hasPrefix("SOUND SET "), let mode = SoundMode(rawValue: String(line.dropFirst("SOUND SET ".count))) {
+            TrustedPeerStore.setSoundMode(mode)
             return
         }
         if line == "SYNC READY" {

@@ -1,6 +1,5 @@
 import Accessibility
 import AVFoundation
-import AVKit
 import ImageIO
 import Photos
 import PhotosUI
@@ -44,19 +43,6 @@ private struct BroadcastPicker: UIViewRepresentable {
     func updateUIView(_ picker: RPSystemBroadcastPickerView, context: Context) { }
 }
 
-private struct AudioOutputPicker: UIViewRepresentable {
-    func makeUIView(context: Context) -> AVRoutePickerView {
-        let picker = AVRoutePickerView()
-        picker.prioritizesVideoDevices = false
-        picker.tintColor = .label
-        picker.activeTintColor = .systemGreen
-        picker.accessibilityLabel = "Choose audio output"
-        return picker
-    }
-
-    func updateUIView(_ picker: AVRoutePickerView, context: Context) { }
-}
-
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var broadcastPicker = BroadcastPickerTrigger()
@@ -95,8 +81,7 @@ struct ContentView: View {
     @State private var copiedItemID: UUID?
     @State private var actionError: String?
     @State private var selectedTab = 0
-    @State private var sendAudioToPC = TrustedPeerStore.broadcastAudioEnabled()
-    @State private var outputIsAirPlay = ContentView.audioOutputIsAirPlay()
+    @State private var soundMode = TrustedPeerStore.soundMode()
 
     private var visibleUnreadRecordIDs: Set<UUID> {
         guard selectedTab == 1, activityFilter == 0, scenePhase == .active,
@@ -194,11 +179,9 @@ struct ContentView: View {
         }
         .onReceive(Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()) { _ in
             if scenePhase != .background {
-                let airPlay = Self.audioOutputIsAirPlay()
-                if airPlay != outputIsAirPlay { outputIsAirPlay = airPlay }
-                // The PC can turn app audio on or off too.
-                let appAudio = TrustedPeerStore.broadcastAudioEnabled()
-                if appAudio != sendAudioToPC { sendAudioToPC = appAudio }
+                // The PC can change the sound choice too.
+                let mode = TrustedPeerStore.soundMode()
+                if mode != soundMode { soundMode = mode }
                 refreshBroadcast()
                 if pendingWidgetShortcut != nil { presentNextSheet() }
             }
@@ -849,34 +832,35 @@ struct ContentView: View {
         }
     }
 
-    /// Sound sent to an AirPlay speaker (such as Porthole on the PC) bypasses
-    /// the broadcast's app audio.
-    private static func audioOutputIsAirPlay() -> Bool {
-        AVAudioSession.sharedInstance().currentRoute.outputs.contains { $0.portType == .airPlay }
-    }
-
-    private var broadcastAudioLabel: String {
-        if !sendAudioToPC { return "Off" }
-        if outputIsAirPlay { return "Via AirPlay" }
-        return client.broadcastStatus?.audioSent == true ? "Sending" : "Waiting"
-    }
-
-    private var audioOutputRow: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Audio output")
-                    .font(.subheadline.weight(.semibold))
-                Text(sendAudioToPC
-                     ? "Choose Porthole with your PC’s name for PC-only playback."
-                     : "Turn on Include app audio to play sound on the PC.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+    /// Saves a sound choice made here and tells the PC.
+    private var soundModeBinding: Binding<SoundMode> {
+        Binding(
+            get: { soundMode },
+            set: { mode in
+                guard TrustedPeerStore.setSoundMode(mode) else {
+                    actionError = "Porthole couldn’t save your sound setting. Try again."
+                    return
+                }
+                soundMode = mode
+                client.setSoundMode(mode)
             }
-            Spacer(minLength: 0)
-            AudioOutputPicker()
-                .frame(width: 44, height: 44)
-                .disabled(!sendAudioToPC)
-                .opacity(sendAudioToPC ? 1 : 0.4)
+        )
+    }
+
+    private var soundPicker: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Play sound on")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            Picker("Play sound on", selection: soundModeBinding) {
+                ForEach(SoundMode.allCases) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            Text(soundMode.help)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -935,13 +919,10 @@ struct ContentView: View {
             let layout = dynamicTypeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 10)) : AnyLayout(HStackLayout(spacing: 10))
             layout {
                 statCard("Video", "Up to 24 fps")
-                statCard("Broadcast audio", broadcastAudioLabel)
+                statCard("Sound", soundMode.label)
                 statCard("Input", input.mouseConnected && input.keyboardConnected ? "Detected" : "Setup required")
             }
-            audioOutputRow
-                .padding(.horizontal, 14)
-                .padding(.vertical, 6)
-                .background(cardFill, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            soundPicker
             receiveStatus
             if let message = client.broadcastStatus?.message {
                 Text(message)
@@ -1216,35 +1197,20 @@ struct ContentView: View {
             }
 
             Section {
-                Toggle(isOn: Binding(
-                    get: { sendAudioToPC },
-                    set: { enabled in
-                        guard TrustedPeerStore.setBroadcastAudioEnabled(enabled) else {
-                            actionError = "Porthole couldn’t save your audio setting. Try again."
-                            return
-                        }
-                        sendAudioToPC = enabled
-                        client.setAppAudio(enabled)
+                Picker(selection: soundModeBinding) {
+                    ForEach(SoundMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
                     }
-                )) {
-                    Label("Include app audio", systemImage: "speaker.wave.2")
+                } label: {
+                    Label("Play sound on", systemImage: "speaker.wave.2")
                 }
-                audioOutputRow
             } header: {
                 Text("Screen and audio")
             } footer: {
                 if client.linked && (client.fileSendPeer?.screenProtocolVersion ?? 1) < 2 {
-                    Text("Update Porthole on your PC to receive app audio.")
-                } else if sendAudioToPC && outputIsAirPlay {
-                    Text("Sound goes to the AirPlay speaker you chose in Audio output. AirPlay adds about 2 seconds before a video starts, resumes, or jumps. Choose iPhone for instant playback.")
-                } else if !sendAudioToPC {
-                    Text("The PC plays no sound while you share. Sound stays on this iPhone.")
-                } else if isPortholeBroadcasting && sendAudioToPC {
-                    Text(client.broadcastStatus?.audioSent == true
-                         ? "App audio is being sent to the PC."
-                         : "Waiting for app audio. Some apps restrict audio capture.")
+                    Text("Update Porthole on your PC to play sound there.")
                 } else {
-                    Text("Include app audio sends the shared app’s sound to this PC.")
+                    Text("\(soundMode.help) Synced with PC.")
                 }
             }
 
