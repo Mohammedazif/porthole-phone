@@ -14,6 +14,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let connectionID: UUID
         let forceKey: Bool
         let ptsNs: UInt64
+        let orientation: CGImagePropertyOrientation
     }
 
     private struct SentPacket {
@@ -48,6 +49,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var deliveryStopped = false
     private var broadcastEndAction: (() -> Void)?
     private var lostFrames = 0
+    private var sentOrientation: CGImagePropertyOrientation?
     private var audio = BroadcastAudio()
     private var preferencesCheckedAt: DispatchTime?
     private var sendAppAudio = false
@@ -258,6 +260,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         reconnectAt = nil
         lastAcknowledgedFrame = nil
         lastKeyframeSent = nil
+        sentOrientation = nil
         lastAcknowledgedAudio = nil
         lostFrames = 0
         encoding.removeAll()
@@ -383,7 +386,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             }
             return
         }
-        guard ready, peer?.screenProtocolVersion == 3, let link else {
+        guard ready, (peer?.screenProtocolVersion ?? 1) >= 3, let link else {
             completion()
             return
         }
@@ -444,7 +447,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let orientationChanged = lastOrientation != orientation
         let timestampDiscontinuity = lastTimestamp.map { seconds < $0 } == true
         guard let ticket = queue.sync(execute: {
-            reserveFrame(forceKey: orientationChanged || timestampDiscontinuity, ptsNs: Self.nanoseconds(timestamp))
+            reserveFrame(forceKey: orientationChanged || timestampDiscontinuity, ptsNs: Self.nanoseconds(timestamp),
+                         orientation: orientation)
         }) else { return }
         lastTimestamp = seconds
         lastOrientation = orientation
@@ -478,7 +482,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         if status != noErr || flags.contains(.frameDropped) { loseFrame(ticket) }
     }
 
-    private func reserveFrame(forceKey: Bool, ptsNs: UInt64) -> FrameTicket? {
+    private func reserveFrame(forceKey: Bool, ptsNs: UInt64, orientation: CGImagePropertyOrientation) -> FrameTicket? {
         // Keep ACKs in flight concurrently, but serialize compression output so
         // asynchronously delivered callbacks cannot reorder H.264 frames.
         guard active, ready, !paused, encoding.isEmpty,
@@ -486,7 +490,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let now = DispatchTime.now()
         let force = forceKey || needKey || lastKeyframeSent.map { now >= $0 + .milliseconds(1200) } == true
         if force { needKey = true }
-        let ticket = FrameTicket(connectionID: connectionID, forceKey: force, ptsNs: ptsNs)
+        let ticket = FrameTicket(connectionID: connectionID, forceKey: force, ptsNs: ptsNs,
+                                 orientation: orientation)
         encoding[ticket.id] = .now()
         return ticket
     }
@@ -512,6 +517,13 @@ final class SampleHandler: RPBroadcastSampleHandler {
         if keyframe {
             needKey = false
             lastKeyframeSent = .now()
+        }
+        // The PC turns its pointer positions back with this: the iPhone places
+        // an absolute pointer on its screen as mounted, not as turned.
+        if (peer?.screenProtocolVersion ?? 1) >= 4, sentOrientation != ticket.orientation {
+            sentOrientation = ticket.orientation
+            sendPacket(Data([UInt8(truncatingIfNeeded: ticket.orientation.rawValue)]), type: 5,
+                       ptsNs: ticket.ptsNs, link: link, id: ticket.connectionID)
         }
         sendPacket(bytes, type: keyframe ? 2 : 1, ptsNs: ticket.ptsNs, link: link, id: ticket.connectionID)
     }
@@ -549,7 +561,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     private func sendPacket(_ bytes: Data, type: UInt8, ptsNs: UInt64, link: NWConnection, id: UUID,
                             hasAudioSignal: Bool = false) {
-        let useTimestamps = peer?.screenProtocolVersion == 3
+        let useTimestamps = (peer?.screenProtocolVersion ?? 1) >= 3
         var frame = Data(capacity: bytes.count + (useTimestamps ? 13 : 5))
         let length = UInt32(bytes.count).bigEndian
         withUnsafeBytes(of: length) { frame.append(contentsOf: $0) }
@@ -559,7 +571,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
             withUnsafeBytes(of: wirePts) { frame.append(contentsOf: $0) }
         }
         frame.append(bytes)
-        awaitingACK.append(SentPacket(sentAt: .now(), video: type != 3,
+        awaitingACK.append(SentPacket(sentAt: .now(), video: type == 1 || type == 2,
                                       hasAudioSignal: hasAudioSignal))
         link.send(content: frame, completion: .contentProcessed { [weak self, weak link] error in
             guard let self, let link, self.link === link, self.connectionID == id,

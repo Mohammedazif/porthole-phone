@@ -18,7 +18,7 @@ struct TrustedPeer: Codable, Equatable {
     var broadcastVersion: Int?
 
     var stableID: UUID { pairingID ?? id }
-    var screenProtocolVersion: Int { broadcastVersion == 3 ? 3 : broadcastVersion == 2 ? 2 : 1 }
+    var screenProtocolVersion: Int { min(max(broadcastVersion ?? 1, 1), 4) }
     var receiveVersion: Int { inboxVersion == 3 ? 3 : resumable ? 2 : 1 }
     var credentialProfile: String { "\(stableID.uuidString.lowercased())/\(fingerprint)" }
 
