@@ -22,12 +22,15 @@ struct TrustedPeer: Codable, Equatable {
     var receiveVersion: Int { inboxVersion == 3 ? 3 : resumable ? 2 : 1 }
     var credentialProfile: String { "\(stableID.uuidString.lowercased())/\(fingerprint)" }
 
+    /// The PC's own name, exactly as it is: "UNKNOWN", "-" or blank-looking
+    /// characters included. Only an empty value or a bare IP address (which
+    /// came from the address field, not a name) is not a name.
     static func computerName(_ value: String?) -> String? {
-        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !["", "unknown", "localhost", "your pc", "porthole pc"].contains(value.lowercased()) else { return nil }
+        guard let value, !value.isEmpty else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         var ipv4 = in_addr()
-        guard inet_pton(AF_INET, value, &ipv4) != 1, !isIPv6(value) else { return nil }
-        return value
+        guard inet_pton(AF_INET, trimmed, &ipv4) != 1, !isIPv6(trimmed) else { return nil }
+        return trimmed.isEmpty ? value : trimmed
     }
 
     func samePairing(as other: TrustedPeer) -> Bool {

@@ -311,8 +311,27 @@ final class ShareViewController: UIViewController {
         ])
     }
 
+    /// iOS hosts the extension in its own sheet, and since iOS 26 the views
+    /// above ours paint that sheet opaque. Clearing every one of them lets the
+    /// sharing app show above the card.
+    private func clearHostBackground() {
+        var host: UIView? = view
+        while let current = host {
+            current.backgroundColor = .clear
+            current.isOpaque = false
+            host = current.superview
+        }
+        view.window?.backgroundColor = .clear
+    }
+
+    override func viewIsAppearing(_ animated: Bool) {
+        super.viewIsAppearing(animated)
+        clearHostBackground()
+    }
+
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        clearHostBackground()
         guard !started else { return }
         started = true
         UIView.animate(withDuration: 0.25) { self.dim.alpha = 1 }

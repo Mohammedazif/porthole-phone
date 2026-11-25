@@ -446,8 +446,12 @@ final class PullClient: ObservableObject {
     }
 
     private static func displayName(_ raw: String, maxBytes: Int) -> String? {
-        let clean = raw.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }
-        let name = String(String.UnicodeScalarView(clean)).trimmingCharacters(in: .whitespacesAndNewlines)
+        let clean = String(String.UnicodeScalarView(raw.unicodeScalars.filter {
+            !CharacterSet.controlCharacters.contains($0)
+        }))
+        // A name of only blank characters is still the PC's name.
+        let trimmed = clean.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = trimmed.isEmpty ? clean : trimmed
         var result = ""
         var remaining = maxBytes
         for character in name {

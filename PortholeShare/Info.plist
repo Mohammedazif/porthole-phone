@@ -30,8 +30,6 @@
 		<string>$(PRODUCT_MODULE_NAME).ShareViewController</string>
 		<key>NSExtensionAttributes</key>
 		<dict>
-			<key>NSExtensionActionWantsFullScreenPresentation</key>
-			<true/>
 			<key>NSExtensionActivationRule</key>
 			<dict>
 				<key>NSExtensionActivationSupportsImageWithMaxCount</key>
