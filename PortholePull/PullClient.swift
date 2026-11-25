@@ -836,7 +836,7 @@ final class PullClient: ObservableObject {
 
     var computerName: String {
         let peer = fileSendPeer ?? savedPC
-        return TrustedPeer.computerName(deviceName) ?? TrustedPeer.computerName(peer?.name) ?? peer?.host ?? "PC"
+        return TrustedPeer.computerName(deviceName) ?? TrustedPeer.computerName(peer?.name) ?? "PC"
     }
 
     /// Callable from any queue; the list lives on the main thread.
@@ -1445,7 +1445,7 @@ final class PullClient: ObservableObject {
               TrustedPeer.isChannelTicket(String(fields[1])) else { return false }
         let advertisedName = fields.count == 3 ? Data(base64Encoded: String(fields[2]))
             .flatMap { String(data: $0, encoding: .utf8) }.flatMap { Self.displayName($0, maxBytes: 63) } : nil
-        let name = TrustedPeer.computerName(advertisedName) ?? TrustedPeer.computerName(peer.name) ?? peer.host
+        let name = TrustedPeer.computerName(advertisedName) ?? TrustedPeer.computerName(peer.name) ?? "PC"
         var verified = TrustedPeer(host: peer.host, name: name, fingerprint: peer.fingerprint,
                                    id: peer.id, pairingID: peer.stableID)
         verified.channelTicket = String(fields[1])

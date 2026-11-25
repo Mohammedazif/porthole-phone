@@ -24,7 +24,9 @@ struct TrustedPeer: Codable, Equatable {
 
     static func computerName(_ value: String?) -> String? {
         guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !["", "unknown", "localhost", "your pc", "porthole", "porthole pc"].contains(value.lowercased()) else { return nil }
+              !["", "unknown", "localhost", "your pc", "porthole pc"].contains(value.lowercased()) else { return nil }
+        var ipv4 = in_addr()
+        guard inet_pton(AF_INET, value, &ipv4) != 1, !isIPv6(value) else { return nil }
         return value
     }
 
@@ -181,8 +183,6 @@ enum TrustedPeerStore {
         }
     }
     static func setBroadcastAudioEnabled(_ enabled: Bool) -> Bool { write(enabled, "broadcast-audio.json") }
-    static func rotateBroadcastLandscape() -> Bool { read("broadcast-landscape-rotation.json") ?? false }
-    static func setRotateBroadcastLandscape(_ enabled: Bool) -> Bool { write(enabled, "broadcast-landscape-rotation.json") }
 
     static func broadcastStatus() -> TrustedBroadcastStatus? { read("broadcast.json") }
     static func publishBroadcast(peer: TrustedPeer?, phase: BroadcastPhase, message: String? = nil,

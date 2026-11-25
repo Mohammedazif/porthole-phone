@@ -51,7 +51,6 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var audio = BroadcastAudio()
     private var preferencesCheckedAt: DispatchTime?
     private var sendAppAudio = false
-    private var rotateLandscape = false
 
     private var session: VTCompressionSession?
     private var sessionWidth = 0
@@ -427,7 +426,6 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let enabled = TrustedPeerStore.broadcastAudioEnabled()
         if sendAppAudio && !enabled { audio = BroadcastAudio() }
         sendAppAudio = enabled
-        rotateLandscape = TrustedPeerStore.rotateBroadcastLandscape()
     }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with type: RPSampleBufferType) {
@@ -442,7 +440,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         guard seconds.isFinite else { return }
         if let lastTimestamp, seconds >= lastTimestamp, seconds - lastTimestamp < minInterval { return }
 
-        let orientation = Self.orientation(sampleBuffer, image: image, rotateLandscape: rotateLandscape)
+        let orientation = Self.orientation(sampleBuffer, image: image)
         let orientationChanged = lastOrientation != orientation
         let timestampDiscontinuity = lastTimestamp.map { seconds < $0 } == true
         guard let ticket = queue.sync(execute: {
@@ -575,44 +573,28 @@ final class SampleHandler: RPBroadcastSampleHandler {
         return UInt64(max(1, time.value))
     }
 
-    private static func orientation(_ sample: CMSampleBuffer, image: CVImageBuffer,
-                                    rotateLandscape: Bool) -> CGImagePropertyOrientation {
+    private static func orientation(_ sample: CMSampleBuffer, image: CVImageBuffer) -> CGImagePropertyOrientation {
         let key = kCGImagePropertyOrientation
         let sampleOrientation = CMGetAttachment(sample, key: key, attachmentModeOut: nil) as? NSNumber
         let pixelOrientation = CVBufferCopyAttachment(image, key, nil) as? NSNumber
         let replayKitOrientation = CMGetAttachment(sample, key: RPVideoSampleOrientationKey as CFString,
                                                     attachmentModeOut: nil) as? NSNumber
-        let explicit = (sampleOrientation ?? pixelOrientation).flatMap {
-            CGImagePropertyOrientation(rawValue: $0.uint32Value)
-        }
-        var orientation = explicit ?? replayKitOrientation.flatMap {
+        let fromSample = sampleOrientation.flatMap { CGImagePropertyOrientation(rawValue: $0.uint32Value) }
+        let fromImage = pixelOrientation.flatMap { CGImagePropertyOrientation(rawValue: $0.uint32Value) }
+        if let explicit = fromSample ?? fromImage { return explicit }
+        let orientation = replayKitOrientation.flatMap {
             CGImagePropertyOrientation(rawValue: $0.uint32Value)
         } ?? .up
+        guard CVPixelBufferGetWidth(image) > CVPixelBufferGetHeight(image) else { return orientation }
 
-        let width = CVPixelBufferGetWidth(image)
-        let height = CVPixelBufferGetHeight(image)
-        // Some ReplayKit frames arrive as native landscape pixels with a
-        // legacy quarter-turn tag. The pixel buffer has already been turned.
-        if explicit == nil && width > height && swapsAxes(orientation) { orientation = .up }
-        let isLandscape = swapsAxes(orientation) ? height > width : width > height
-        guard rotateLandscape && isLandscape else { return orientation }
+        // A native landscape frame already has the landscape axes. The legacy
+        // tags distinguish the two directions, which differ by a half-turn.
         switch orientation {
-        case .up: return .down
-        case .down: return .up
-        case .left: return .right
-        case .right: return .left
-        case .upMirrored: return .downMirrored
-        case .downMirrored: return .upMirrored
-        case .leftMirrored: return .rightMirrored
-        case .rightMirrored: return .leftMirrored
-        @unknown default: return orientation
-        }
-    }
-
-    private static func swapsAxes(_ orientation: CGImagePropertyOrientation) -> Bool {
-        switch orientation {
-        case .left, .right, .leftMirrored, .rightMirrored: return true
-        default: return false
+        case .right: return .up
+        case .left: return .down
+        case .rightMirrored: return .upMirrored
+        case .leftMirrored: return .downMirrored
+        default: return orientation
         }
     }
 

@@ -96,7 +96,6 @@ struct ContentView: View {
     @State private var actionError: String?
     @State private var selectedTab = 0
     @State private var sendAudioToPC = TrustedPeerStore.broadcastAudioEnabled()
-    @State private var rotateLandscape = TrustedPeerStore.rotateBroadcastLandscape()
 
     private var visibleUnreadRecordIDs: Set<UUID> {
         guard selectedTab == 1, activityFilter == 0, scenePhase == .active,
@@ -577,8 +576,7 @@ struct ContentView: View {
                 .textCase(.uppercase)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 12)
-            pcRow(TrustedPeer.computerName(saved.name) ?? saved.host,
-                  detail: saved.name == saved.host ? nil : saved.host) {
+            pcRow(TrustedPeer.computerName(saved.name) ?? "Saved computer", detail: saved.host) {
                 client.connectSavedPC()
             }
             .background(cardFill, in: RoundedRectangle(cornerRadius: 22))
@@ -1214,18 +1212,6 @@ struct ContentView: View {
                     Label("Include app audio", systemImage: "speaker.wave.2")
                 }
                 audioOutputRow
-                Toggle(isOn: Binding(
-                    get: { rotateLandscape },
-                    set: { enabled in
-                        guard TrustedPeerStore.setRotateBroadcastLandscape(enabled) else {
-                            actionError = "Porthole couldn’t save your landscape setting. Try again."
-                            return
-                        }
-                        rotateLandscape = enabled
-                    }
-                )) {
-                    Label("Rotate landscape 180°", systemImage: "rotate.right")
-                }
             } header: {
                 Text("Screen and audio")
             } footer: {

@@ -9,10 +9,12 @@ func require(_ condition: Bool, _ message: String) {
 
 let pin = String(repeating: "a1", count: 32)
 require(TrustedPeer.computerName("  Studio-PC ") == "Studio-PC", "Use the computer name")
-require(TrustedPeer.computerName("Porthole") == nil && TrustedPeer.computerName("Porthole PC") == nil,
-        "Receiver branding must not replace a saved computer name")
+require(TrustedPeer.computerName("Porthole") == "Porthole", "Accept Porthole as a computer name")
+require(TrustedPeer.computerName("Porthole PC") == nil, "Ignore the generic desktop fallback")
+require(TrustedPeer.computerName("192.0.2.42") == nil && TrustedPeer.computerName("2001:db8::42") == nil,
+        "IP addresses are endpoints, not computer names")
 require(TrustedPeer.computerName("Your PC") == nil && TrustedPeer.computerName("UNKNOWN") == nil,
-        "Use the network address when an older PC only advertises a placeholder")
+        "Ignore computer-name placeholders")
 let standardGroup = "group.local.porthole.pull"
 let profileGroup = standardGroup + ".A1B2C3D4E5"
 let xml = try PropertyListSerialization.data(
