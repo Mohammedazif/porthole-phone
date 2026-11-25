@@ -9,6 +9,8 @@ func require(_ condition: Bool, _ message: String) {
 
 let pin = String(repeating: "a1", count: 32)
 require(TrustedPeer.computerName("  Studio-PC ") == "Studio-PC", "Use the computer name")
+require(TrustedPeer.computerName("Porthole") == nil && TrustedPeer.computerName("Porthole PC") == nil,
+        "Receiver branding must not replace a saved computer name")
 require(TrustedPeer.computerName("Your PC") == nil && TrustedPeer.computerName("UNKNOWN") == nil,
         "Use the network address when an older PC only advertises a placeholder")
 let standardGroup = "group.local.porthole.pull"

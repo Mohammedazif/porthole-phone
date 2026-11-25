@@ -23,7 +23,7 @@ struct TrustedPeer: Codable, Equatable {
 
     static func computerName(_ value: String?) -> String? {
         guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !["", "unknown", "localhost", "your pc"].contains(value.lowercased()) else { return nil }
+              !["", "unknown", "localhost", "your pc", "porthole", "porthole pc"].contains(value.lowercased()) else { return nil }
         return value
     }
 

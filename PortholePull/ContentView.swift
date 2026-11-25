@@ -854,7 +854,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Audio output")
                     .font(.subheadline.weight(.semibold))
-                Text("Choose Porthole for PC-only audio.")
+                Text("Play audio, then choose Porthole with your PC’s name.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -865,81 +865,92 @@ struct ContentView: View {
     }
 
     private var sharingScreen: some View {
-        ScrollView {
-            VStack(spacing: 22) {
-                HStack {
-                    GlassIconButton(systemImage: "chevron.left", label: "Back") { hideSharing = true }
-                    Spacer()
-                    Label(broadcastLabel, systemImage: isLive && !stoppingBroadcast ? "dot.radiowaves.left.and.right" : "clock")
-                        .font(.footnote.weight(.semibold))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(.thinMaterial, in: Capsule())
-                }
-                VStack(spacing: 4) {
-                    Text(isLive ? "Sharing to" : "Connecting to")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    Text(deviceTitle)
-                        .font(.largeTitle.bold())
-                        .multilineTextAlignment(.center)
-                }
-                if isLive, let started = shareStarted {
-                    TimelineView(.periodic(from: started, by: 1)) { context in
-                        let elapsed = max(0, Int(context.date.timeIntervalSince(started)))
-                        PortholeLens(diameter: dynamicTypeSize.isAccessibilitySize ? 200 : 248) {
-                            VStack(spacing: 4) {
-                                Text(Duration.seconds(elapsed).formatted(.time(pattern: .minuteSecond)))
-                                    .font(.title.monospacedDigit())
-                                Text("Elapsed time")
-                                    .font(.footnote)
-                                    .foregroundStyle(.secondary)
-                            }
-                            .multilineTextAlignment(.center)
+        ViewThatFits(in: .vertical) {
+            sharingDetails.fixedSize(horizontal: false, vertical: true)
+            ScrollView { sharingDetails }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .safeAreaInset(edge: .bottom) { sharingStopButton }
+    }
+
+    private var sharingDetails: some View {
+        VStack(spacing: 12) {
+            HStack {
+                GlassIconButton(systemImage: "chevron.left", label: "Back") { hideSharing = true }
+                Spacer()
+                Label(broadcastLabel, systemImage: isLive && !stoppingBroadcast ? "dot.radiowaves.left.and.right" : "clock")
+                    .font(.footnote.weight(.semibold))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(.thinMaterial, in: Capsule())
+            }
+            VStack(spacing: 4) {
+                Text(isLive ? "Sharing to" : "Connecting to")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Text(deviceTitle)
+                    .font(.largeTitle.bold())
+                    .multilineTextAlignment(.center)
+            }
+            if isLive, let started = shareStarted {
+                TimelineView(.periodic(from: started, by: 1)) { context in
+                    let elapsed = max(0, Int(context.date.timeIntervalSince(started)))
+                    PortholeLens(diameter: 152) {
+                        VStack(spacing: 4) {
+                            Text(Duration.seconds(elapsed).formatted(.time(pattern: .minuteSecond)))
+                                .font(.title.monospacedDigit())
+                            Text("Elapsed time")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
                         }
-                        .accessibilityElement(children: .combine)
+                        .multilineTextAlignment(.center)
                     }
-                } else {
-                    ProgressView(broadcastLabel)
-                        .frame(minHeight: 70)
+                    .accessibilityElement(children: .combine)
                 }
-                let layout = dynamicTypeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 10)) : AnyLayout(HStackLayout(spacing: 10))
-                layout {
-                    statCard("Video", "Up to 24 fps")
-                    statCard("Broadcast audio", broadcastAudioLabel)
-                    statCard("Input", input.mouseConnected && input.keyboardConnected ? "Detected" : "Setup required")
-                }
-                audioOutputRow
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 6)
-                    .background(cardFill, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                receiveStatus
-                Text(client.broadcastStatus?.message ?? "Your screen and notifications stay visible until you stop sharing.")
+            } else {
+                ProgressView(broadcastLabel)
+                    .frame(minHeight: 44)
+            }
+            let layout = dynamicTypeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 10)) : AnyLayout(HStackLayout(spacing: 10))
+            layout {
+                statCard("Video", "Up to 24 fps")
+                statCard("Broadcast audio", broadcastAudioLabel)
+                statCard("Input", input.mouseConnected && input.keyboardConnected ? "Detected" : "Setup required")
+            }
+            audioOutputRow
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+                .background(cardFill, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            receiveStatus
+            if let message = client.broadcastStatus?.message {
+                Text(message)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
             }
-            .padding(20)
         }
-        .safeAreaInset(edge: .bottom) {
-            Button(role: .destructive, action: {
-                if deliveryStopped {
-                    actionError = "Open Control Center, then tap the active Screen Recording control to finish the broadcast."
-                } else {
-                    confirmingStopBroadcast = true
-                }
-            }) {
-                Text(deliveryStopped ? "End in Control Center" : stoppingBroadcast ? "Stopping…" : "Stop sharing")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity, minHeight: 44)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+    }
+
+    private var sharingStopButton: some View {
+        Button(role: .destructive, action: {
+            if deliveryStopped {
+                actionError = "Open Control Center, then tap the active Screen Recording control to finish the broadcast."
+            } else {
+                confirmingStopBroadcast = true
             }
-            .buttonStyle(.bordered)
-            .buttonBorderShape(.capsule)
-            .disabled(stoppingBroadcast)
-            .padding(.horizontal, 20)
-            .padding(.vertical, 8)
-            .background(.regularMaterial)
+        }) {
+            Text(deliveryStopped ? "End in Control Center" : stoppingBroadcast ? "Stopping…" : "Stop sharing")
+                .font(.headline)
+                .frame(maxWidth: .infinity, minHeight: 44)
         }
+        .buttonStyle(.bordered)
+        .buttonBorderShape(.capsule)
+        .disabled(stoppingBroadcast)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 8)
+        .background(.regularMaterial)
     }
 
     private func statCard(_ title: String, _ value: String) -> some View {

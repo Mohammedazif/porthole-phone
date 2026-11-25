@@ -89,11 +89,16 @@ final class CompanionBackgroundAudio {
     }
 
     private func stopPlayback() {
+        let session = AVAudioSession.sharedInstance()
+        let usingAirPlay = sessionActive && session.currentRoute.outputs.contains { $0.portType == .airPlay }
         player.stop()
         engine.stop()
         if sessionActive {
             sessionActive = false
-            try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+            // Leave the selected AirPlay route in place when stopping the silent player.
+            if !usingAirPlay {
+                try? session.setActive(false, options: [.notifyOthersOnDeactivation])
+            }
         }
     }
 }
