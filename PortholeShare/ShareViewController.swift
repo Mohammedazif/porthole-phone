@@ -78,6 +78,71 @@ final class ShareViewController: UIViewController {
     private var closing = false
     private var started = false
 
+    // Porthole's own card over the sharing app: it opens at half height, drags
+    // up to full height, and drags down (or a tap outside) to cancel.
+    private let dim = UIView()
+    private let card = UIView()
+    private var cardTop: NSLayoutConstraint?
+    private var expanded = false
+    private var dragging = false
+    private var dragStart: CGFloat = 0
+
+    override init(nibName: String?, bundle: Bundle?) {
+        super.init(nibName: nibName, bundle: bundle)
+        modalPresentationStyle = .overFullScreen
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        modalPresentationStyle = .overFullScreen
+    }
+
+    private var halfTop: CGFloat { max(view.safeAreaInsets.top + 8, view.bounds.height * 0.45) }
+    private var fullTop: CGFloat { view.safeAreaInsets.top + 8 }
+
+    private func placeCard(expanded: Bool, animated: Bool) {
+        self.expanded = expanded
+        cardTop?.constant = expanded ? fullTop : halfTop
+        guard animated else { view.layoutIfNeeded(); return }
+        UIView.animate(withDuration: 0.32, delay: 0, usingSpringWithDamping: 0.9, initialSpringVelocity: 0,
+                       options: [.allowUserInteraction]) { self.view.layoutIfNeeded() }
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        // Keep the card at its height as the screen size or safe area settles.
+        guard !closing, !dragging, view.bounds.height > 0, let top = cardTop else { return }
+        let wanted = expanded ? fullTop : halfTop
+        if top.constant != wanted { top.constant = wanted }
+    }
+
+    @objc private func dragCard(_ pan: UIPanGestureRecognizer) {
+        guard let top = cardTop, !closing else { return }
+        switch pan.state {
+        case .began:
+            dragging = true
+            dragStart = top.constant
+        case .changed:
+            top.constant = max(fullTop, dragStart + pan.translation(in: view).y)
+        case .ended, .cancelled:
+            dragging = false
+            let velocity = pan.velocity(in: view).y
+            if top.constant > halfTop + 90 || (velocity > 900 && !expanded) {
+                close()
+            } else if velocity < -500 || top.constant < (halfTop + fullTop) / 2 {
+                placeCard(expanded: true, animated: true)
+            } else {
+                placeCard(expanded: false, animated: true)
+            }
+        default:
+            break
+        }
+    }
+
+    @objc private func toggleCard() {
+        placeCard(expanded: !expanded, animated: true)
+    }
+
     private static func card() -> UIStackView {
         let card = UIStackView()
         card.axis = .vertical
@@ -90,8 +155,35 @@ final class ShareViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = .systemGroupedBackground
+        view.backgroundColor = .clear
         preferredContentSize = CGSize(width: 420, height: 600)
+        dim.backgroundColor = UIColor.black.withAlphaComponent(0.35)
+        dim.alpha = 0
+        dim.isAccessibilityElement = true
+        dim.accessibilityLabel = "Cancel sending"
+        dim.accessibilityTraits = .button
+        dim.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(close)))
+        dim.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(dim)
+        card.backgroundColor = .systemGroupedBackground
+        card.layer.cornerRadius = 28
+        card.layer.cornerCurve = .continuous
+        card.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        card.layer.shadowColor = UIColor.black.cgColor
+        card.layer.shadowOpacity = 0.2
+        card.layer.shadowRadius = 18
+        card.accessibilityViewIsModal = true
+        card.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(card)
+        let grabber = UIView()
+        grabber.backgroundColor = .tertiaryLabel
+        grabber.layer.cornerRadius = 2.5
+        grabber.isAccessibilityElement = true
+        grabber.accessibilityLabel = "Resize"
+        grabber.accessibilityTraits = .button
+        grabber.accessibilityHint = "Shows the sheet at full or half height."
+        grabber.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(grabber)
         titleLabel.text = "Send to PC"
         titleLabel.font = UIFontMetrics(forTextStyle: .headline).scaledFont(for: .systemFont(ofSize: 17, weight: .semibold))
         titleLabel.adjustsFontForContentSizeCategory = true
@@ -184,10 +276,29 @@ final class ShareViewController: UIViewController {
         body.axis = .vertical
         body.spacing = 16
         body.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(body)
+        card.addSubview(body)
+        // The grab handle and the header row move the card.
+        for handle in [grabber, header] as [UIView] {
+            handle.addGestureRecognizer(UIPanGestureRecognizer(target: self, action: #selector(dragCard(_:))))
+        }
+        grabber.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(toggleCard)))
+        let top = card.topAnchor.constraint(equalTo: view.topAnchor)
+        cardTop = top
         let safe = view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
-            body.topAnchor.constraint(equalTo: safe.topAnchor, constant: 12),
+            dim.topAnchor.constraint(equalTo: view.topAnchor),
+            dim.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            dim.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            dim.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            top,
+            card.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            card.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            card.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            grabber.topAnchor.constraint(equalTo: card.topAnchor, constant: 8),
+            grabber.centerXAnchor.constraint(equalTo: card.centerXAnchor),
+            grabber.widthAnchor.constraint(equalToConstant: 36),
+            grabber.heightAnchor.constraint(equalToConstant: 5),
+            body.topAnchor.constraint(equalTo: grabber.bottomAnchor, constant: 10),
             body.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 20),
             body.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -20),
             body.bottomAnchor.constraint(equalTo: safe.bottomAnchor, constant: -12),
@@ -204,6 +315,7 @@ final class ShareViewController: UIViewController {
         super.viewDidAppear(animated)
         guard !started else { return }
         started = true
+        UIView.animate(withDuration: 0.25) { self.dim.alpha = 1 }
         guard TrustedPeerStore.available else {
             status.text = "This install did not grant Share access to the Porthole App Group."
             finished = true
@@ -275,7 +387,18 @@ final class ShareViewController: UIViewController {
         guard !closing else { return }
         closing = true
         transfer?.cancel()
-        extensionContext?.completeRequest(returningItems: nil, completionHandler: nil)
+        cardTop?.constant = view.bounds.height
+        UIView.animate(withDuration: 0.25, animations: {
+            self.dim.alpha = 0
+            self.view.layoutIfNeeded()
+        }, completion: { _ in
+            self.extensionContext?.completeRequest(returningItems: nil, completionHandler: nil)
+        })
+    }
+
+    override func accessibilityPerformEscape() -> Bool {
+        close()
+        return true
     }
 
     private func presentFiles(_ items: [ShareTransfer.Item]) {
