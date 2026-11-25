@@ -854,7 +854,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Audio output")
                     .font(.subheadline.weight(.semibold))
-                Text("Play audio, then choose Porthole with your PC’s name.")
+                Text("Choose Porthole with your PC’s name for PC-only playback.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -866,14 +866,19 @@ struct ContentView: View {
 
     private var sharingScreen: some View {
         ViewThatFits(in: .vertical) {
-            sharingDetails.fixedSize(horizontal: false, vertical: true)
-            ScrollView { sharingDetails }
+            sharingDetails(diameter: 248)
+                .fixedSize(horizontal: false, vertical: true)
+            sharingDetails(diameter: 216)
+                .fixedSize(horizontal: false, vertical: true)
+            sharingDetails(diameter: 184)
+                .fixedSize(horizontal: false, vertical: true)
+            ScrollView { sharingDetails(diameter: 184) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .safeAreaInset(edge: .bottom) { sharingStopButton }
     }
 
-    private var sharingDetails: some View {
+    private func sharingDetails(diameter: CGFloat) -> some View {
         VStack(spacing: 12) {
             HStack {
                 GlassIconButton(systemImage: "chevron.left", label: "Back") { hideSharing = true }
@@ -895,7 +900,7 @@ struct ContentView: View {
             if isLive, let started = shareStarted {
                 TimelineView(.periodic(from: started, by: 1)) { context in
                     let elapsed = max(0, Int(context.date.timeIntervalSince(started)))
-                    PortholeLens(diameter: 152) {
+                    PortholeLens(diameter: diameter) {
                         VStack(spacing: 4) {
                             Text(Duration.seconds(elapsed).formatted(.time(pattern: .minuteSecond)))
                                 .font(.title.monospacedDigit())
