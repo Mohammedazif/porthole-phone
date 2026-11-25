@@ -573,28 +573,36 @@ final class SampleHandler: RPBroadcastSampleHandler {
         return UInt64(max(1, time.value))
     }
 
+    /// The rotation that turns this frame upright.
+    ///
+    /// ReplayKit's `RPVideoSampleOrientationKey` names the opposite quarter-turn
+    /// from Core Image: WebRTC's ReplayKit capturer (react-native-webrtc,
+    /// used for Jitsi screen sharing) turns `.left` 90° clockwise and `.right`
+    /// 270°, while `CIImage.oriented(.left)` turns 90° counterclockwise. Passing
+    /// the tag straight to Core Image left both landscape directions upside down.
     private static func orientation(_ sample: CMSampleBuffer, image: CVImageBuffer) -> CGImagePropertyOrientation {
         let key = kCGImagePropertyOrientation
         let sampleOrientation = CMGetAttachment(sample, key: key, attachmentModeOut: nil) as? NSNumber
         let pixelOrientation = CVBufferCopyAttachment(image, key, nil) as? NSNumber
-        let replayKitOrientation = CMGetAttachment(sample, key: RPVideoSampleOrientationKey as CFString,
-                                                    attachmentModeOut: nil) as? NSNumber
         let fromSample = sampleOrientation.flatMap { CGImagePropertyOrientation(rawValue: $0.uint32Value) }
         let fromImage = pixelOrientation.flatMap { CGImagePropertyOrientation(rawValue: $0.uint32Value) }
         if let explicit = fromSample ?? fromImage { return explicit }
-        let orientation = replayKitOrientation.flatMap {
-            CGImagePropertyOrientation(rawValue: $0.uint32Value)
-        } ?? .up
-        guard CVPixelBufferGetWidth(image) > CVPixelBufferGetHeight(image) else { return orientation }
-
-        // A native landscape frame already has the landscape axes. The legacy
-        // tags distinguish the two directions, which differ by a half-turn.
-        switch orientation {
-        case .right: return .up
-        case .left: return .down
-        case .rightMirrored: return .upMirrored
-        case .leftMirrored: return .downMirrored
-        default: return orientation
+        let replayKit = (CMGetAttachment(sample, key: RPVideoSampleOrientationKey as CFString,
+                                         attachmentModeOut: nil) as? NSNumber)
+            .flatMap { CGImagePropertyOrientation(rawValue: $0.uint32Value) } ?? .up
+        let quarterTurn: Bool
+        switch replayKit {
+        case .left, .right, .leftMirrored, .rightMirrored: quarterTurn = true
+        default: quarterTurn = false
+        }
+        // Pixels that already have the landscape axes need no quarter-turn.
+        if quarterTurn && CVPixelBufferGetWidth(image) > CVPixelBufferGetHeight(image) { return .up }
+        switch replayKit {
+        case .left: return .right
+        case .right: return .left
+        case .leftMirrored: return .rightMirrored
+        case .rightMirrored: return .leftMirrored
+        default: return replayKit
         }
     }
 

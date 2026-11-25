@@ -225,6 +225,8 @@ final class PullClient: ObservableObject {
     // Accessed only on queue. Explicit selection bypasses visual matching once.
     private var chosenIdentifier: String?
     private var syncReady = false
+    // Accessed only on queue. The PC accepts the "Include app audio" setting.
+    private var audioPreferenceReady = false
     private var didReclaimStaging = false
     private var receivingRecoveryScheduled = false
     private var foreground = true
@@ -414,6 +416,22 @@ final class PullClient: ObservableObject {
             guard let self, self.expectedClipboardReceipt == "SYNC OK \(id) \(value)" else { return }
             self.clipboardReceiptTimer = self.receiptTimeout(for: peer, message: "The PC did not confirm the clipboard setting.")
         }
+    }
+
+    /// Tells the PC whether "Include app audio" is on, so it stops playing the
+    /// phone's sound while sharing (including sound sent to it over AirPlay).
+    func setAppAudio(_ enabled: Bool) {
+        queue.async {
+            guard self.audioPreferenceReady else { return }
+            self.sendAudioPreference(enabled)
+        }
+    }
+
+    // Called on queue.
+    private func sendAudioPreference(_ enabled: Bool = TrustedPeerStore.broadcastAudioEnabled()) {
+        guard greeted else { return }
+        let id = UUID().uuidString.lowercased()
+        send("AUDIO \(id) \(enabled ? 1 : 0)\n")
     }
 
     private func sendSystemPhoneName() {
@@ -1029,6 +1047,7 @@ final class PullClient: ObservableObject {
         deferredLines.removeAll()
         greeted = false
         syncReady = false
+        audioPreferenceReady = false
         proposedClipboardGeneration = nil
         acceptedClipboardGeneration = nil
         pendingData = nil
@@ -1526,7 +1545,8 @@ final class PullClient: ObservableObject {
             return
         }
         guard pairingCommitted else {
-            if line == "SYNC READY" || line == "INPUT READY", !pendingPairingCapabilities.contains(line) {
+            if line == "SYNC READY" || line == "INPUT READY" || line == "AUDIO READY",
+               !pendingPairingCapabilities.contains(line) {
                 pendingPairingCapabilities.append(line)
             }
             return
@@ -1616,6 +1636,17 @@ final class PullClient: ObservableObject {
                 guard self.fileSendPeer?.id == peer.id, self.requestedInputID == String(id) else { return }
                 self.inputSettingsApplied = true
             }
+            return
+        }
+        if line == "AUDIO READY" {
+            audioPreferenceReady = true
+            sendAudioPreference()
+            return
+        }
+        // The PC's sound switch changed. The broadcast extension and the
+        // Settings switch both read this saved setting.
+        if line == "AUDIO SET 0" || line == "AUDIO SET 1" {
+            _ = TrustedPeerStore.setBroadcastAudioEnabled(line == "AUDIO SET 1")
             return
         }
         if line == "SYNC READY" {

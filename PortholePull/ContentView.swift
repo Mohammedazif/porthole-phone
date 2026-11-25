@@ -96,6 +96,7 @@ struct ContentView: View {
     @State private var actionError: String?
     @State private var selectedTab = 0
     @State private var sendAudioToPC = TrustedPeerStore.broadcastAudioEnabled()
+    @State private var outputIsAirPlay = ContentView.audioOutputIsAirPlay()
 
     private var visibleUnreadRecordIDs: Set<UUID> {
         guard selectedTab == 1, activityFilter == 0, scenePhase == .active,
@@ -193,6 +194,11 @@ struct ContentView: View {
         }
         .onReceive(Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()) { _ in
             if scenePhase != .background {
+                let airPlay = Self.audioOutputIsAirPlay()
+                if airPlay != outputIsAirPlay { outputIsAirPlay = airPlay }
+                // The PC can turn app audio on or off too.
+                let appAudio = TrustedPeerStore.broadcastAudioEnabled()
+                if appAudio != sendAudioToPC { sendAudioToPC = appAudio }
                 refreshBroadcast()
                 if pendingWidgetShortcut != nil { presentNextSheet() }
             }
@@ -843,8 +849,15 @@ struct ContentView: View {
         }
     }
 
+    /// Sound sent to an AirPlay speaker (such as Porthole on the PC) bypasses
+    /// the broadcast's app audio.
+    private static func audioOutputIsAirPlay() -> Bool {
+        AVAudioSession.sharedInstance().currentRoute.outputs.contains { $0.portType == .airPlay }
+    }
+
     private var broadcastAudioLabel: String {
         if !sendAudioToPC { return "Off" }
+        if outputIsAirPlay { return "Via AirPlay" }
         return client.broadcastStatus?.audioSent == true ? "Sending" : "Waiting"
     }
 
@@ -853,13 +866,17 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Audio output")
                     .font(.subheadline.weight(.semibold))
-                Text("Choose Porthole with your PC’s name for PC-only playback.")
+                Text(sendAudioToPC
+                     ? "Choose Porthole with your PC’s name for PC-only playback."
+                     : "Turn on Include app audio to play sound on the PC.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
             AudioOutputPicker()
                 .frame(width: 44, height: 44)
+                .disabled(!sendAudioToPC)
+                .opacity(sendAudioToPC ? 1 : 0.4)
         }
     }
 
@@ -1207,6 +1224,7 @@ struct ContentView: View {
                             return
                         }
                         sendAudioToPC = enabled
+                        client.setAppAudio(enabled)
                     }
                 )) {
                     Label("Include app audio", systemImage: "speaker.wave.2")
@@ -1217,6 +1235,10 @@ struct ContentView: View {
             } footer: {
                 if client.linked && (client.fileSendPeer?.screenProtocolVersion ?? 1) < 2 {
                     Text("Update Porthole on your PC to receive app audio.")
+                } else if sendAudioToPC && outputIsAirPlay {
+                    Text("Sound goes to the AirPlay speaker you chose in Audio output. AirPlay adds about 2 seconds before a video starts, resumes, or jumps. Choose iPhone for instant playback.")
+                } else if !sendAudioToPC {
+                    Text("The PC plays no sound while you share. Sound stays on this iPhone.")
                 } else if isPortholeBroadcasting && sendAudioToPC {
                     Text(client.broadcastStatus?.audioSent == true
                          ? "App audio is being sent to the PC."
