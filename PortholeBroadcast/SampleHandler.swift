@@ -48,8 +48,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var deliveryStopped = false
     private var lostFrames = 0
     private var audio = BroadcastAudio()
-    private var audioPreferenceCheckedAt: DispatchTime?
+    private var preferencesCheckedAt: DispatchTime?
     private var sendAppAudio = false
+    private var rotateLandscape = false
 
     private var session: VTCompressionSession?
     private var sessionWidth = 0
@@ -74,7 +75,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private static let maxFrameBytes = 8 * 1024 * 1024
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
-        audioPreferenceCheckedAt = nil
+        preferencesCheckedAt = nil
         queue.async {
             self.active = true
             self.paused = false
@@ -370,15 +371,19 @@ final class SampleHandler: RPBroadcastSampleHandler {
         }
     }
 
+    private func refreshPreferences() {
+        let now = DispatchTime.now()
+        if let previous = preferencesCheckedAt, now < previous + .milliseconds(250) { return }
+        preferencesCheckedAt = now
+        let enabled = TrustedPeerStore.broadcastAudioEnabled()
+        if sendAppAudio && !enabled { audio = BroadcastAudio() }
+        sendAppAudio = enabled
+        rotateLandscape = TrustedPeerStore.rotateBroadcastLandscape()
+    }
+
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with type: RPSampleBufferType) {
+        if type == .audioApp || type == .video { refreshPreferences() }
         if type == .audioApp {
-            let now = DispatchTime.now()
-            if audioPreferenceCheckedAt.map({ now >= $0 + .milliseconds(250) }) ?? true {
-                let enabled = TrustedPeerStore.broadcastAudioEnabled()
-                if sendAppAudio && !enabled { audio = BroadcastAudio() }
-                sendAppAudio = enabled
-                audioPreferenceCheckedAt = now
-            }
             if sendAppAudio { forwardAudio(sampleBuffer) }
             return
         }
@@ -388,9 +393,12 @@ final class SampleHandler: RPBroadcastSampleHandler {
         guard seconds.isFinite else { return }
         if let lastTimestamp, seconds >= lastTimestamp, seconds - lastTimestamp < minInterval { return }
 
-        let orientation = Self.orientation(sampleBuffer)
-        let reset = lastOrientation != orientation || lastTimestamp.map { seconds < $0 || seconds - $0 > 2 } == true
-        guard let ticket = queue.sync(execute: { reserveFrame(forceKey: reset, ptsNs: Self.nanoseconds(timestamp)) }) else { return }
+        let orientation = Self.orientation(sampleBuffer, image: image, rotateLandscape: rotateLandscape)
+        let orientationChanged = lastOrientation != orientation
+        let timestampDiscontinuity = lastTimestamp.map { seconds < $0 } == true
+        guard let ticket = queue.sync(execute: {
+            reserveFrame(forceKey: orientationChanged || timestampDiscontinuity, ptsNs: Self.nanoseconds(timestamp))
+        }) else { return }
         lastTimestamp = seconds
         lastOrientation = orientation
 
@@ -400,7 +408,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         }
         let width = CVPixelBufferGetWidth(source)
         let height = CVPixelBufferGetHeight(source)
-        let newSession = session == nil || reset || width != sessionWidth || height != sessionHeight
+        let newSession = session == nil || timestampDiscontinuity || width != sessionWidth || height != sessionHeight
         if newSession { makeSession(width: width, height: height) }
         guard let session else {
             loseFrame(ticket)
@@ -518,10 +526,45 @@ final class SampleHandler: RPBroadcastSampleHandler {
         return UInt64(max(1, time.value))
     }
 
-    private static func orientation(_ sample: CMSampleBuffer) -> CGImagePropertyOrientation {
-        let attachment = CMGetAttachment(sample, key: RPVideoSampleOrientationKey as CFString, attachmentModeOut: nil)
-        guard let raw = attachment as? NSNumber else { return .up }
-        return CGImagePropertyOrientation(rawValue: raw.uint32Value) ?? .up
+    private static func orientation(_ sample: CMSampleBuffer, image: CVImageBuffer,
+                                    rotateLandscape: Bool) -> CGImagePropertyOrientation {
+        let key = kCGImagePropertyOrientation
+        let sampleOrientation = CMGetAttachment(sample, key: key, attachmentModeOut: nil) as? NSNumber
+        let pixelOrientation = CVBufferCopyAttachment(image, key, nil) as? NSNumber
+        let replayKitOrientation = CMGetAttachment(sample, key: RPVideoSampleOrientationKey as CFString,
+                                                    attachmentModeOut: nil) as? NSNumber
+        let explicit = (sampleOrientation ?? pixelOrientation).flatMap {
+            CGImagePropertyOrientation(rawValue: $0.uint32Value)
+        }
+        var orientation = explicit ?? replayKitOrientation.flatMap {
+            CGImagePropertyOrientation(rawValue: $0.uint32Value)
+        } ?? .up
+
+        let width = CVPixelBufferGetWidth(image)
+        let height = CVPixelBufferGetHeight(image)
+        // Some ReplayKit frames arrive as native landscape pixels with a
+        // legacy quarter-turn tag. The pixel buffer has already been turned.
+        if explicit == nil && width > height && swapsAxes(orientation) { orientation = .up }
+        let isLandscape = swapsAxes(orientation) ? height > width : width > height
+        guard rotateLandscape && isLandscape else { return orientation }
+        switch orientation {
+        case .up: return .down
+        case .down: return .up
+        case .left: return .right
+        case .right: return .left
+        case .upMirrored: return .downMirrored
+        case .downMirrored: return .upMirrored
+        case .leftMirrored: return .rightMirrored
+        case .rightMirrored: return .leftMirrored
+        @unknown default: return orientation
+        }
+    }
+
+    private static func swapsAxes(_ orientation: CGImagePropertyOrientation) -> Bool {
+        switch orientation {
+        case .left, .right, .leftMirrored, .rightMirrored: return true
+        default: return false
+        }
     }
 
     private func makeSession(width: Int, height: Int) {
@@ -593,7 +636,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let inputHeight = CVPixelBufferGetHeight(image)
         guard inputWidth >= 2, inputHeight >= 2 else { return nil }
         if orientation != .up {
-            let rotated = CIImage(cvPixelBuffer: image).oriented(orientation)
+            let rotated = CIImage(cvPixelBuffer: image, options: [.applyOrientationProperty: false]).oriented(orientation)
             let bounds = rotated.extent
             let size = Self.fit(width: Int(bounds.width), height: Int(bounds.height), longEdge: longEdge)
             guard let target = allocate(size, format: kCVPixelFormatType_32BGRA) else { return nil }

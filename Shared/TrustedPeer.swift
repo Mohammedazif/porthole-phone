@@ -181,6 +181,8 @@ enum TrustedPeerStore {
         }
     }
     static func setBroadcastAudioEnabled(_ enabled: Bool) -> Bool { write(enabled, "broadcast-audio.json") }
+    static func rotateBroadcastLandscape() -> Bool { read("broadcast-landscape-rotation.json") ?? false }
+    static func setRotateBroadcastLandscape(_ enabled: Bool) -> Bool { write(enabled, "broadcast-landscape-rotation.json") }
 
     static func broadcastStatus() -> TrustedBroadcastStatus? { read("broadcast.json") }
     static func publishBroadcast(peer: TrustedPeer?, phase: BroadcastPhase, message: String? = nil,
