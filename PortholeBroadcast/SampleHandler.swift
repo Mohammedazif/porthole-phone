@@ -46,6 +46,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var firstFrameDeadline: DispatchTime?
     private var ticketDeadline: DispatchTime?
     private var deliveryStopped = false
+    private var broadcastEndAction: (() -> Void)?
     private var lostFrames = 0
     private var audio = BroadcastAudio()
     private var preferencesCheckedAt: DispatchTime?
@@ -126,9 +127,15 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func broadcastFinished() {
+        let endSent = DispatchSemaphore(value: 0)
         queue.sync {
             active = false
             stopWatchdog()
+            sendBroadcastEnd { endSent.signal() }
+        }
+        _ = endSent.wait(timeout: .now() + .milliseconds(400))
+        queue.sync {
+            completeBroadcastEnd()
             disconnect()
             if !failed { report(.ended) }
             peer = nil
@@ -203,8 +210,17 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     private func watch(_ connection: NWConnection, id: UUID) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64) { [weak self, weak connection] data, _, complete, error in
-            guard let self, let connection, self.active, self.link === connection,
+            guard let self, let connection, self.link === connection,
                   self.connectionID == id else { return }
+            if self.broadcastEndAction != nil {
+                if data?.last == 0x45 || complete || error != nil {
+                    self.completeBroadcastEnd()
+                } else {
+                    self.watch(connection, id: id)
+                }
+                return
+            }
+            guard self.active else { return }
             if let data, !data.isEmpty {
                 guard data.allSatisfy({ $0 == 0x41 }), data.count <= self.awaitingACK.count else {
                     self.retry("The PC sent an invalid screen acknowledgement.")
@@ -348,13 +364,46 @@ final class SampleHandler: RPBroadcastSampleHandler {
         deliveryStopped = true
         active = false
         stopWatchdog()
-        disconnect()
-        report(.ended)
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.finishBroadcastWithError(NSError(domain: RPRecordingErrorDomain,
-                                                    code: RPRecordingErrorCode.userDeclined.rawValue,
-                                                    userInfo: [NSLocalizedDescriptionKey: "Screen sharing stopped."]))
+        sendBroadcastEnd { [weak self] in
+            guard let self else { return }
+            self.disconnect()
+            self.report(.ended)
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                self?.finishBroadcastWithError(NSError(domain: RPRecordingErrorDomain,
+                                                        code: RPRecordingErrorCode.userDeclined.rawValue,
+                                                        userInfo: [NSLocalizedDescriptionKey: "Screen sharing stopped."]))
+            }
         }
+    }
+
+    private func sendBroadcastEnd(completion: @escaping () -> Void) {
+        if let pending = broadcastEndAction {
+            broadcastEndAction = {
+                pending()
+                completion()
+            }
+            return
+        }
+        guard ready, peer?.screenProtocolVersion == 3, let link else {
+            completion()
+            return
+        }
+        broadcastEndAction = completion
+        let id = connectionID
+        link.send(content: Data([0, 0, 0, 0, 4]), completion: .contentProcessed { [weak self] error in
+            guard let self, self.connectionID == id, error != nil else { return }
+            self.completeBroadcastEnd()
+        })
+        queue.asyncAfter(deadline: .now() + .milliseconds(350)) { [weak self] in
+            guard let self, self.connectionID == id else { return }
+            self.completeBroadcastEnd()
+        }
+    }
+
+    private func completeBroadcastEnd() {
+        let action = broadcastEndAction
+        broadcastEndAction = nil
+        action?()
     }
 
     private func fail(_ message: String) {
