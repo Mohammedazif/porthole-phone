@@ -25,7 +25,15 @@ final class VolumeButtonRelay {
     /// each source keeps its own last level.
     private var lastBySource: [String: Float] = [:]
     private var engaged = false
-    private var savedVolume: Float?
+    /// The iPhone's own volume, kept across launches so a level this relay
+    /// set (zero) is never taken for the person's choice.
+    private static let ownVolumeKey = "porthole.volume-buttons.own-volume"
+    private static let holdingKey = "porthole.volume-buttons.holding"
+    private var ownVolume: Float? {
+        get { (UserDefaults.standard.object(forKey: Self.ownVolumeKey) as? NSNumber)?.floatValue }
+        set { UserDefaults.standard.set(newValue.map { NSNumber(value: $0) }, forKey: Self.ownVolumeKey) }
+    }
+    private var lastFloorPress: (at: Date, sequence: Int?)?
     private var restoring: Float?
     private var restoreCheck: DispatchWorkItem?
     private var heardFrom: Set<String> = []
@@ -62,10 +70,13 @@ final class VolumeButtonRelay {
         lastBySource = [:]
         heardFrom = []
         lastReason = nil
+        lastFloorPress = nil
         notesLeft = 60
+        let current = session.outputVolume
+        if current > 0.01, !UserDefaults.standard.bool(forKey: Self.holdingKey) { ownVolume = current }
         observation = session.observe(\.outputVolume, options: [.new]) { [weak self] _, change in
             guard let value = change.newValue else { return }
-            DispatchQueue.main.async { self?.volumeChanged(to: value, from: "session", reason: nil) }
+            DispatchQueue.main.async { self?.volumeChanged(to: value, from: "session", reason: nil, sequence: nil) }
         }
         // iOS also posts these while a system volume view is in a window. They
         // carry the reason, and may come even when a press can't move the level.
@@ -75,7 +86,8 @@ final class VolumeButtonRelay {
             let info = notification.userInfo ?? [:]
             guard let value = (info["Volume"] as? NSNumber)?.floatValue else { return }
             let reason = info["Reason"] as? String
-            self?.volumeChanged(to: value, from: "system", reason: reason)
+            let sequence = (info["SequenceNumber"] as? NSNumber)?.intValue
+            self?.volumeChanged(to: value, from: "system", reason: reason, sequence: sequence)
         })
         let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in self?.evaluate() }
         RunLoop.main.add(timer, forMode: .common)
@@ -109,11 +121,20 @@ final class VolumeButtonRelay {
         if reason == nil, !engaged {
             engaged = true
             let current = AVAudioSession.sharedInstance().outputVolume
-            savedVolume = current
-            send(note: "engaged: iPhone volume \(Self.percent(current)) saved, held at 0%")
+            // Zero is not taken as the person's level: it is what this relay
+            // holds, and what an interrupted hold could have left behind.
+            if current > 0.01, !UserDefaults.standard.bool(forKey: Self.holdingKey) { ownVolume = current }
+            if ownVolume == nil { ownVolume = 0.5 }
+            UserDefaults.standard.set(true, forKey: Self.holdingKey)
+            send(note: "engaged: iPhone volume \(Self.percent(ownVolume ?? 0)) remembered, held at 0%")
             put(0)
         } else if let reason, engaged {
             send(note: "released: \(reason)")
+            disengage()
+        } else if let reason, !engaged, UserDefaults.standard.bool(forKey: Self.holdingKey) {
+            // Porthole stopped while holding (quit, or a crash): give the level back now.
+            engaged = true
+            send(note: "released after a restart: \(reason)")
             disengage()
         } else if let reason, reason != lastReason {
             send(note: "idle: \(reason)")
@@ -124,16 +145,15 @@ final class VolumeButtonRelay {
     private func disengage() {
         guard engaged else { return }
         engaged = false
-        if let saved = savedVolume {
-            send(note: "iPhone volume put back to \(Self.percent(saved))")
-            put(saved)
-        }
-        savedVolume = nil
+        UserDefaults.standard.set(false, forKey: Self.holdingKey)
+        let own = ownVolume ?? 0.5
+        send(note: "iPhone volume put back to \(Self.percent(own))")
+        put(own)
     }
 
     private var systemReportsNoted = 0
 
-    private func volumeChanged(to value: Float, from source: String, reason: String?) {
+    private func volumeChanged(to value: Float, from source: String, reason: String?, sequence: Int?) {
         if heardFrom.insert(source).inserted { send(note: "first volume report from \(source)") }
         if source == "system", systemReportsNoted < 6 {
             systemReportsNoted += 1
@@ -143,7 +163,14 @@ final class VolumeButtonRelay {
         let previous = lastBySource[source] ?? value
         lastBySource[source] = value
         evaluate()
-        guard engaged else { return }
+        guard engaged else {
+            // The person's own level, unless it is this relay putting one back.
+            if value > 0.01, restoring.map({ abs(value - $0) >= Self.sameLevel }) ?? true,
+               !UserDefaults.standard.bool(forKey: Self.holdingKey) {
+                ownVolume = value
+            }
+            return
+        }
         // One press, two reports: the system notice counts when it comes.
         if source == "session" && heardFrom.contains("system") { return }
         if let target = restoring, abs(value - target) < Self.sameLevel { return }  // our own correction
@@ -151,7 +178,14 @@ final class VolumeButtonRelay {
             press(value > previous)
             put(0)
         } else if source == "system", explicit, value < 0.01 {
-            // At zero a volume-down press can't move the level; iOS may still say so.
+            // At zero a volume-down press can't move the level, but iOS still
+            // says so, twice: count one press per sequence number, or per moment.
+            let now = Date()
+            if let last = lastFloorPress,
+               (sequence != nil && last.sequence == sequence) || now.timeIntervalSince(last.at) < 0.12 {
+                return
+            }
+            lastFloorPress = (now, sequence)
             press(false)
         }
     }
