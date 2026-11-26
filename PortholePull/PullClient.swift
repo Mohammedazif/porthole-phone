@@ -221,12 +221,21 @@ final class PullClient: ObservableObject {
     private var reconnectAttempt = 0
     private var reconnectWork: DispatchWorkItem?
     private var backgroundAudio: CompanionBackgroundAudio?
+    // Experiment: the volume buttons change the PC's volume while sharing with sound there.
+    private lazy var volumeRelay = VolumeButtonRelay(
+        isActive: { [weak self] in self?.volumeButtonsDriveThePC() ?? false },
+        press: { [weak self] louder in self?.sendVolume(louder ? "up" : "down") },
+        stuck: { [weak self] in self?.sendVolume("stuck") })
+    // Main thread copy of volumeReady.
+    private var volumeLinkReady = false
     private weak var index: PhotoIndex?
     // Accessed only on queue. Explicit selection bypasses visual matching once.
     private var chosenIdentifier: String?
     private var syncReady = false
     // Accessed only on queue. The PC accepts the sound choice.
     private var soundReady = false
+    // Accessed only on queue. The PC takes volume button presses.
+    private var volumeReady = false
     private var didReclaimStaging = false
     private var receivingRecoveryScheduled = false
     private var foreground = true
@@ -431,6 +440,22 @@ final class PullClient: ObservableObject {
         guard greeted else { return }
         let id = UUID().uuidString.lowercased()
         send("SOUND \(id) \(mode.rawValue)\n")
+    }
+
+    // Called on main.
+    private func volumeButtonsDriveThePC() -> Bool {
+        guard volumeLinkReady, linked, TrustedPeerStore.soundMode() != .iPhone,
+              let peer = requestedPeer, let snapshot = TrustedPeerStore.broadcastStatus(),
+              snapshot.peerID == peer.stableID, snapshot.phase == .live || snapshot.phase == .waitingForFrames,
+              Date().timeIntervalSince(snapshot.updatedAt) < 8 else { return false }
+        return true
+    }
+
+    private func sendVolume(_ word: String) {
+        queue.async {
+            guard self.volumeReady, self.greeted else { return }
+            self.send("VOLUME \(word)\n")
+        }
     }
 
     private func sendSystemPhoneName() {
@@ -936,6 +961,7 @@ final class PullClient: ObservableObject {
     func cameForward() {
         foreground = true
         backgroundAudio?.setRequested(false)
+        volumeRelay.stop()
         loadLocalState()
         refreshNotificationPermission(promptIfNeeded: linked)
         refreshBroadcastStatus()
@@ -958,8 +984,10 @@ final class PullClient: ObservableObject {
            PairingCredential.load(requestedPeer.credentialProfile) != nil {
             if backgroundAudio == nil { backgroundAudio = CompanionBackgroundAudio() }
             backgroundAudio?.setRequested(true)
+            volumeRelay.start()
         } else {
             backgroundAudio?.setRequested(false)
+            volumeRelay.stop()
             if !foreground {
                 reconnectWork?.cancel()
                 reconnectWork = nil
@@ -1051,6 +1079,8 @@ final class PullClient: ObservableObject {
         greeted = false
         syncReady = false
         soundReady = false
+        volumeReady = false
+        DispatchQueue.main.async { self.volumeLinkReady = false }
         proposedClipboardGeneration = nil
         acceptedClipboardGeneration = nil
         pendingData = nil
@@ -1641,6 +1671,11 @@ final class PullClient: ObservableObject {
                 guard self.fileSendPeer?.id == peer.id, self.requestedInputID == String(id) else { return }
                 self.inputSettingsApplied = true
             }
+            return
+        }
+        if line == "VOLUME READY" {
+            volumeReady = true
+            DispatchQueue.main.async { self.volumeLinkReady = true }
             return
         }
         if line == "SOUND READY" {
