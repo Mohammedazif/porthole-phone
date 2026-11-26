@@ -531,7 +531,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
         }
         // The PC turns its pointer positions back with this: the iPhone places
         // an absolute pointer on its screen as mounted, not as turned.
-        if (peer?.screenProtocolVersion ?? 1) >= 4, sentTurn != ticket.turn {
+        // Repeated with each keyframe, so a PC that restarted mid-share (and
+        // so assumes portrait) learns the turn again within a second or two.
+        if (peer?.screenProtocolVersion ?? 1) >= 4, sentTurn != ticket.turn || keyframe {
             sentTurn = ticket.turn
             sendPacket(ticket.turn, type: 5, ptsNs: ticket.ptsNs, link: link, id: ticket.connectionID)
         }
