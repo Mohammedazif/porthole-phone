@@ -918,7 +918,7 @@ struct ContentView: View {
             }
             let layout = dynamicTypeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 10)) : AnyLayout(HStackLayout(spacing: 10))
             layout {
-                statCard("Video", "Up to 24 fps")
+                statCard("Video", "Up to 30 fps")
                 statCard("Sound", soundMode.label)
                 statCard("Input", input.mouseConnected && input.keyboardConnected ? "Detected" : "Setup required")
             }

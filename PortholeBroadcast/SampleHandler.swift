@@ -38,6 +38,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private let motionQueue = OperationQueue()
     private let heldLock = NSLock()
     private var heldValue: UInt8 = 0
+    private var heldCandidate: (value: UInt8, count: Int) = (0, 0)  // motion queue only
     private var peer: TrustedPeer?
     private var link: NWConnection?
     private var connectionID = UUID()
@@ -86,12 +87,15 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var poolFormat: OSType = 0
     private lazy var imageContext = CIContext(options: [.cacheIntermediates: false])
 
-    private let minInterval = 1.0 / 24.0
+    // ReplayKit captures at 30 fps (frames ~33 ms apart, with jitter). The
+    // old 1/24 s floor dropped about every other one, leaving ~20 fps; this
+    // keeps all 30 and thins a 60 fps source to 30.
+    private let minInterval = 0.8 / 30.0
     private let maxOutstanding = 3
     private let videoBacklogLimit = DispatchTimeInterval.milliseconds(240)
     private let packetTimeout = DispatchTimeInterval.seconds(5)
     private let longEdge = 1080
-    private let frameRate = 24
+    private let frameRate = 30
     private let bitrate = 3_500_000
     // Match PH_SCREEN_FRAME_MAX in the PC receiver.
     private static let maxFrameBytes = 8 * 1024 * 1024
@@ -670,17 +674,24 @@ final class SampleHandler: RPBroadcastSampleHandler {
         motion.deviceMotionUpdateInterval = 0.2
         motion.startDeviceMotionUpdates(to: motionQueue) { [weak self] data, _ in
             guard let self, let gravity = data?.gravity else { return }
+            // Only a clear, settled tilt counts: a phone propped at an angle
+            // used to flip between upright and landscape every few seconds,
+            // and each flip moved the pointer off what it was over.
             let x = abs(gravity.x), y = abs(gravity.y)
-            let held: UInt8
-            if y > 0.6, y > x + 0.2 {
-                held = gravity.y < 0 ? 1 : 2
-            } else if x > 0.6, x > y + 0.2 {
-                held = gravity.x < 0 ? 3 : 4
+            let seen: UInt8
+            if y > 0.8, y > x + 0.4 {
+                seen = gravity.y < 0 ? 1 : 2
+            } else if x > 0.8, x > y + 0.4 {
+                seen = gravity.x < 0 ? 3 : 4
             } else {
+                self.heldCandidate = (0, 0)
                 return  // flat or between: keep the last
             }
+            // Five readings in a row (one second) before it changes.
+            self.heldCandidate = seen == self.heldCandidate.value ? (seen, self.heldCandidate.count + 1) : (seen, 1)
+            guard self.heldCandidate.count >= 5 else { return }
             self.heldLock.lock()
-            self.heldValue = held
+            self.heldValue = seen
             self.heldLock.unlock()
         }
     }
