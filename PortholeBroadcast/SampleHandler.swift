@@ -1,4 +1,5 @@
 import CoreImage
+import CoreMotion
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -28,6 +29,15 @@ final class SampleHandler: RPBroadcastSampleHandler {
     // Connection state and frame reservations belong to this queue. ReplayKit
     // invokes its handler methods serially, so it owns the encoder and pixel pool.
     private let queue = DispatchQueue(label: "porthole.broadcast")
+    // Which way the phone is physically held, from gravity. iOS places the
+    // absolute pointer by this, while the picture follows the screen's
+    // layout, and the two disagree when iOS leaves its screen unturned (a
+    // direct landscape flip). 0 not known yet, 1 portrait, 2 upside down,
+    // 3 top to the left, 4 top to the right. Lying flat keeps the last.
+    private let motion = CMMotionManager()
+    private let motionQueue = OperationQueue()
+    private let heldLock = NSLock()
+    private var heldValue: UInt8 = 0
     private var peer: TrustedPeer?
     private var link: NWConnection?
     private var connectionID = UUID()
@@ -88,6 +98,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     override func broadcastStarted(withSetupInfo setupInfo: [String: NSObject]?) {
         preferencesCheckedAt = nil
+        startHeldUpdates()
         queue.async {
             self.active = true
             self.paused = false
@@ -138,6 +149,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     override func broadcastFinished() {
+        motion.stopDeviceMotionUpdates()
         let endSent = DispatchSemaphore(value: 0)
         queue.sync {
             active = false
@@ -460,7 +472,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let timestampDiscontinuity = lastTimestamp.map { seconds < $0 } == true
         guard let ticket = queue.sync(execute: {
             reserveFrame(forceKey: orientationChanged || timestampDiscontinuity, ptsNs: Self.nanoseconds(timestamp),
-                         turn: Self.turnMessage(turned, image: image))
+                         turn: Self.turnMessage(turned, image: image, held: held()))
         }) else { return }
         lastTimestamp = seconds
         lastOrientation = orientation
@@ -634,12 +646,40 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     private static func turnMessage(_ turned: (pixels: CGImagePropertyOrientation, pointer: CGImagePropertyOrientation, tag: UInt32),
-                                    image: CVImageBuffer) -> Data {
+                                    image: CVImageBuffer, held: UInt8) -> Data {
         let width = UInt16(clamping: CVPixelBufferGetWidth(image))
         let height = UInt16(clamping: CVPixelBufferGetHeight(image))
+        // Byte 7 (newer phones): how the phone is held. Older PCs read 7 bytes.
         return Data([UInt8(truncatingIfNeeded: turned.pointer.rawValue), UInt8(truncatingIfNeeded: turned.tag),
                      UInt8(truncatingIfNeeded: turned.pixels.rawValue),
-                     UInt8(width >> 8), UInt8(width & 0xff), UInt8(height >> 8), UInt8(height & 0xff)])
+                     UInt8(width >> 8), UInt8(width & 0xff), UInt8(height >> 8), UInt8(height & 0xff), held])
+    }
+
+    private func startHeldUpdates() {
+        guard motion.isDeviceMotionAvailable, !motion.isDeviceMotionActive else { return }
+        motionQueue.maxConcurrentOperationCount = 1
+        motion.deviceMotionUpdateInterval = 0.2
+        motion.startDeviceMotionUpdates(to: motionQueue) { [weak self] data, _ in
+            guard let self, let gravity = data?.gravity else { return }
+            let x = abs(gravity.x), y = abs(gravity.y)
+            let held: UInt8
+            if y > 0.6, y > x + 0.2 {
+                held = gravity.y < 0 ? 1 : 2
+            } else if x > 0.6, x > y + 0.2 {
+                held = gravity.x < 0 ? 3 : 4
+            } else {
+                return  // flat or between: keep the last
+            }
+            self.heldLock.lock()
+            self.heldValue = held
+            self.heldLock.unlock()
+        }
+    }
+
+    private func held() -> UInt8 {
+        heldLock.lock()
+        defer { heldLock.unlock() }
+        return heldValue
     }
 
     private func makeSession(width: Int, height: Int) {
