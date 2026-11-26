@@ -6,6 +6,7 @@ import Foundation
 import ImageIO
 import Network
 import ReplayKit
+import UIKit
 import VideoToolbox
 
 /// Supplies H.264 Annex-B frames to the paired PC over its verified transport.
@@ -39,6 +40,14 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private let heldLock = NSLock()
     private var heldValue: UInt8 = 0
     private var heldCandidate: (value: UInt8, count: Int) = (0, 0)  // motion queue only
+    /// iOS's own idea of how the phone is held (UIDevice), in the held
+    /// byte's terms; 0 until it is known to be live. With rotation lock on it
+    /// stays portrait, and so does the absolute pointer (measured: YouTube
+    /// landscape under the lock wanted the pointer laid out as if upright).
+    private var systemValue: UInt8 = 0               // under heldLock
+    private var firstSystemOrientation: UIDeviceOrientation?  // main thread only
+    private var lastSystemValue: UInt8 = 0                    // main thread only
+    private static let systemOrientationWorksKey = "porthole.broadcast.system-orientation-works"
     private var peer: TrustedPeer?
     private var link: NWConnection?
     private var connectionID = UUID()
@@ -154,6 +163,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
 
     override func broadcastFinished() {
         motion.stopDeviceMotionUpdates()
+        DispatchQueue.main.async { UIDevice.current.endGeneratingDeviceOrientationNotifications() }
         let endSent = DispatchSemaphore(value: 0)
         queue.sync {
             active = false
@@ -671,20 +681,53 @@ final class SampleHandler: RPBroadcastSampleHandler {
     }
 
     private static func turnMessage(_ turned: (pixels: CGImagePropertyOrientation, pointer: CGImagePropertyOrientation, tag: UInt32),
-                                    image: CVImageBuffer, held: UInt8) -> Data {
+                                    image: CVImageBuffer, held: (gravity: UInt8, system: UInt8)) -> Data {
         let width = UInt16(clamping: CVPixelBufferGetWidth(image))
         let height = UInt16(clamping: CVPixelBufferGetHeight(image))
         // Byte 7 (newer phones): how the phone is held. Older PCs read 7 bytes.
+        // Byte 8: how iOS itself takes the phone to be held (0 unknown).
         return Data([UInt8(truncatingIfNeeded: turned.pointer.rawValue), UInt8(truncatingIfNeeded: turned.tag),
                      UInt8(truncatingIfNeeded: turned.pixels.rawValue),
-                     UInt8(width >> 8), UInt8(width & 0xff), UInt8(height >> 8), UInt8(height & 0xff), held])
+                     UInt8(width >> 8), UInt8(width & 0xff), UInt8(height >> 8), UInt8(height & 0xff),
+                     held.gravity, held.system])
+    }
+
+    /// Reads UIDevice's orientation (main thread). It counts only once it has
+    /// been seen to change on this iPhone, ever: an extension that never
+    /// heard from it can't tell rotation lock from no updates at all.
+    private func readSystemOrientation() {
+        let now = UIDevice.current.orientation
+        let value: UInt8
+        switch now {
+        case .portrait: value = 1
+        case .portraitUpsideDown: value = 2
+        case .landscapeLeft: value = 3   // home side right: top to the left
+        case .landscapeRight: value = 4
+        case .faceUp, .faceDown: value = lastSystemValue  // flat: keep the last
+        default: return
+        }
+        let defaults = UserDefaults.standard
+        if let first = firstSystemOrientation {
+            if now != first, !defaults.bool(forKey: Self.systemOrientationWorksKey) {
+                defaults.set(true, forKey: Self.systemOrientationWorksKey)
+            }
+        } else {
+            firstSystemOrientation = now
+        }
+        lastSystemValue = value
+        let works = defaults.bool(forKey: Self.systemOrientationWorksKey)
+        heldLock.lock()
+        systemValue = works ? value : 0
+        heldLock.unlock()
     }
 
     private func startHeldUpdates() {
         guard motion.isDeviceMotionAvailable, !motion.isDeviceMotionActive else { return }
         motionQueue.maxConcurrentOperationCount = 1
         motion.deviceMotionUpdateInterval = 0.2
+        DispatchQueue.main.async { UIDevice.current.beginGeneratingDeviceOrientationNotifications() }
         motion.startDeviceMotionUpdates(to: motionQueue) { [weak self] data, _ in
+            DispatchQueue.main.async { self?.readSystemOrientation() }
             guard let self, let gravity = data?.gravity else { return }
             // Only a clear, settled tilt counts: a phone propped at an angle
             // used to flip between upright and landscape every few seconds,
@@ -708,10 +751,10 @@ final class SampleHandler: RPBroadcastSampleHandler {
         }
     }
 
-    private func held() -> UInt8 {
+    private func held() -> (gravity: UInt8, system: UInt8) {
         heldLock.lock()
         defer { heldLock.unlock() }
-        return heldValue
+        return (heldValue, systemValue)
     }
 
     private func makeSession(width: Int, height: Int) {
