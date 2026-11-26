@@ -62,6 +62,14 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private var lastTimestamp: Double?
     private var lastOrientation: CGImagePropertyOrientation?
     private var transfer: VTPixelTransferSession?
+    // Landscape: scale, then turn upright in hardware, both in the captured
+    // pixel format. Core Image's turn converted every frame to BGRA first,
+    // which made landscape frames 15-40 ms slower than portrait.
+    private var rotation: VTPixelRotationSession?
+    private var rotationAngle: String?
+    private var scaledPool: CVPixelBufferPool?
+    private var scaledPoolSize = (w: 0, h: 0)
+    private var scaledPoolFormat: OSType = 0
     private var pool: CVPixelBufferPool?
     private var poolWidth = 0
     private var poolHeight = 0
@@ -701,6 +709,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let inputHeight = CVPixelBufferGetHeight(image)
         guard inputWidth >= 2, inputHeight >= 2 else { return nil }
         if orientation != .up {
+            if let fast = rotateInHardware(image, orientation: orientation) { return fast }
             let rotated = CIImage(cvPixelBuffer: image, options: [.applyOrientationProperty: false]).oriented(orientation)
             let bounds = rotated.extent
             let size = Self.fit(width: Int(bounds.width), height: Int(bounds.height), longEdge: longEdge)
@@ -722,6 +731,66 @@ final class SampleHandler: RPBroadcastSampleHandler {
         guard let transfer, let target = allocate(size, format: CVPixelBufferGetPixelFormatType(image)),
               VTPixelTransferSessionTransferImage(transfer, from: image, to: target) == noErr else { return nil }
         return target
+    }
+
+    /// Quarter and half turns with VideoToolbox; nil (Core Image then) for
+    /// mirrored orientations or when the hardware path refuses the format.
+    private func rotateInHardware(_ image: CVPixelBuffer, orientation: CGImagePropertyOrientation) -> CVPixelBuffer? {
+        let angle: CFString
+        switch orientation {
+        case .right: angle = kVTRotation_CW90
+        case .left: angle = kVTRotation_CCW90
+        case .down: angle = kVTRotation_180
+        default: return nil
+        }
+        let format = CVPixelBufferGetPixelFormatType(image)
+        let inputWidth = CVPixelBufferGetWidth(image)
+        let inputHeight = CVPixelBufferGetHeight(image)
+        let scaled = Self.fit(width: inputWidth, height: inputHeight, longEdge: longEdge)
+        var source = image
+        if scaled.w != inputWidth || scaled.h != inputHeight {
+            if transfer == nil {
+                var made: VTPixelTransferSession?
+                guard VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &made) == noErr else { return nil }
+                transfer = made
+            }
+            guard let transfer, let middle = allocateScaled(scaled, format: format),
+                  VTPixelTransferSessionTransferImage(transfer, from: image, to: middle) == noErr else { return nil }
+            source = middle
+        }
+        if rotation == nil {
+            var made: VTPixelRotationSession?
+            guard VTPixelRotationSessionCreate(allocator: nil, pixelRotationSessionOut: &made) == noErr else { return nil }
+            rotation = made
+        }
+        guard let rotation else { return nil }
+        if rotationAngle != angle as String {
+            guard VTSessionSetProperty(rotation, key: kVTPixelRotationPropertyKey_Rotation, value: angle) == noErr else { return nil }
+            rotationAngle = angle as String
+        }
+        let upright = orientation == .down ? scaled : (w: scaled.h, h: scaled.w)
+        guard let target = allocate(upright, format: format),
+              VTPixelRotationSessionRotateImage(rotation, from: source, to: target) == noErr else { return nil }
+        return target
+    }
+
+    private func allocateScaled(_ size: (w: Int, h: Int), format: OSType) -> CVPixelBuffer? {
+        if scaledPool == nil || scaledPoolSize != size || scaledPoolFormat != format {
+            let attributes: [CFString: Any] = [
+                kCVPixelBufferWidthKey: size.w,
+                kCVPixelBufferHeightKey: size.h,
+                kCVPixelBufferPixelFormatTypeKey: format,
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary
+            ]
+            var created: CVPixelBufferPool?
+            guard CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &created) == kCVReturnSuccess else { return nil }
+            scaledPool = created
+            scaledPoolSize = size
+            scaledPoolFormat = format
+        }
+        var result: CVPixelBuffer?
+        guard let scaledPool, CVPixelBufferPoolCreatePixelBuffer(nil, scaledPool, &result) == kCVReturnSuccess else { return nil }
+        return result
     }
 
     private func allocate(_ size: (w: Int, h: Int), format: OSType) -> CVPixelBuffer? {
