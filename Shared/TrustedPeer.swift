@@ -215,10 +215,11 @@ enum TrustedPeerStore {
         return broadcastAudioEnabled() ? .both : .iPhone
     }
 
-    /// Only "Both" sends the shared app's sound with the screen: with "PC" the
-    /// PC is the iPhone's speaker, and with "iPhone" the sound stays here.
+    /// "PC" and "Both" send the shared app's sound with the screen over Wi-Fi,
+    /// which works with any PC; with "PC" the iPhone also holds its own volume
+    /// at zero. With "iPhone" the sound stays here.
     @discardableResult static func setSoundMode(_ mode: SoundMode) -> Bool {
-        write(mode, "sound-mode.json") && setBroadcastAudioEnabled(mode == .both)
+        write(mode, "sound-mode.json") && setBroadcastAudioEnabled(mode != .iPhone)
     }
 
     static func broadcastStatus() -> TrustedBroadcastStatus? { read("broadcast.json") }

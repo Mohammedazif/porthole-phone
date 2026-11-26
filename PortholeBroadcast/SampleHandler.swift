@@ -428,7 +428,8 @@ final class SampleHandler: RPBroadcastSampleHandler {
         let now = DispatchTime.now()
         if let previous = preferencesCheckedAt, now < previous + .milliseconds(250) { return }
         preferencesCheckedAt = now
-        let enabled = TrustedPeerStore.broadcastAudioEnabled()
+        // The sound choice decides, so a "PC" saved when it meant Bluetooth sound still sends here.
+        let enabled = TrustedPeerStore.soundMode() != .iPhone
         if sendAppAudio && !enabled { audio = BroadcastAudio() }
         sendAppAudio = enabled
     }

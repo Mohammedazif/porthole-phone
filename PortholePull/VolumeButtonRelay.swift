@@ -2,16 +2,16 @@ import AVFoundation
 import MediaPlayer
 import UIKit
 
-/// Experiment: while the screen is shared and its sound plays on the PC, the
-/// iPhone's volume buttons change the PC's volume instead of the iPhone's.
+/// While the screen is shared with sound on "PC", the iPhone stays silent and
+/// its volume buttons change the PC's volume.
 ///
-/// iOS gives an app no volume button events, so this watches the system
-/// volume (which needs Porthole's audio session active, as it is in the
-/// background), reports each step as a press, and puts the iPhone's volume
-/// back where it was through a hidden system volume slider. At zero a
-/// volume-down press changes nothing, so iOS reports nothing for it.
-/// Notes go to the PC's log, since that is the log we can read while testing.
-/// Main thread only.
+/// The shared app's sound reaches the PC over Wi-Fi at full level whatever
+/// the iPhone's volume, so on engaging this saves the iPhone's volume and
+/// holds it at zero, and puts it back when sharing ends or the choice
+/// changes. iOS gives an app no volume button events, so each press is read
+/// from the system volume notice and the level is put back to zero through a
+/// hidden system volume slider. Notes go to the PC's log, the log we can read
+/// while testing. Main thread only.
 final class VolumeButtonRelay {
     private let inactiveReason: () -> String?
     private let press: (_ louder: Bool) -> Void
@@ -19,16 +19,17 @@ final class VolumeButtonRelay {
     private let note: (String) -> Void
     private var observation: NSKeyValueObservation?
     private var notificationObservers: [NSObjectProtocol] = []
+    private var timer: Timer?
     private var volumeView: MPVolumeView?
-    /// Each source reports every change, with slightly different numbers
-    /// (the session in 1/16 steps, the system notice rounded), so each keeps
-    /// its own last value and one press is counted once.
+    /// The session reports in 1/16 steps and the system notice rounds, so
+    /// each source keeps its own last level.
     private var lastBySource: [String: Float] = [:]
-    private var lastPress: (at: Date, source: String)?
-    private var restVolume: Float?
+    private var engaged = false
+    private var savedVolume: Float?
     private var restoring: Float?
     private var restoreCheck: DispatchWorkItem?
     private var heardFrom: Set<String> = []
+    private var lastReason: String?
     private var notesLeft = 0
 
     /// Less than one iPhone volume step (1/16), more than the sources differ.
@@ -44,6 +45,7 @@ final class VolumeButtonRelay {
 
     deinit {
         observation?.invalidate()
+        timer?.invalidate()
         notificationObservers.forEach { NotificationCenter.default.removeObserver($0) }
     }
 
@@ -58,70 +60,100 @@ final class VolumeButtonRelay {
         installVolumeView()
         let session = AVAudioSession.sharedInstance()
         lastBySource = [:]
-        lastPress = nil
         heardFrom = []
-        notesLeft = 40
+        lastReason = nil
+        notesLeft = 60
         observation = session.observe(\.outputVolume, options: [.new]) { [weak self] _, change in
             guard let value = change.newValue else { return }
-            DispatchQueue.main.async { self?.volumeChanged(to: value, from: "session") }
+            DispatchQueue.main.async { self?.volumeChanged(to: value, from: "session", reason: nil) }
         }
-        // iOS also posts these while a system volume view is in a window;
-        // they may arrive where the session's own report does not.
-        for name in ["SystemVolumeDidChange", "AVSystemController_SystemVolumeDidChangeNotification"] {
-            notificationObservers.append(NotificationCenter.default.addObserver(
-                forName: Notification.Name(name), object: nil, queue: .main) { [weak self] notification in
-                let info = notification.userInfo ?? [:]
-                let raw = info["Volume"] ?? info["AVSystemController_AudioVolumeNotificationParameter"]
-                guard let value = (raw as? NSNumber)?.floatValue else { return }
-                self?.volumeChanged(to: value, from: "system")
-            })
-        }
+        // iOS also posts these while a system volume view is in a window. They
+        // carry the reason, and may come even when a press can't move the level.
+        // (The older AVSystemController name would report each press twice.)
+        notificationObservers.append(NotificationCenter.default.addObserver(
+            forName: Notification.Name("SystemVolumeDidChange"), object: nil, queue: .main) { [weak self] notification in
+            let info = notification.userInfo ?? [:]
+            guard let value = (info["Volume"] as? NSNumber)?.floatValue else { return }
+            let reason = info["Reason"] as? String
+            self?.volumeChanged(to: value, from: "system", reason: reason)
+        })
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in self?.evaluate() }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
         DispatchQueue.main.async { [weak self] in
             guard let self, self.observation != nil else { return }
             self.installVolumeView()
-            let ready = self.slider() != nil
-            self.send(note: "watching at \(Self.percent(session.outputVolume)), slider \(ready ? "ready" : "missing")")
+            self.send(note: "watching at \(Self.percent(session.outputVolume)), slider \(self.slider() != nil ? "ready" : "missing")")
+            self.evaluate()
         }
     }
 
-    /// Stops watching. The hidden slider stays in the window for next time.
+    /// Stops watching, giving the iPhone its volume back first.
     func stop() {
+        disengage()
         observation?.invalidate()
         observation = nil
+        timer?.invalidate()
+        timer = nil
         notificationObservers.forEach { NotificationCenter.default.removeObserver($0) }
         notificationObservers = []
         restoreCheck?.cancel()
         restoreCheck = nil
-        restVolume = nil
         restoring = nil
         lastBySource = [:]
-        lastPress = nil
     }
 
-    private func volumeChanged(to value: Float, from source: String) {
+    /// Engages while sharing with sound on the PC, and lets go otherwise.
+    private func evaluate() {
+        let reason = inactiveReason()
+        if reason == nil, !engaged {
+            engaged = true
+            let current = AVAudioSession.sharedInstance().outputVolume
+            savedVolume = current
+            send(note: "engaged: iPhone volume \(Self.percent(current)) saved, held at 0%")
+            put(0)
+        } else if let reason, engaged {
+            send(note: "released: \(reason)")
+            disengage()
+        } else if let reason, reason != lastReason {
+            send(note: "idle: \(reason)")
+        }
+        lastReason = reason
+    }
+
+    private func disengage() {
+        guard engaged else { return }
+        engaged = false
+        if let saved = savedVolume {
+            send(note: "iPhone volume put back to \(Self.percent(saved))")
+            put(saved)
+        }
+        savedVolume = nil
+    }
+
+    private var systemReportsNoted = 0
+
+    private func volumeChanged(to value: Float, from source: String, reason: String?) {
         if heardFrom.insert(source).inserted { send(note: "first volume report from \(source)") }
+        if source == "system", systemReportsNoted < 6 {
+            systemReportsNoted += 1
+            send(note: "system report \(Self.percent(value)), reason \(reason ?? "none")")
+        }
+        let explicit = reason == "ExplicitVolumeChange"
         let previous = lastBySource[source] ?? value
         lastBySource[source] = value
-        if let target = restoring, abs(value - target) < Self.sameLevel {
-            return  // our own correction arriving, from either source
+        evaluate()
+        guard engaged else { return }
+        // One press, two reports: the system notice counts when it comes.
+        if source == "session" && heardFrom.contains("system") { return }
+        if let target = restoring, abs(value - target) < Self.sameLevel { return }  // our own correction
+        if abs(value - previous) >= 0.01 {
+            press(value > previous)
+            put(0)
+        } else if source == "system", explicit, value < 0.01 {
+            // At zero a volume-down press can't move the level; iOS may still say so.
+            press(false)
         }
-        guard abs(value - previous) >= 0.01 else { return }
-        if let reason = inactiveReason() {
-            // Not sharing with sound on the PC: the buttons are the iPhone's again.
-            restVolume = nil
-            restoring = nil
-            send(note: "iPhone volume \(Self.percent(value)) left alone: \(reason)")
-            return
-        }
-        let now = Date()
-        if let last = lastPress, last.source != source, now.timeIntervalSince(last.at) < 0.2 {
-            return  // the other source reporting the same press
-        }
-        lastPress = (now, source)
-        let rest = restVolume ?? previous
-        restVolume = rest
-        press(value > previous)
-        put(rest)
     }
 
     private func put(_ value: Float) {
@@ -179,8 +211,8 @@ final class VolumeButtonRelay {
             .compactMap { $0 as? UIWindowScene }
             .flatMap(\.windows)
         guard let window = windows.first(where: \.isKeyWindow) ?? windows.first else { return }
-        // On screen at almost no opacity: iOS skips building views placed
-        // far outside the window.
+        // In the window at almost no opacity: iOS skips building views placed
+        // far outside it.
         let view = volumeView ?? MPVolumeView(frame: CGRect(x: 0, y: 0, width: 120, height: 40))
         view.alpha = 0.01
         view.isUserInteractionEnabled = false

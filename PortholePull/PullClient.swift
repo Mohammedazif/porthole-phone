@@ -452,7 +452,7 @@ final class PullClient: ObservableObject {
     private func volumeButtonsIdleReason() -> String? {
         guard volumeLinkReady else { return "PC did not offer volume" }
         guard linked else { return "not connected" }
-        guard TrustedPeerStore.soundMode() != .iPhone else { return "sound on iPhone" }
+        guard TrustedPeerStore.soundMode() == .pc else { return "sound mode \(TrustedPeerStore.soundMode().rawValue)" }
         guard let peer = requestedPeer, let snapshot = TrustedPeerStore.broadcastStatus(),
               snapshot.peerID == peer.stableID else { return "not sharing" }
         guard snapshot.phase == .live || snapshot.phase == .waitingForFrames else {
@@ -972,8 +972,8 @@ final class PullClient: ObservableObject {
     func cameForward() {
         foreground = true
         backgroundAudio?.setRequested(false)
-        volumeRelay.stop()
         volumeRelay.prepare()  // the system slider is built while Porthole is on screen
+        if linked { volumeRelay.start() }
         loadLocalState()
         refreshNotificationPermission(promptIfNeeded: linked)
         refreshBroadcastStatus()
@@ -996,10 +996,10 @@ final class PullClient: ObservableObject {
            PairingCredential.load(requestedPeer.credentialProfile) != nil {
             if backgroundAudio == nil { backgroundAudio = CompanionBackgroundAudio() }
             backgroundAudio?.setRequested(true)
-            volumeRelay.start()
+            volumeRelay.start()  // keeps running in the foreground too, while linked
         } else {
             backgroundAudio?.setRequested(false)
-            volumeRelay.stop()
+            if linked { volumeRelay.start() } else { volumeRelay.stop() }
             if !foreground {
                 reconnectWork?.cancel()
                 reconnectWork = nil
