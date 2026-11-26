@@ -223,9 +223,10 @@ final class PullClient: ObservableObject {
     private var backgroundAudio: CompanionBackgroundAudio?
     // Experiment: the volume buttons change the PC's volume while sharing with sound there.
     private lazy var volumeRelay = VolumeButtonRelay(
-        isActive: { [weak self] in self?.volumeButtonsDriveThePC() ?? false },
+        inactiveReason: { [weak self] in self?.volumeButtonsIdleReason() ?? "no connection" },
         press: { [weak self] louder in self?.sendVolume(louder ? "up" : "down") },
-        stuck: { [weak self] in self?.sendVolume("stuck") })
+        stuck: { [weak self] in self?.sendVolume("stuck") },
+        note: { [weak self] text in self?.sendVolume("note " + text) })
     // Main thread copy of volumeReady.
     private var volumeLinkReady = false
     private weak var index: PhotoIndex?
@@ -442,13 +443,19 @@ final class PullClient: ObservableObject {
         send("SOUND \(id) \(mode.rawValue)\n")
     }
 
-    // Called on main.
-    private func volumeButtonsDriveThePC() -> Bool {
-        guard volumeLinkReady, linked, TrustedPeerStore.soundMode() != .iPhone,
-              let peer = requestedPeer, let snapshot = TrustedPeerStore.broadcastStatus(),
-              snapshot.peerID == peer.stableID, snapshot.phase == .live || snapshot.phase == .waitingForFrames,
-              Date().timeIntervalSince(snapshot.updatedAt) < 8 else { return false }
-        return true
+    /// Why the volume buttons are the iPhone's own right now, or nil while
+    /// they change the PC's volume. Called on main.
+    private func volumeButtonsIdleReason() -> String? {
+        guard volumeLinkReady else { return "PC did not offer volume" }
+        guard linked else { return "not connected" }
+        guard TrustedPeerStore.soundMode() != .iPhone else { return "sound on iPhone" }
+        guard let peer = requestedPeer, let snapshot = TrustedPeerStore.broadcastStatus(),
+              snapshot.peerID == peer.stableID else { return "not sharing" }
+        guard snapshot.phase == .live || snapshot.phase == .waitingForFrames else {
+            return "sharing \(snapshot.phase.rawValue)"
+        }
+        guard Date().timeIntervalSince(snapshot.updatedAt) < 8 else { return "sharing status old" }
+        return nil
     }
 
     private func sendVolume(_ word: String) {
@@ -1578,7 +1585,7 @@ final class PullClient: ObservableObject {
             return
         }
         guard pairingCommitted else {
-            if line == "SYNC READY" || line == "INPUT READY" || line == "SOUND READY",
+            if line == "SYNC READY" || line == "INPUT READY" || line == "SOUND READY" || line == "VOLUME READY",
                !pendingPairingCapabilities.contains(line) {
                 pendingPairingCapabilities.append(line)
             }
