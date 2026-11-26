@@ -802,7 +802,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         }
         if rotation == nil {
             var made: VTPixelRotationSession?
-            guard VTPixelRotationSessionCreate(allocator: nil, pixelRotationSessionOut: &made) == noErr else { return nil }
+            guard VTPixelRotationSessionCreate(nil, &made) == noErr else { return nil }
             rotation = made
         }
         guard let rotation else { return nil }
@@ -812,7 +812,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         }
         let upright = orientation == .down ? scaled : (w: scaled.h, h: scaled.w)
         guard let target = allocate(upright, format: format),
-              VTPixelRotationSessionRotateImage(rotation, from: source, to: target) == noErr else { return nil }
+              VTPixelRotationSessionRotateImage(rotation, source, target) == noErr else { return nil }
         return target
     }
 
