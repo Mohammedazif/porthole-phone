@@ -7,13 +7,14 @@ import UIKit
 ///
 /// The shared app's sound reaches the PC over Wi-Fi at full level whatever
 /// the iPhone's volume, so on engaging this saves the iPhone's volume and
-/// holds it at 1%, and puts it back when sharing ends or the choice changes.
+/// holds it at zero, and puts it back when sharing ends or the choice changes.
 /// iOS gives an app no volume button events, so each press is read as a
 /// change of the system volume and the level is put back through a hidden
-/// system volume slider. Not zero: a button step is 1/16, so from 1% a
-/// volume-down press still moves the level (to zero), and Porthole sees it
-/// from the background, where iOS says nothing about a press that can't move
-/// the level. 1% is far below the lowest button step, too quiet to hear.
+/// system volume slider. At zero a volume-down press can't move the level:
+/// iOS reports it inside Porthole only, so from other apps down is the
+/// Control Center and Dynamic Island buttons, or the PC's own keys. (Any
+/// level above zero is audible, and iOS reports levels only in whole 1/16
+/// steps, so a hold under the lowest step hides the down press too.)
 /// Notes go to the PC's log, the log we can read while testing. Main thread only.
 final class VolumeButtonRelay {
     private let inactiveReason: () -> String?
@@ -44,8 +45,8 @@ final class VolumeButtonRelay {
     private var notesLeft = 0
 
     /// Where the iPhone's volume is held while its sound plays on the PC.
-    private static let holdLevel: Float = 0.01
-    /// Closer than this is the same level: well under the 1% hold.
+    private static let holdLevel: Float = 0
+    /// Closer than this is the same level: well under one 1/16 step.
     private static let sameLevel: Float = 0.004
     /// The person's own level is anything clearly above the hold.
     private static let ownLevelFloor: Float = 0.03

@@ -34,7 +34,6 @@ struct PortholeInboxProvider: TimelineProvider {
     }
 }
 
-@main
 struct PortholeInboxWidget: Widget {
     var body: some WidgetConfiguration {
         StaticConfiguration(kind: WidgetInboxSnapshot.kind, provider: PortholeInboxProvider()) { entry in

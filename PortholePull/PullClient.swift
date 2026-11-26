@@ -1,3 +1,4 @@
+import ActivityKit
 import Combine
 import Foundation
 import ImageIO
@@ -278,6 +279,52 @@ final class PullClient: ObservableObject {
         clipboardSyncEnabled = clipboardPreference.generation != nil
         inputControlsEnabled = inputPreference.enabled
         inputScreenSharingOnly = inputPreference.screenSharingOnly
+        observeVolumeSignals()
+    }
+
+    // MARK: PC volume buttons in Control Center and the Dynamic Island
+
+    /// The buttons' intents post a Darwin notification; this app holds the PC link.
+    private func observeVolumeSignals() {
+        let observer = Unmanaged.passUnretained(self).toOpaque()
+        for name in [PCVolumeSignal.up, PCVolumeSignal.down] {
+            CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), observer,
+                                            { _, observer, name, _, _ in
+                guard let observer, let name else { return }
+                let client = Unmanaged<PullClient>.fromOpaque(observer).takeUnretainedValue()
+                let louder = name.rawValue as String == PCVolumeSignal.up
+                DispatchQueue.main.async { client.volumeButtonTapped(louder: louder) }
+            }, name as CFString, nil, .deliverImmediately)
+        }
+    }
+
+    private func volumeButtonTapped(louder: Bool) {
+        sendVolume(louder ? "up" : "down")
+    }
+
+    /// The Live Activity with the PC's volume buttons shows while connected
+    /// with sound on the PC. iOS lets an app start one only while it is on
+    /// screen, so it starts when Porthole is opened and ends from anywhere.
+    /// Called on main.
+    func updateSoundActivity() {
+        let wanted = linked && TrustedPeerStore.soundMode() == .pc
+        let running = Activity<PortholeSoundAttributes>.activities
+        if wanted {
+            let state = PortholeSoundAttributes.ContentState(pcName: computerName)
+            if running.isEmpty {
+                guard foreground, ActivityAuthorizationInfo().areActivitiesEnabled else { return }
+                _ = try? Activity.request(attributes: PortholeSoundAttributes(),
+                                          content: .init(state: state, staleDate: nil), pushType: nil)
+            } else {
+                for activity in running where activity.content.state != state {
+                    Task { await activity.update(.init(state: state, staleDate: nil)) }
+                }
+            }
+        } else {
+            for activity in running {
+                Task { await activity.end(nil, dismissalPolicy: .immediate) }
+            }
+        }
     }
 
     var inputControlSummary: String {
@@ -434,6 +481,7 @@ final class PullClient: ObservableObject {
 
     /// Tells the PC where the shared app's sound plays, so both devices show the same choice.
     func setSoundMode(_ mode: SoundMode) {
+        DispatchQueue.main.async { self.updateSoundActivity() }
         queue.async {
             guard self.soundReady else { return }
             self.sendSoundMode(mode)
@@ -974,6 +1022,7 @@ final class PullClient: ObservableObject {
         backgroundAudio?.setRequested(false)
         volumeRelay.prepare()  // the system slider is built while Porthole is on screen
         volumeRelay.setForeground(true)
+        updateSoundActivity()
         if linked { volumeRelay.start() }
         loadLocalState()
         refreshNotificationPermission(promptIfNeeded: linked)
@@ -1048,6 +1097,7 @@ final class PullClient: ObservableObject {
     private func setDisconnected() {
         fileSendPeer = nil
         linked = false
+        updateSoundActivity()
         inputControlSupported = false
         inputSettingsApplied = false
         inputVerificationSupported = false
@@ -1556,6 +1606,7 @@ final class PullClient: ObservableObject {
             self.linked = true
             self.status = "Connected securely to \(peer.name)."
             self.updateBackgroundConnection()
+            self.updateSoundActivity()
             self.publishSharedPeer(peer)
             self.publishWidgetPairing()
             self.sendSystemPhoneName()
@@ -1700,6 +1751,7 @@ final class PullClient: ObservableObject {
         // Chosen on the PC. The broadcast extension and Settings read the saved choice.
         if line.hasPrefix("SOUND SET "), let mode = SoundMode(rawValue: String(line.dropFirst("SOUND SET ".count))) {
             TrustedPeerStore.setSoundMode(mode)
+            DispatchQueue.main.async { self.updateSoundActivity() }
             return
         }
         if line == "SYNC READY" {
