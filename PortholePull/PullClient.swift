@@ -223,7 +223,11 @@ final class PullClient: ObservableObject {
     private var backgroundAudio: CompanionBackgroundAudio?
     // Experiment: the volume buttons change the PC's volume while sharing with sound there.
     private lazy var volumeRelay = VolumeButtonRelay(
-        inactiveReason: { [weak self] in self?.volumeButtonsIdleReason() ?? "no connection" },
+        inactiveReason: { [weak self] in
+            // Not `self?.volumeButtonsIdleReason() ?? ...`: nil there means active.
+            guard let self else { return "no connection" }
+            return self.volumeButtonsIdleReason()
+        },
         press: { [weak self] louder in self?.sendVolume(louder ? "up" : "down") },
         stuck: { [weak self] in self?.sendVolume("stuck") },
         note: { [weak self] text in self?.sendVolume("note " + text) })
@@ -969,6 +973,7 @@ final class PullClient: ObservableObject {
         foreground = true
         backgroundAudio?.setRequested(false)
         volumeRelay.stop()
+        volumeRelay.prepare()  // the system slider is built while Porthole is on screen
         loadLocalState()
         refreshNotificationPermission(promptIfNeeded: linked)
         refreshBroadcastStatus()
