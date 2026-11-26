@@ -39,6 +39,8 @@ final class VolumeButtonRelay {
     }
     private var lastFloorPress: (at: Date, sequence: Int?)?
     private var restoring: Float?
+    /// iOS reported the level `restoring` asked for.
+    private var restoreConfirmed = false
     /// The level before our last correction, and when: iOS can refuse a
     /// correction (inside Porthole, with its audio session off) and report
     /// the old level again, which is not a press.
@@ -61,6 +63,19 @@ final class VolumeButtonRelay {
 
     func setForeground(_ value: Bool) {
         foreground = value
+    }
+
+    /// The source that reports where the volume really is.
+    private var primarySource: String {
+        foreground || !heardFrom.contains("session") ? "system" : "session"
+    }
+
+    /// The volume now. In the app Porthole's audio session is off and its
+    /// reading can be stale (it once said 100% just after iOS said 0%), so
+    /// iOS's own last notice counts first there.
+    private func currentLevel() -> Float {
+        if primarySource == "system", let level = lastBySource["system"] { return level }
+        return AVAudioSession.sharedInstance().outputVolume
     }
 
     init(inactiveReason: @escaping () -> String?, press: @escaping (_ louder: Bool) -> Void,
@@ -140,7 +155,7 @@ final class VolumeButtonRelay {
         let reason = inactiveReason()
         if reason == nil, !engaged {
             engaged = true
-            let current = AVAudioSession.sharedInstance().outputVolume
+            let current = currentLevel()
             // Zero is not taken as the person's level: it is what this relay
             // holds, and what an interrupted hold could have left behind.
             if current > Self.ownLevelFloor, !UserDefaults.standard.bool(forKey: Self.holdingKey) { ownVolume = current }
@@ -193,9 +208,11 @@ final class VolumeButtonRelay {
             return
         }
         // One press, two reports: count the source that reports where we are.
-        let primary = foreground || !heardFrom.contains("session") ? "system" : "session"
-        guard source == primary else { return }
-        if let target = restoring, abs(value - target) < Self.sameLevel { return }  // our own correction
+        guard source == primarySource else { return }
+        if let target = restoring, abs(value - target) < Self.sameLevel {
+            restoreConfirmed = true
+            return  // our own correction
+        }
         if let undone, Date().timeIntervalSince(undone.at) < 1.5, abs(value - undone.level) < Self.sameLevel {
             self.undone = nil
             return  // iOS put back the level our correction replaced
@@ -218,6 +235,7 @@ final class VolumeButtonRelay {
 
     private func put(_ value: Float) {
         restoring = value
+        restoreConfirmed = false
         installVolumeView()
         guard let slider = slider() else {
             restoring = nil
@@ -231,8 +249,8 @@ final class VolumeButtonRelay {
         let check = DispatchWorkItem { [weak self] in
             guard let self, self.restoring == value else { return }
             self.restoring = nil
-            let now = AVAudioSession.sharedInstance().outputVolume
-            if abs(now - value) >= Self.sameLevel {
+            let now = self.currentLevel()
+            if !self.restoreConfirmed, abs(now - value) >= Self.sameLevel {
                 self.send(note: "volume stayed at \(Self.percent(now)), wanted \(Self.percent(value))")
                 self.stuck()
             }

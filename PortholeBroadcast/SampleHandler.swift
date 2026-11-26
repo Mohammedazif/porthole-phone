@@ -491,7 +491,7 @@ final class SampleHandler: RPBroadcastSampleHandler {
         lastOrientation = orientation
 
         guard let source = makeSource(image, orientation: orientation) else {
-            loseFrame(ticket)
+            loseFrame(ticket, breaksStream: false) // never reached the encoder
             return
         }
         let width = CVPixelBufferGetWidth(source)
@@ -510,13 +510,22 @@ final class SampleHandler: RPBroadcastSampleHandler {
                                                      duration: .invalid, frameProperties: properties,
                                                      infoFlagsOut: &flags) { [weak self] result, flags, sample in
             guard let self else { return }
-            guard result == noErr, !flags.contains(.frameDropped), let sample, let encoded = Self.annexB(sample) else {
+            // A frame the encoder skipped (rate control, often right after a
+            // keyframe) never entered the stream: the next frame still
+            // follows what the PC has. Asking for a keyframe then made the
+            // next one too big as well, skipped again: 1-2 s of frozen
+            // picture after each rotation.
+            if flags.contains(.frameDropped) || (result == noErr && sample == nil) {
+                self.loseFrame(ticket, breaksStream: false)
+                return
+            }
+            guard result == noErr, let sample, let encoded = Self.annexB(sample) else {
                 self.loseFrame(ticket)
                 return
             }
             self.queue.async { self.send(encoded.bytes, keyframe: encoded.keyframe, ticket: ticket) }
         }
-        if status != noErr || flags.contains(.frameDropped) { loseFrame(ticket) }
+        if status != noErr { loseFrame(ticket) } else if flags.contains(.frameDropped) { loseFrame(ticket, breaksStream: false) }
     }
 
     private func reserveFrame(forceKey: Bool, ptsNs: UInt64, turn: Data) -> FrameTicket? {
@@ -532,11 +541,14 @@ final class SampleHandler: RPBroadcastSampleHandler {
         return ticket
     }
 
-    private func loseFrame(_ ticket: FrameTicket) {
+    /// `breaksStream`: the frame was encoded (or may have been) but won't
+    /// reach the PC, so later frames refer to one it lacks: start over with
+    /// a keyframe. A frame that never got encoded leaves the stream whole.
+    private func loseFrame(_ ticket: FrameTicket, breaksStream: Bool = true) {
         queue.async {
             guard self.connectionID == ticket.connectionID,
                   self.encoding.removeValue(forKey: ticket.id) != nil else { return }
-            self.needKey = true
+            if breaksStream || ticket.forceKey { self.needKey = true }
             self.lostFrames += 1
         }
     }
