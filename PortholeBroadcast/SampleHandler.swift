@@ -336,6 +336,15 @@ final class SampleHandler: RPBroadcastSampleHandler {
             return
         }
         let current = TrustedPeerStore.broadcastPeer(matching: pairing) ?? pairing
+        // After the PC restarts, the screen can reconnect before the app has
+        // heard which screen protocol the PC speaks, and settle for version 2:
+        // no capture times, no turn for the pointer. Once the app knows the PC
+        // speaks a newer one, reconnect once to use it.
+        if ready, link != nil, current.screenProtocolVersion > peer.screenProtocolVersion {
+            disconnect()
+            connect()
+            return
+        }
         // A verified screen connection is independent of the foreground companion socket.
         if !ready, current.channelTicket == nil, peer.channelTicket == nil {
             if link != nil { disconnect() }

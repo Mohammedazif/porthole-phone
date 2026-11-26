@@ -39,6 +39,10 @@ final class VolumeButtonRelay {
     }
     private var lastFloorPress: (at: Date, sequence: Int?)?
     private var restoring: Float?
+    /// The level before our last correction, and when: iOS can refuse a
+    /// correction (inside Porthole, with its audio session off) and report
+    /// the old level again, which is not a press.
+    private var undone: (level: Float, at: Date)?
     private var restoreCheck: DispatchWorkItem?
     private var heardFrom: Set<String> = []
     private var lastReason: String?
@@ -143,6 +147,7 @@ final class VolumeButtonRelay {
             if ownVolume == nil { ownVolume = 0.5 }
             UserDefaults.standard.set(true, forKey: Self.holdingKey)
             send(note: "engaged: iPhone volume \(Self.percent(ownVolume ?? 0)) remembered, held at \(Self.percent(Self.holdLevel))")
+            if current > Self.holdLevel + Self.sameLevel { undone = (current, Date()) }
             put(Self.holdLevel)
         } else if let reason, engaged {
             send(note: "released: \(reason)")
@@ -191,6 +196,10 @@ final class VolumeButtonRelay {
         let primary = foreground || !heardFrom.contains("session") ? "system" : "session"
         guard source == primary else { return }
         if let target = restoring, abs(value - target) < Self.sameLevel { return }  // our own correction
+        if let undone, Date().timeIntervalSince(undone.at) < 1.5, abs(value - undone.level) < Self.sameLevel {
+            self.undone = nil
+            return  // iOS put back the level our correction replaced
+        }
         if abs(value - previous) >= Self.sameLevel {
             press(value > previous)
             put(Self.holdLevel)
