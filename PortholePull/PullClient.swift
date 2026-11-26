@@ -973,6 +973,7 @@ final class PullClient: ObservableObject {
         foreground = true
         backgroundAudio?.setRequested(false)
         volumeRelay.prepare()  // the system slider is built while Porthole is on screen
+        volumeRelay.setForeground(true)
         if linked { volumeRelay.start() }
         loadLocalState()
         refreshNotificationPermission(promptIfNeeded: linked)
@@ -983,6 +984,7 @@ final class PullClient: ObservableObject {
 
     func enteredBackground() {
         foreground = false
+        volumeRelay.setForeground(false)
         cancelInputVerification(message: "Bluetooth verification was interrupted.")
         updateBackgroundConnection()
         if backgroundAudio?.requested == true && !linked && !connecting && reconnectWork == nil {

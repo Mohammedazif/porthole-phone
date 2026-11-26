@@ -7,11 +7,14 @@ import UIKit
 ///
 /// The shared app's sound reaches the PC over Wi-Fi at full level whatever
 /// the iPhone's volume, so on engaging this saves the iPhone's volume and
-/// holds it at zero, and puts it back when sharing ends or the choice
-/// changes. iOS gives an app no volume button events, so each press is read
-/// from the system volume notice and the level is put back to zero through a
-/// hidden system volume slider. Notes go to the PC's log, the log we can read
-/// while testing. Main thread only.
+/// holds it at 1%, and puts it back when sharing ends or the choice changes.
+/// iOS gives an app no volume button events, so each press is read as a
+/// change of the system volume and the level is put back through a hidden
+/// system volume slider. Not zero: a button step is 1/16, so from 1% a
+/// volume-down press still moves the level (to zero), and Porthole sees it
+/// from the background, where iOS says nothing about a press that can't move
+/// the level. 1% is far below the lowest button step, too quiet to hear.
+/// Notes go to the PC's log, the log we can read while testing. Main thread only.
 final class VolumeButtonRelay {
     private let inactiveReason: () -> String?
     private let press: (_ louder: Bool) -> Void
@@ -40,8 +43,20 @@ final class VolumeButtonRelay {
     private var lastReason: String?
     private var notesLeft = 0
 
-    /// Less than one iPhone volume step (1/16), more than the sources differ.
-    private static let sameLevel: Float = 0.04
+    /// Where the iPhone's volume is held while its sound plays on the PC.
+    private static let holdLevel: Float = 0.01
+    /// Closer than this is the same level: well under the 1% hold.
+    private static let sameLevel: Float = 0.004
+    /// The person's own level is anything clearly above the hold.
+    private static let ownLevelFloor: Float = 0.03
+    /// In the background Porthole's audio session reports exact levels; in
+    /// the app, with its session off, iOS's system notice does. One source at
+    /// a time, so a press counts once.
+    private var foreground = true
+
+    func setForeground(_ value: Bool) {
+        foreground = value
+    }
 
     init(inactiveReason: @escaping () -> String?, press: @escaping (_ louder: Bool) -> Void,
          stuck: @escaping () -> Void, note: @escaping (String) -> Void) {
@@ -123,11 +138,11 @@ final class VolumeButtonRelay {
             let current = AVAudioSession.sharedInstance().outputVolume
             // Zero is not taken as the person's level: it is what this relay
             // holds, and what an interrupted hold could have left behind.
-            if current > 0.01, !UserDefaults.standard.bool(forKey: Self.holdingKey) { ownVolume = current }
+            if current > Self.ownLevelFloor, !UserDefaults.standard.bool(forKey: Self.holdingKey) { ownVolume = current }
             if ownVolume == nil { ownVolume = 0.5 }
             UserDefaults.standard.set(true, forKey: Self.holdingKey)
-            send(note: "engaged: iPhone volume \(Self.percent(ownVolume ?? 0)) remembered, held at 0%")
-            put(0)
+            send(note: "engaged: iPhone volume \(Self.percent(ownVolume ?? 0)) remembered, held at \(Self.percent(Self.holdLevel))")
+            put(Self.holdLevel)
         } else if let reason, engaged {
             send(note: "released: \(reason)")
             disengage()
@@ -165,19 +180,20 @@ final class VolumeButtonRelay {
         evaluate()
         guard engaged else {
             // The person's own level, unless it is this relay putting one back.
-            if value > 0.01, restoring.map({ abs(value - $0) >= Self.sameLevel }) ?? true,
+            if value > Self.ownLevelFloor, restoring.map({ abs(value - $0) >= Self.sameLevel }) ?? true,
                !UserDefaults.standard.bool(forKey: Self.holdingKey) {
                 ownVolume = value
             }
             return
         }
-        // One press, two reports: the system notice counts when it comes.
-        if source == "session" && heardFrom.contains("system") { return }
+        // One press, two reports: count the source that reports where we are.
+        let primary = foreground || !heardFrom.contains("session") ? "system" : "session"
+        guard source == primary else { return }
         if let target = restoring, abs(value - target) < Self.sameLevel { return }  // our own correction
-        if abs(value - previous) >= 0.01 {
+        if abs(value - previous) >= Self.sameLevel {
             press(value > previous)
-            put(0)
-        } else if source == "system", explicit, value < 0.01 {
+            put(Self.holdLevel)
+        } else if source == "system", explicit, value < Self.sameLevel {
             // At zero a volume-down press can't move the level, but iOS still
             // says so, twice: count one press per sequence number, or per moment.
             let now = Date()
@@ -221,7 +237,9 @@ final class VolumeButtonRelay {
         note(text)
     }
 
-    private static func percent(_ value: Float) -> String { "\(Int((value * 100).rounded()))%" }
+    private static func percent(_ value: Float) -> String {
+        value > 0 && value < 0.1 ? String(format: "%.1f%%", value * 100) : "\(Int((value * 100).rounded()))%"
+    }
 
     private func slider() -> UISlider? {
         guard let view = volumeView else { return nil }
