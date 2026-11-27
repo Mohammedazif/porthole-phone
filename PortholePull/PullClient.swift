@@ -277,6 +277,9 @@ final class PullClient: ObservableObject {
     private var chunkedPush = false
     private var lastReceiveProgressAt = DispatchTime(uptimeNanoseconds: 0)
     private var pushStage: IncomingTransferStore.Stage?
+    /// The checksum of an incoming file, taken as it arrives, so a large
+    /// file isn't read a second time to check it.
+    private var pushHasher: SHA256?
     private var pushTransfer: IncomingTransfer?
     private var incomingOperation: UUID?
     private var incomingHeartbeat: DispatchWorkItem?
@@ -2101,6 +2104,18 @@ final class PullClient: ObservableObject {
             if case .success(.saved(let receipt?, at: let path)) = state {
                 self.importReceivedReceipt(receipt, at: path)
             }
+            // Continuing: what was kept goes into the checksum first, read once.
+            var hasher = SHA256()
+            if case .success(.staged(let staged)) = state, staged.offset > 0,
+               let kept = try? FileHandle(forReadingFrom: staged.data) {
+                var left = staged.offset
+                while left > 0, let chunk = autoreleasepool(invoking: { try? kept.read(upToCount: min(left, 1 << 20)) }),
+                      !chunk.isEmpty {
+                    hasher.update(data: chunk)
+                    left -= chunk.count
+                }
+                try? kept.close()
+            }
             self.queue.async {
                 guard self.transportPeer?.id == peer.id, self.incomingOperation == operation else {
                     if case .success(.staged(let staged)) = state { try? staged.handle.close() }
@@ -2116,6 +2131,7 @@ final class PullClient: ObservableObject {
                     DispatchQueue.main.async { self.setReceiveProgress(nil) }
                 case .success(.staged(let staged)):
                     self.pushStage = staged
+                    self.pushHasher = hasher
                     self.pushLeft = transfer.bytes - staged.offset
                     self.pushChunkLeft = chunked ? 0 : self.pushLeft
                     self.reportReceive(transfer, received: staged.offset, phase: .receiving)
@@ -2163,7 +2179,9 @@ final class PullClient: ObservableObject {
         let take = min(pushChunkLeft, buffer.count)
         guard take > 0 else { return true }
         do {
-            try stage.handle.write(contentsOf: buffer.prefix(take))
+            let piece = buffer.prefix(take)
+            try stage.handle.write(contentsOf: piece)
+            pushHasher?.update(data: piece)
             buffer.removeFirst(take)
             pushLeft -= take
             pushChunkLeft -= take
@@ -2188,8 +2206,13 @@ final class PullClient: ObservableObject {
             return
         }
         pushStage = nil
+        let streamed = pushHasher.map { $0.finalize().map { String(format: "%02x", $0) }.joined() }
+        pushHasher = nil
         reportReceive(transfer, received: transfer.bytes, phase: .saving)
-        reportIncomingPending(transfer, operation: operation, peer: peer, deadline: .now() + .seconds(120))
+        // Saving a large file into its folder takes a while; the PC hears
+        // PENDING every few seconds meanwhile.
+        let saving = Int(TransferStaging.receiptWait(Int64(transfer.bytes)))
+        reportIncomingPending(transfer, operation: operation, peer: peer, deadline: .now() + .seconds(max(120, saving)))
         incomingQueue.async {
             let result = Result {
                 let saved: ReceivedFileStorage.SavedFile
@@ -2200,7 +2223,8 @@ final class PullClient: ObservableObject {
                     receipt = try self.incomingStore.record(recovered.reference, from: peer.name, at: stage.receipt)
                     try? FileManager.default.removeItem(at: stage.data)
                 } else {
-                    if try Self.digest(of: stage.data) != transfer.digest {
+                    let actual = try streamed ?? Self.digest(of: stage.data)
+                    if actual != transfer.digest {
                         try FileManager.default.removeItem(at: stage.data)
                         throw CocoaError(.fileReadCorruptFile)
                     }
@@ -2250,6 +2274,7 @@ final class PullClient: ObservableObject {
     private func abortPush() {
         try? pushStage?.handle.close()
         pushStage = nil
+        pushHasher = nil
         pushTransfer = nil
         pushLeft = 0
         pushChunkLeft = 0
@@ -2268,6 +2293,10 @@ final class PullClient: ObservableObject {
             let task = UIApplication.shared.beginBackgroundTask(withName: "Finish receiving a file") { [weak self] in
                 guard let self else { return }
                 self.endReceiveBackgroundTask(operation)
+                // While paired, Porthole keeps running in the background
+                // (silent audio), so the transfer goes on; only stop it when
+                // iOS is really about to suspend the app.
+                if self.backgroundAudio?.requested == true { return }
                 self.queue.async {
                     guard self.transportPeer?.id == peer.id, self.incomingOperation == operation else { return }
                     self.disconnect(peer, message: "iOS paused the transfer. Reopen Porthole to resume from the PC.")
