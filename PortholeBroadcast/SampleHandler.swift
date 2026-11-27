@@ -732,11 +732,15 @@ final class SampleHandler: RPBroadcastSampleHandler {
             // Only a clear, settled tilt counts: a phone propped at an angle
             // used to flip between upright and landscape every few seconds,
             // and each flip moved the pointer off what it was over.
+            // A phone in the hand leans back (about half its weight on the
+            // screen's axis), so the screen's own axes are compared with
+            // each other: one clearly beyond the other counts. Lying flat
+            // (both small) says nothing.
             let x = abs(gravity.x), y = abs(gravity.y)
             let seen: UInt8
-            if y > 0.8, y > x + 0.4 {
+            if y > 0.45, y > 2 * x {
                 seen = gravity.y < 0 ? 1 : 2
-            } else if x > 0.8, x > y + 0.4 {
+            } else if x > 0.45, x > 2 * y {
                 seen = gravity.x < 0 ? 3 : 4
             } else {
                 self.heldCandidate = (0, 0)
