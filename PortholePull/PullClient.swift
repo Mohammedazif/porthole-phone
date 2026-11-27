@@ -10,6 +10,7 @@ import UserNotifications
 
 extension Notification.Name {
     static let portholeOpenReceived = Notification.Name("porthole.openReceived")
+    static let portholeSendNotice = Notification.Name("porthole.sendNotice")
 }
 
 enum PhoneNotice {
@@ -55,6 +56,12 @@ enum PhoneNotice {
 final class NoticeDelegate: NSObject, UNUserNotificationCenterDelegate {
     static let shared = NoticeDelegate()
     private static var pendingFiles: [ReceivedFileReference] = []
+    private static var pendingSendAction: SendNotice.Action?
+
+    static func takeSendAction() -> SendNotice.Action? {
+        defer { pendingSendAction = nil }
+        return pendingSendAction
+    }
 
     static func takePendingFiles() -> [ReceivedFileReference] {
         defer { pendingFiles.removeAll() }
@@ -73,6 +80,14 @@ final class NoticeDelegate: NSObject, UNUserNotificationCenterDelegate {
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         guard response.actionIdentifier == UNNotificationDefaultActionIdentifier else { completionHandler(); return }
         let payload = response.notification.request.content.userInfo
+        if let action = (payload[SendNotice.key] as? String).flatMap(SendNotice.Action.init(rawValue:)) {
+            DispatchQueue.main.async {
+                Self.pendingSendAction = action
+                NotificationCenter.default.post(name: .portholeSendNotice, object: nil)
+                completionHandler()
+            }
+            return
+        }
         let reference = (payload["reference"] as? Data)
             .flatMap { try? JSONDecoder().decode(ReceivedFileReference.self, from: $0) }
             ?? (payload["file"] as? String).flatMap { ReceivedFileWriter.validName($0) ? ReceivedFileReference(name: $0) : nil }

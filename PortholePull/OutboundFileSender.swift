@@ -1,6 +1,16 @@
 import Foundation
 import Network
 import Combine
+import Photos
+import UniformTypeIdentifiers
+
+/// What the person picked to send: a file in Files, or a Photo Library item
+/// (its identifier when Porthole can read the library, and the picker's
+/// provider as the fallback).
+enum SendPick {
+    case file(URL)
+    case photo(identifier: String?, provider: NSItemProvider?)
+}
 
 /// Uses the paired PC's pinned inbox and the per-file acknowledgements used by Share › Porthole.
 /// File bodies are streamed; history is updated only after the PC returns OK.
@@ -29,12 +39,19 @@ final class OutboundFileSender: ObservableObject {
         var bytes: Int64
         var digest: String
         var sent = false
+        var source: TransferSource = .staged
     }
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var items: [Item] = []
     @Published private(set) var progress: Double = 0
     @Published private(set) var message = ""
     @Published private(set) var pendingCount = 0
+    /// The item being sent, how far into it, and the whole send in bytes.
+    @Published private(set) var activeItemID: UUID?
+    @Published private(set) var activeFraction: Double = 0
+    @Published private(set) var sentBytes: Int64 = 0
+    @Published private(set) var totalBytes: Int64 = 0
+    @Published private(set) var secondsLeft: Double?
     private let queue = DispatchQueue(label: "porthole.sendFiles")
     private let preparation = PreparationCancellation()
     private var generation = UUID()
@@ -42,7 +59,25 @@ final class OutboundFileSender: ObservableObject {
     private var journalBatch: OutboundTransferJournal.Batch?
     private var manifest: OutboundTransferManifest?
     private var link: NWConnection?
-    private var handle: FileHandle?
+    private let readerLock = NSLock()
+    private var currentReader: TransferBodyReader?
+    /// Reading the item being sent; replacing it closes the old one.
+    private var reader: TransferBodyReader? {
+        get { readerLock.lock(); defer { readerLock.unlock() }; return currentReader }
+        set {
+            readerLock.lock()
+            let old = currentReader
+            currentReader = newValue
+            readerLock.unlock()
+            if let old, old !== newValue { old.close() }
+        }
+    }
+    private var batchBytes: Int64 = 0
+    private var doneBytes: Int64 = 0
+    private var activeIndex: Int?
+    private var activeDone: Int64 = 0
+    private var rateBase: (at: DispatchTime, bytes: Int64)?
+    private var smoothedLeft: Double?
     private var buffer = Data()
     private var timer: DispatchWorkItem?
     private var batch: [Int] = []
@@ -55,62 +90,138 @@ final class OutboundFileSender: ObservableObject {
     private var onSaved: (() -> Void)?
 
     func prepare(_ urls: [URL], for peer: TrustedPeer) {
+        prepare(urls.map(SendPick.file), for: peer)
+    }
+
+    /// Reads each pick once for its size and checksum. Files and Photo
+    /// Library items are not copied: they are read again from where they are
+    /// when sent, so a retry works later and nothing takes extra space.
+    func prepare(_ picks: [SendPick], for peer: TrustedPeer) {
         let attempt = preparation.begin()
         queue.async {
             self.cleanUp()
-            self.publish(.preparing, message: "Preparing selected files…")
+            self.publish(.preparing, message: "Preparing…")
             do {
-                guard !urls.isEmpty else { throw SendError.message("No files selected.") }
-                guard urls.count <= TransferStaging.maxItems else { throw SendError.message("Send up to 500 files at a time.") }
+                guard !picks.isEmpty else { throw SendError.message("Nothing selected.") }
+                guard picks.count <= TransferStaging.maxItems else { throw SendError.message("Send up to 500 items at a time.") }
                 let journal = OutboundTransferJournal(container: PortholeAppGroup.containerURL ?? Self.privateContainer)
                 let batch = try journal.makeBatch(for: peer)
                 self.journalBatch = batch
                 self.destination = peer.remembered
-                let folder = batch.folder
-                let manager = FileManager.default
                 var remaining = TransferStaging.maxBatchBytes
-                for (index, url) in urls.enumerated() {
-                    if self.preparation.isCancelled(attempt) { throw TransferStaging.Failure.cancelled }
-                    let scoped = url.startAccessingSecurityScopedResource()
-                    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-                    let name = TransferFileName.make(url.lastPathComponent, index: index)
-                    let directory = folder.appendingPathComponent(String(index), isDirectory: true)
-                    try manager.createDirectory(at: directory, withIntermediateDirectories: true)
-                    let target = directory.appendingPathComponent(name)
-                    var coordinatorError: NSError?
-                    var staged: Result<(bytes: Int64, digest: String), Error>?
-                    NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinatorError) { coordinated in
-                        staged = Result {
-                            try TransferStaging.snapshot(coordinated, to: target, remaining: remaining, reserve: batch.reserve) {
-                                self.preparation.isCancelled(attempt) || batch.isRevoked
-                            }
+                let cancelled = { self.preparation.isCancelled(attempt) || batch.isRevoked }
+                for (index, pick) in picks.enumerated() {
+                    if cancelled() { throw TransferStaging.Failure.cancelled }
+                    if picks.count > 1 { self.publish(.preparing, message: "Preparing \(index + 1) of \(picks.count)…") }
+                    let item: Item
+                    switch pick {
+                    case .file(let url):
+                        item = try Self.original(url, index: index, batch: batch, cancelled: cancelled)
+                    case .photo(let identifier, let provider):
+                        if let identifier, let photo = try Self.libraryItem(identifier, index: index, batch: batch,
+                                                                             cancelled: cancelled) {
+                            item = photo
+                        } else if let provider {
+                            item = try Self.copy(provider, index: index, batch: batch, remaining: remaining,
+                                                 cancelled: cancelled)
+                            remaining -= item.bytes
+                        } else {
+                            throw SendError.message("This item is no longer in your Photo Library.")
                         }
                     }
-                    if let coordinatorError { throw coordinatorError }
-                    guard let staged else { throw SendError.message("Unable to prepare \(name).") }
-                    let snapshot = try staged.get()
-                    remaining -= snapshot.bytes
-                    self.files.append(Item(id: UUID(), url: target, name: name, bytes: snapshot.bytes, digest: snapshot.digest))
+                    self.files.append(item)
                 }
-                if self.preparation.isCancelled(attempt) { throw TransferStaging.Failure.cancelled }
+                if cancelled() { throw TransferStaging.Failure.cancelled }
                 let manifest = OutboundTransferManifest(id: batch.id, destination: peer.remembered,
                                                         files: self.files.map { file in
-                    .init(id: file.id, name: file.name, bytes: file.bytes, digest: file.digest, sent: false)
+                    .init(id: file.id, name: file.name, bytes: file.bytes, digest: file.digest, sent: false,
+                          source: file.source.isStaged ? nil : file.source)
                 })
                 let reviewed = try batch.saveSelection(manifest, version: peer.receiveVersion)
                 self.files = reviewed.files.enumerated().map { index, file in
                     Item(id: file.id, url: batch.itemURL(named: file.name, index: index), name: file.name,
-                         bytes: file.bytes, digest: file.digest)
+                         bytes: file.bytes, digest: file.digest, source: file.source ?? .staged)
                 }
                 self.manifest = reviewed
                 self.protocolVersion = reviewed.version
-                self.publish(.ready, message: "Ready to send \(self.files.count) \(self.files.count == 1 ? "file" : "files").")
+                self.publish(.ready, message: "")
             } catch {
                 self.cleanUp()
-                if self.preparation.isCancelled(attempt) { self.publish(.cancelled, message: "File preparation cancelled.") }
+                if self.preparation.isCancelled(attempt) { self.publish(.cancelled, message: "") }
                 else { self.fail(error.localizedDescription) }
             }
         }
+    }
+
+    /// A file picked in Files: measured where it is and kept as a bookmark.
+    private static func original(_ url: URL, index: Int, batch: OutboundTransferJournal.Batch,
+                                 cancelled: @escaping () -> Bool) throws -> Item {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        let bookmark = try url.bookmarkData()
+        let name = TransferFileName.make(url.lastPathComponent, index: index)
+        var coordinatorError: NSError?
+        var measured: Result<(bytes: Int64, digest: String), Error>?
+        // Coordinated, so a file still in iCloud Drive is downloaded first.
+        NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinatorError) { coordinated in
+            measured = Result {
+                let reader = try FileBodyReader(url: coordinated)
+                defer { reader.close() }
+                return try TransferMeasure.measure(reader, cancelled: cancelled)
+            }
+        }
+        if let coordinatorError { throw coordinatorError }
+        guard let measured else { throw SendError.message("Unable to read \(name).") }
+        let result = try measured.get()
+        return Item(id: UUID(), url: batch.itemURL(named: name, index: index), name: name, bytes: result.bytes,
+                    digest: result.digest, source: .file(bookmark: bookmark))
+    }
+
+    /// A Photo Library item, read from the library itself. Nil when this
+    /// iPhone does not let Porthole read it (limited access).
+    private static func libraryItem(_ identifier: String, index: Int, batch: OutboundTransferJournal.Batch,
+                                    cancelled: @escaping () -> Bool) throws -> Item? {
+        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject,
+              let resource = PhotoBodyReader.resource(of: asset, named: nil) else { return nil }
+        let name = TransferFileName.make(resource.originalFilename, index: index)
+        let reader = try PhotoBodyReader(asset: identifier, resource: resource.originalFilename)
+        defer { reader.close() }
+        let measured = try TransferMeasure.measure(reader, cancelled: cancelled)
+        return Item(id: UUID(), url: batch.itemURL(named: name, index: index), name: name, bytes: measured.bytes,
+                    digest: measured.digest, source: .photo(asset: identifier, resource: resource.originalFilename))
+    }
+
+    /// The picker's own copy, when the library itself can't be read.
+    private static func copy(_ provider: NSItemProvider, index: Int, batch: OutboundTransferJournal.Batch,
+                             remaining: Int64, cancelled: @escaping () -> Bool) throws -> Item {
+        let types = provider.registeredTypeIdentifiers.compactMap(UTType.init)
+        guard let type = types.first(where: { $0.conforms(to: .movie) || $0.conforms(to: .image) }) ?? types.first else {
+            throw SendError.message("This item can't be sent.")
+        }
+        let done = DispatchSemaphore(value: 0)
+        var result: Result<Item, Error> = .failure(SendError.message("Unable to prepare this item."))
+        _ = provider.loadFileRepresentation(forTypeIdentifier: type.identifier) { url, error in
+            defer { done.signal() }
+            guard let url else {
+                result = .failure(error ?? SendError.message("Unable to prepare this item."))
+                return
+            }
+            result = Result {
+                var wanted = provider.suggestedName ?? url.deletingPathExtension().lastPathComponent
+                if (wanted as NSString).pathExtension.isEmpty, !url.pathExtension.isEmpty {
+                    wanted += ".\(url.pathExtension)"
+                }
+                let name = TransferFileName.make(wanted, index: index)
+                let directory = batch.folder.appendingPathComponent(String(index), isDirectory: true)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let target = directory.appendingPathComponent(name)
+                let snapshot = try TransferStaging.snapshot(url, to: target, remaining: remaining,
+                                                            reserve: batch.reserve, cancelled: cancelled)
+                return Item(id: UUID(), url: target, name: name, bytes: snapshot.bytes, digest: snapshot.digest)
+            }
+        }
+        done.wait()
+        return try result.get()
     }
 
     func refreshPending(for peer: TrustedPeer?) {
@@ -126,6 +237,7 @@ final class OutboundFileSender: ObservableObject {
 
     func restorePending(for peer: TrustedPeer) {
         queue.async {
+            guard self.link == nil else { return } // sending now: keep it
             self.cleanUp()
             guard let (batch, manifest) = Self.pending(for: peer) else {
                 self.publish(.failed, message: "This transfer is unavailable or open in another Porthole window.")
@@ -137,9 +249,9 @@ final class OutboundFileSender: ObservableObject {
             self.protocolVersion = manifest.version
             self.files = manifest.files.enumerated().map { index, file in
                 Item(id: file.id, url: batch.itemURL(named: file.name, index: index), name: file.name,
-                     bytes: file.bytes, digest: file.digest, sent: file.sent)
+                     bytes: file.bytes, digest: file.digest, sent: file.sent, source: file.source ?? .staged)
             }
-            self.publish(.failed, message: "Review and retry the remaining files for \(peer.name).")
+            self.publish(.failed, message: "")
         }
     }
 
@@ -174,6 +286,19 @@ final class OutboundFileSender: ObservableObject {
             self.protocolVersion = version
             self.batch = self.files.indices.filter { !self.files[$0].sent }
             guard !self.batch.isEmpty else { return }
+            self.batchBytes = self.batch.reduce(0) { $0 + self.files[$1].bytes }
+            self.doneBytes = 0
+            self.activeIndex = nil
+            self.activeDone = 0
+            self.rateBase = nil
+            self.smoothedLeft = nil
+            let first = self.files[self.batch[0]].name
+            let more = self.batch.count - 1
+            BackgroundSend.shared.begin(title: "Sending to \(current.name)",
+                                        subtitle: more > 0 ? "\(first) and \(more) more" : first) { [weak self] in
+                self?.pauseForBackground()
+            }
+            SendNotice.clear()
             self.onSaved = onSaved
             self.buffer = Data()
             let token = self.generation
@@ -206,6 +331,9 @@ final class OutboundFileSender: ObservableObject {
 
     func cancel() {
         preparation.cancel()
+        // A Photo Library read may be waiting on Photos: let it go at once.
+        (reader as? PhotoBodyReader)?.close()
+        BackgroundSend.shared.finish(success: false)
         queue.async {
             guard self.link != nil || !self.files.isEmpty else { return }
             let uncertain = self.awaitingReceipt && !self.resumable
@@ -217,6 +345,19 @@ final class OutboundFileSender: ObservableObject {
             } else {
                 self.publish(.cancelled, message: "Transfer cancelled. Files already acknowledged by the PC remain sent.")
             }
+        }
+    }
+
+    /// Stops sending for now, ready to continue where it stopped.
+    func pause() {
+        (reader as? PhotoBodyReader)?.close()
+        queue.async {
+            guard self.link != nil else { return }
+            self.stopConnection()
+            BackgroundSend.shared.finish(success: false)
+            self.publish(.failed, message: "")
+            guard !BackgroundSend.appInForeground else { return }
+            Self.notify(about: self.files.first(where: { !$0.sent })) { SendNotice.stopped(thumbnail: $0) }
         }
     }
 
@@ -239,14 +380,17 @@ final class OutboundFileSender: ObservableObject {
                 self.readLine(token: token) { line in
                     guard line == "BYE" else { self.fail("The PC did not confirm the transfer session."); return }
                     self.stopConnection()
-                    self.publish(.sent, progress: 1, message: "Files sent to your PC.")
+                    self.publish(.sent, progress: 1, message: "")
+                    self.announceSent()
                 }
             }
             return
         }
         let file = files[batch[cursor]]
-        do { handle = try FileHandle(forReadingFrom: file.url) }
-        catch { fail("Unable to read \(file.name)."); return }
+        activeIndex = batch[cursor]
+        activeDone = 0
+        do { reader = try Self.reader(for: file) }
+        catch { fail("\(file.name): \(error.localizedDescription)"); return }
         let ticket = file.id.uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         let header: String
         switch protocolVersion {
@@ -261,8 +405,11 @@ final class OutboundFileSender: ObservableObject {
                 guard response.hasPrefix("OFFSET "), let offset = Int64(response.dropFirst(7)), (0...file.bytes).contains(offset) else {
                     self.fail("The PC could not resume this transfer."); return
                 }
-                do { try self.handle?.seek(toOffset: UInt64(offset)) }
-                catch { self.fail("Unable to read the selected file."); return }
+                do { try self.reader?.seek(to: offset) }
+                catch { self.fail("Unable to read \(file.name)."); return }
+                // What the PC already has counts as sent, not toward the speed.
+                self.activeDone = offset
+                self.rateBase = nil
                 self.pump(cursor, remaining: file.bytes - offset, token: token)
             }
         }
@@ -270,8 +417,11 @@ final class OutboundFileSender: ObservableObject {
 
     private func accept(_ cursor: Int, token: UUID) {
         awaitingReceipt = false
-        try? handle?.close(); handle = nil
+        reader = nil
         let index = batch[cursor], file = files[index]
+        doneBytes += file.bytes
+        activeIndex = nil
+        activeDone = 0
         guard let journalBatch, var manifest else {
             fail("The PC saved this file. Porthole could not record the receipt. Retry to check it again.")
             return
@@ -290,7 +440,7 @@ final class OutboundFileSender: ObservableObject {
         files[index].sent = true
         let callback = onSaved
         DispatchQueue.main.async { callback?() }
-        publish(.sending, progress: Double(cursor + 1) / Double(batch.count), message: "Saved \(file.name) on your PC.")
+        publish(.sending, progress: batchBytes > 0 ? Double(doneBytes) / Double(batchBytes) : 1, message: "")
         sendFile(cursor + 1, token: token)
     }
 
@@ -298,7 +448,7 @@ final class OutboundFileSender: ObservableObject {
         guard generation == token, link != nil else { return }
         let index = batch[cursor], file = files[index]
         if remaining == 0 {
-            try? handle?.close(); handle = nil
+            reader = nil
             awaitingReceipt = true
             readLine(token: token) { line in
                 guard line == "OK" else { self.fail("The PC did not save \(file.name). Reconnect and retry unsent files."); return }
@@ -307,22 +457,26 @@ final class OutboundFileSender: ObservableObject {
             return
         }
         do {
-            let data = try autoreleasepool { try handle?.read(upToCount: Int(min(remaining, 1 << 20))) }
-            guard let data, !data.isEmpty else {
+            guard let data = try reader?.read(upTo: Int(min(remaining, 1 << 20))), !data.isEmpty else {
                 fail("Unable to finish reading \(file.name)."); return
             }
             if Int64(data.count) == remaining { awaitingReceipt = true }
             write(data, token: token) {
                 let left = remaining - Int64(data.count)
-                let part = Double(file.bytes - left) / Double(file.bytes)
+                self.activeDone = file.bytes - left
                 let now = DispatchTime.now()
                 if now.uptimeNanoseconds - self.lastProgressAt.uptimeNanoseconds >= 150_000_000 {
                     self.lastProgressAt = now
-                    self.publish(.sending, progress: (Double(cursor) + part) / Double(self.batch.count), message: "Sending \(file.name)…")
+                    self.measureRate(now)
+                    let fraction = self.batchBytes > 0 ? Double(self.doneBytes + self.activeDone) / Double(self.batchBytes) : 0
+                    self.publish(.sending, progress: fraction, message: "")
+                    let sent = ByteCountFormatter.string(fromByteCount: self.doneBytes + self.activeDone, countStyle: .file)
+                    let total = ByteCountFormatter.string(fromByteCount: self.batchBytes, countStyle: .file)
+                    BackgroundSend.shared.update(fraction: fraction, subtitle: "\(file.name) · \(sent) of \(total)")
                 }
                 self.pump(cursor, remaining: left, token: token)
             }
-        } catch { fail("Unable to read \(file.name).") }
+        } catch { fail("\(file.name): \(error.localizedDescription)") }
     }
 
     private func write(_ data: Data, token: UUID, then completion: @escaping () -> Void) {
@@ -377,7 +531,8 @@ final class OutboundFileSender: ObservableObject {
         generation = UUID()
         timer?.cancel(); timer = nil
         link?.cancel(); link = nil
-        try? handle?.close(); handle = nil
+        reader = nil
+        activeIndex = nil
         buffer = Data()
         awaitingReceipt = false
     }
@@ -403,7 +558,10 @@ final class OutboundFileSender: ObservableObject {
 
     private func fail(_ text: String) {
         let uncertain = awaitingReceipt && !resumable
+        let wasSending = link != nil
         stopConnection()
+        BackgroundSend.shared.finish(success: false)
+        if wasSending, !files.allSatisfy(\.sent) { announcePaused() }
         if !files.isEmpty, files.allSatisfy(\.sent) {
             publish(.sent, progress: 1, message: "All files were saved on your PC. The transfer connection closed.")
         } else {
@@ -413,10 +571,75 @@ final class OutboundFileSender: ObservableObject {
 
     private func publish(_ phase: Phase, progress: Double? = nil, message: String) {
         let files = files
+        let activeID = activeIndex.flatMap { files.indices.contains($0) ? files[$0].id : nil }
+        let activeFraction = activeIndex.flatMap { files.indices.contains($0) && files[$0].bytes > 0
+            ? Double(activeDone) / Double(files[$0].bytes) : nil } ?? 0
+        let sent = doneBytes + activeDone
+        let total = batchBytes > 0 ? batchBytes : files.filter { !$0.sent }.reduce(0) { $0 + $1.bytes }
+        let left = phase == .sending ? smoothedLeft : nil
         DispatchQueue.main.async {
             self.items = files; self.phase = phase; self.message = message
             if let progress { self.progress = progress }
             else if phase == .preparing || phase == .ready || phase == .idle { self.progress = 0 }
+            self.activeItemID = phase == .sending ? activeID : nil
+            self.activeFraction = activeFraction
+            self.sentBytes = phase == .sending || phase == .sent ? sent : 0
+            self.totalBytes = total
+            self.secondsLeft = left
+        }
+    }
+
+    /// Time left from the speed since sending (or resuming) began, smoothed
+    /// so the estimate doesn't jump about.
+    private func measureRate(_ now: DispatchTime) {
+        let sent = doneBytes + activeDone
+        guard let base = rateBase else { rateBase = (now, sent); return }
+        let seconds = Double(now.uptimeNanoseconds - base.at.uptimeNanoseconds) / 1e9
+        guard seconds >= 2, sent > base.bytes else { return }
+        let speed = Double(sent - base.bytes) / seconds
+        let left = Double(batchBytes - sent) / speed
+        smoothedLeft = smoothedLeft.map { $0 * 0.8 + left * 0.2 } ?? left
+    }
+
+    private static func reader(for file: Item) throws -> TransferBodyReader {
+        switch file.source {
+        case .staged: return try FileBodyReader(url: file.url)
+        case .file(let bookmark): return try FileBodyReader(bookmark: bookmark)
+        case .photo(let asset, let resource): return try PhotoBodyReader(asset: asset, resource: resource)
+        }
+    }
+
+    /// iOS stopped the background work: pause, ready to continue.
+    private func pauseForBackground() {
+        queue.async {
+            guard self.link != nil else { return }
+            self.stopConnection()
+            self.publish(.failed, message: "")
+            Self.notify(about: self.files.first(where: { !$0.sent })) { SendNotice.stopped(thumbnail: $0) }
+        }
+    }
+
+    private func announceSent() {
+        BackgroundSend.shared.finish(success: true)
+        guard !BackgroundSend.appInForeground,
+              let first = batch.first.flatMap({ files.indices.contains($0) ? files[$0] : nil }) ?? files.first else { return }
+        let pc = destination?.name ?? "your PC"
+        let more = max(0, batch.count - 1)
+        Self.notify(about: first) { SendNotice.sent(to: pc, first: first.name, more: more, thumbnail: $0) }
+    }
+
+    private func announcePaused() {
+        guard !BackgroundSend.appInForeground else { return }
+        let pc = destination?.name ?? "Your PC"
+        Self.notify(about: files.first(where: { !$0.sent })) { SendNotice.paused(pc: pc, thumbnail: $0) }
+    }
+
+    /// Posts with the item's thumbnail, made off the sending queue.
+    private static func notify(about item: Item?, _ post: @escaping (URL?) -> Void) {
+        Task {
+            var thumbnail: URL?
+            if let item { thumbnail = await TransferThumbnail.attachmentFile(for: item.source, url: item.url) }
+            post(thumbnail)
         }
     }
 

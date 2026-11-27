@@ -13,6 +13,10 @@ struct OutboundTransferManifest: Codable {
         let digest: String
         var sent: Bool
         var generatedName: Bool? = nil
+        /// Where the bytes are read from; none means a copy in this batch.
+        var source: TransferSource? = nil
+
+        var isStaged: Bool { source?.isStaged ?? true }
     }
 
     let id: UUID
@@ -85,11 +89,12 @@ struct OutboundTransferJournal {
                         (previous.generatedName == true || previous.name.range(
                             of: #"^File-[0-9]{8}-[0-9]{6}-[0-9]+\."#, options: .regularExpression) != nil)))
                 }) else { continue }
-                let previous = pending.remove(at: match)
-                if file.name != previous.name {
+                var previous = pending.remove(at: match)
+                if file.name != previous.name, file.isStaged {
                     try FileManager.default.moveItem(at: itemURL(named: file.name, index: index),
                                                      to: itemURL(named: previous.name, index: index))
                 }
+                previous.source = file.source // read from where it is now
                 selection.files[index] = previous
                 selection.version = version
             }
@@ -104,8 +109,11 @@ struct OutboundTransferJournal {
             }
             if let allocation = journal.allocation(in: folder) {
                 var available = allocation.bytes
+                // Only Porthole's own copies take space; originals stay where they are.
                 guard allocation.belongs(to: manifest.destination), manifest.files.allSatisfy({ file in
-                    guard file.bytes > 0, file.bytes <= available else { return false }
+                    guard file.bytes > 0 else { return false }
+                    guard file.isStaged else { return true }
+                    guard file.bytes <= available else { return false }
                     available -= file.bytes
                     return true
                 }) else { throw TransferStaging.Failure.sharedBudget }
@@ -251,7 +259,7 @@ struct OutboundTransferJournal {
                 if let reserved = allocation(in: url) {
                     available -= reserved.bytes
                 } else if let old = manifest(in: url, id: id) {
-                    for file in old.files { available -= min(file.bytes, totalBudget) }
+                    for file in old.files where file.isStaged { available -= min(file.bytes, totalBudget) }
                 }
                 if available < bytes { throw TransferStaging.Failure.sharedBudget }
             }

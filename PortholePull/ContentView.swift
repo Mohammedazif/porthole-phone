@@ -60,6 +60,7 @@ struct ContentView: View {
     @State private var pendingFiles: [ReceivedFileReference] = []
     @State private var openingFile: ReceivedFileReference?
     @State private var pendingSend: SendSelection?
+    @State private var pendingSendSource: (SendChoiceSheet.SendSource, TrustedPeer)?
     @State private var sendBackgroundTask: UIBackgroundTaskIdentifier = .invalid
     @State private var pendingWidgetDestination: WidgetOpenRequest?
     @State private var pendingWidgetShortcut: WidgetOpenRequest?
@@ -153,6 +154,8 @@ struct ContentView: View {
             updateCapture()
             refreshBroadcast()
             openPendingNotice()
+            handleSendNotice()
+            takeShareHandoff()
             presentNextSheet()
         }
         .onOpenURL { url in
@@ -173,6 +176,7 @@ struct ContentView: View {
                 input.refresh()
                 updateCapture()
                 refreshBroadcast()
+                takeShareHandoff()
                 presentNextSheet()
             }
             if phase == .background { client.enteredBackground() }
@@ -207,7 +211,9 @@ struct ContentView: View {
             if phase == .sending {
                 guard sendBackgroundTask == .invalid else { return }
                 sendBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Finish sending files") {
-                    fileSender.cancel()
+                    // On iOS 26 the background task keeps sending; earlier,
+                    // pause here so it can continue later.
+                    if !BackgroundSend.shared.isRunning { fileSender.pause() }
                     endSendBackgroundTask()
                 }
             } else {
@@ -216,6 +222,7 @@ struct ContentView: View {
         }
         .onChange(of: client.fileSendPeer) { _, peer in
             fileSender.refreshPending(for: peer)
+            if peer != nil { takeShareHandoff() }
             if pendingWidgetShortcut != nil { presentNextSheet() }
         }
         .onChange(of: selectedTab) { _, tab in
@@ -261,6 +268,9 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .portholeOpenReceived)) { _ in
             openPendingNotice()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .portholeSendNotice)) { _ in
+            handleSendNotice()
+        }
         .safeAreaInset(edge: .top) {
             if let arrival = client.arrival {
                 arrivalBanner(arrival)
@@ -287,9 +297,19 @@ struct ContentView: View {
                     }
             }
             .presentationDetents([.large])
+        case .sendChoice(let peer):
+            SendChoiceSheet(peerName: peer.name.isEmpty ? peer.host : peer.name) { source in
+                pendingSendSource = (source, peer)
+                activeSheet = nil
+            }
         case .sendPicker(let peer):
             SendFilePicker { urls in
-                if !urls.isEmpty { pendingSend = SendSelection(urls: urls, peer: peer) }
+                if !urls.isEmpty { pendingSend = SendSelection(picks: urls.map(SendPick.file), peer: peer) }
+                activeSheet = nil
+            }
+        case .sendPhotoPicker(let peer):
+            SendPhotoPicker { picks in
+                if !picks.isEmpty { pendingSend = SendSelection(picks: picks, peer: peer) }
                 activeSheet = nil
             }
         case .sendReview(let peer):
@@ -319,7 +339,8 @@ struct ContentView: View {
     private func sheetDidDismiss() {
         let previous = lastSheet
         lastSheet = nil
-        if case .sendReview = previous {
+        if case .sendReview = previous, fileSender.phase != .sending {
+            // Closing while sending keeps sending; Porthole's home shows it.
             fileSender.reset()
             fileSender.refreshPending(for: client.fileSendPeer)
         }
@@ -340,13 +361,18 @@ struct ContentView: View {
             prepareManualEntry(host: client.address)
             return
         }
+        if let choice = pendingSendSource {
+            pendingSendSource = nil
+            showSheet(choice.0 == .files ? .sendPicker(choice.1) : .sendPhotoPicker(choice.1))
+            return
+        }
         if let selection = pendingSend {
             pendingSend = nil
             guard client.matchesReviewedPairing(selection.peer) else {
-                actionError = "The connected PC changed before the transfer. Select your files again after reconnecting."
+                actionError = "The connected PC changed. Choose the items again after reconnecting."
                 return
             }
-            fileSender.prepare(selection.urls, for: selection.peer)
+            fileSender.prepare(selection.picks, for: selection.peer)
             showSheet(.sendReview(selection.peer))
             return
         }
@@ -505,7 +531,53 @@ struct ContentView: View {
 
     private func openSendPicker() {
         guard let peer = client.fileSendPeer else { return }
-        showSheet(.sendPicker(peer))
+        if PHPhotoLibrary.authorizationStatus(for: .readWrite) == .notDetermined {
+            PHPhotoLibrary.requestAuthorization(for: .readWrite) { _ in }
+        }
+        showSheet(.sendChoice(peer))
+    }
+
+    /// Items the Share Sheet passed on (too large for a copy there): found
+    /// in the Photo Library and opened, ready to send.
+    private func takeShareHandoff() {
+        guard let container = PortholeAppGroup.containerURL, let handoff = ShareHandoff.load(in: container),
+              let peer = client.fileSendPeer else { return }
+        ShareHandoff.clear(in: container)
+        let lookup = {
+            DispatchQueue.global(qos: .userInitiated).async {
+                let ids = handoff.items.compactMap { PhotoLibraryLookup.identifier(named: $0.name, bytes: $0.bytes) }
+                DispatchQueue.main.async {
+                    guard !ids.isEmpty else {
+                        actionError = "Couldn’t find \(handoff.items.count == 1 ? handoff.items[0].name : "these items") in your Photo Library. Choose with Send › Photo Library."
+                        return
+                    }
+                    pendingSend = SendSelection(picks: ids.map { SendPick.photo(identifier: $0, provider: nil) }, peer: peer)
+                    presentNextSheet()
+                }
+            }
+        }
+        if PHPhotoLibrary.authorizationStatus(for: .readWrite) == .notDetermined {
+            PHPhotoLibrary.requestAuthorization(for: .readWrite) { _ in lookup() }
+        } else {
+            lookup()
+        }
+    }
+
+    /// A tapped notification about sending.
+    private func handleSendNotice() {
+        guard let action = NoticeDelegate.takeSendAction() else { return }
+        switch action {
+        case .handoff:
+            takeShareHandoff()
+        case .resume:
+            guard let peer = client.fileSendPeer, fileSender.pendingCount > 0 else { return }
+            // Continue where it stopped; the sheet shows the progress.
+            fileSender.restorePending(for: peer)
+            fileSender.send(to: peer) { client.importSentReceipts() }
+            showSheet(.sendReview(peer))
+        case .open:
+            break
+        }
     }
 
     private var phoneBackground: some View {
@@ -635,8 +707,14 @@ struct ContentView: View {
             if client.receiveProgress != nil || client.widgetReceiveAttention != nil {
                 receiveStatus.id(ConnectionJump.Target.transfer)
             }
-            if fileSender.pendingCount > 0, let peer = client.fileSendPeer {
-                linkRow("Pending file transfer", "\(fileSender.pendingCount) ready to retry", icon: "arrow.clockwise", last: true) {
+            if fileSender.phase == .sending, let peer = client.fileSendPeer {
+                linkRow("Sending", "\(Int((fileSender.progress * 100).rounded()))% · \(ByteCountFormatter.string(fromByteCount: fileSender.sentBytes, countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: fileSender.totalBytes, countStyle: .file))",
+                        icon: "arrow.up.circle", last: true) {
+                    showSheet(.sendReview(peer))
+                }
+                .background(cardFill, in: RoundedRectangle(cornerRadius: 18))
+            } else if fileSender.pendingCount > 0, let peer = client.fileSendPeer {
+                linkRow("Not finished sending", "\(fileSender.pendingCount) \(fileSender.pendingCount == 1 ? "item" : "items")", icon: "arrow.clockwise", last: true) {
                     fileSender.restorePending(for: peer)
                     showSheet(.sendReview(peer))
                 }
@@ -1491,19 +1569,22 @@ private struct PairingDraft {
 }
 
 private struct SendSelection {
-    let urls: [URL]
+    let picks: [SendPick]
     let peer: TrustedPeer
 }
 
 private enum PhoneSheet: Identifiable {
-    case manualPairing, feature(ConnectionFeature), sendPicker(TrustedPeer), sendReview(TrustedPeer)
+    case manualPairing, feature(ConnectionFeature), sendChoice(TrustedPeer), sendPicker(TrustedPeer)
+    case sendPhotoPicker(TrustedPeer), sendReview(TrustedPeer)
     case qrScanner, photoChoice(TrustedPeer, [String]), received(ReceivedFile), saveFolder, clipboard(ActivityRecord)
 
     var id: String {
         switch self {
         case .manualPairing: "manual-pairing"
         case .feature(let feature): "feature-\(feature.id)"
+        case .sendChoice: "send-choice"
         case .sendPicker: "send-picker"
+        case .sendPhotoPicker: "send-photo-picker"
         case .sendReview: "send-review"
         case .qrScanner: "qr-scanner"
         case .photoChoice: "photo-choice"

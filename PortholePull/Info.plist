@@ -48,7 +48,7 @@
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Porthole saves received photos and videos to your photo library when you select Save to Photos.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>Porthole accesses your photo library to identify photos and videos displayed on your PC and transfer their original files.</string>
+	<string>Porthole accesses your photo library to identify photos and videos displayed on your PC and to send the photos and videos you choose to your PC.</string>
 	<key>PHPhotoLibraryPreventAutomaticLimitedAccessAlert</key>
 	<true/>
 	<key>UIFileSharingEnabled</key>
@@ -58,6 +58,10 @@
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>
+	</array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>local.porthole.pull.send.*</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict/>

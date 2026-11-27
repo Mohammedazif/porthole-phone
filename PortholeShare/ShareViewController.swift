@@ -1,6 +1,8 @@
 import Network
+import QuickLookThumbnailing
 import UIKit
 import UniformTypeIdentifiers
+import UserNotifications
 
 /// A document page with its file type on a colored tag, as in the design.
 private final class FileTile: UIView {
@@ -74,6 +76,10 @@ final class ShareViewController: UIViewController {
     private var marks: [UIImageView] = []
     private var transfer: ShareTransfer?
     private var readyToSend = false
+    private var handingOff = false
+    private lazy var notice: UIStackView = Self.card()
+    private let noticeTitle = UILabel()
+    private let noticeBody = UILabel()
     private var finished = false
     private var closing = false
     private var started = false
@@ -258,7 +264,23 @@ final class ShareViewController: UIViewController {
             pcRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 58),
         ])
 
-        let details = UIStackView(arrangedSubviews: [files, destination])
+        // Shown when photos or videos are too large to send from here.
+        noticeTitle.font = UIFontMetrics(forTextStyle: .subheadline).scaledFont(for: .systemFont(ofSize: 15, weight: .semibold))
+        noticeTitle.adjustsFontForContentSizeCategory = true
+        noticeTitle.numberOfLines = 0
+        noticeBody.font = .preferredFont(forTextStyle: .subheadline)
+        noticeBody.adjustsFontForContentSizeCategory = true
+        noticeBody.textColor = .secondaryLabel
+        noticeBody.numberOfLines = 0
+        let noticeText = UIStackView(arrangedSubviews: [noticeTitle, noticeBody])
+        noticeText.axis = .vertical
+        noticeText.spacing = 4
+        noticeText.layoutMargins = UIEdgeInsets(top: 14, left: 16, bottom: 14, right: 16)
+        noticeText.isLayoutMarginsRelativeArrangement = true
+        notice.addArrangedSubview(noticeText)
+        notice.isHidden = true
+
+        let details = UIStackView(arrangedSubviews: [files, notice, destination])
         details.axis = .vertical
         details.spacing = 16
         details.translatesAutoresizingMaskIntoConstraints = false
@@ -367,6 +389,7 @@ final class ShareViewController: UIViewController {
                                          self.statusDot.isHidden = title != "Done"
                                          self.configureButton(title, enabled: true)
                                      })
+        transfer.onHandoff = { [weak self] in self?.presentHandoff($0) }
         self.transfer = transfer
         let providers = (extensionContext?.inputItems as? [NSExtensionItem] ?? []).flatMap { $0.attachments ?? [] }
         transfer.prepare(providers)
@@ -396,6 +419,11 @@ final class ShareViewController: UIViewController {
 
     @objc private func sendTapped() {
         if finished { close(); return }
+        if handingOff {
+            button.isEnabled = false
+            transfer?.handOff { [weak self] in self?.close() }
+            return
+        }
         guard readyToSend else { return }
         readyToSend = false
         button.isEnabled = false
@@ -423,7 +451,7 @@ final class ShareViewController: UIViewController {
     private func presentFiles(_ items: [ShareTransfer.Item]) {
         guard !closing else { return }
         for (index, item) in items.enumerated() {
-            let tile = FileTile(fileExtension: (item.name as NSString).pathExtension)
+            let tile = thumbnail(for: item.name, url: item.url)
             let name = UILabel()
             name.font = UIFontMetrics(forTextStyle: .subheadline).scaledFont(for: .systemFont(ofSize: 15, weight: .medium))
             name.adjustsFontForContentSizeCategory = true
@@ -469,6 +497,101 @@ final class ShareViewController: UIViewController {
                         enabled: true)
     }
 
+    /// iOS's thumbnail for the item, over Porthole's file-type tile until
+    /// (and unless) iOS has one.
+    private func thumbnail(for name: String, url: URL?, image known: UIImage? = nil) -> UIView {
+        let tile = FileTile(fileExtension: (name as NSString).pathExtension)
+        let holder = UIView()
+        holder.isAccessibilityElement = false
+        holder.translatesAutoresizingMaskIntoConstraints = false
+        let image = UIImageView()
+        image.contentMode = .scaleAspectFill
+        image.clipsToBounds = true
+        image.layer.cornerRadius = 8
+        image.layer.cornerCurve = .continuous
+        image.isHidden = true
+        image.translatesAutoresizingMaskIntoConstraints = false
+        holder.addSubview(tile)
+        holder.addSubview(image)
+        NSLayoutConstraint.activate([
+            holder.widthAnchor.constraint(equalToConstant: 44),
+            holder.heightAnchor.constraint(equalToConstant: 44),
+            tile.centerXAnchor.constraint(equalTo: holder.centerXAnchor),
+            tile.centerYAnchor.constraint(equalTo: holder.centerYAnchor),
+            image.leadingAnchor.constraint(equalTo: holder.leadingAnchor),
+            image.trailingAnchor.constraint(equalTo: holder.trailingAnchor),
+            image.topAnchor.constraint(equalTo: holder.topAnchor),
+            image.bottomAnchor.constraint(equalTo: holder.bottomAnchor),
+        ])
+        if let known {
+            image.image = known
+            image.isHidden = false
+            tile.isHidden = true
+        } else if let url {
+            let request = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: 44, height: 44),
+                                                       scale: UIScreen.main.scale, representationTypes: .thumbnail)
+            QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { representation, _ in
+                guard let picture = representation?.uiImage else { return }
+                DispatchQueue.main.async {
+                    image.image = picture
+                    image.isHidden = false
+                    tile.isHidden = true
+                }
+            }
+        }
+        return holder
+    }
+
+    /// Photos or videos too large to copy here: offer to send them with Porthole.
+    private func presentHandoff(_ items: [ShareTransfer.Handoff]) {
+        guard !closing else { return }
+        for (index, item) in items.enumerated() {
+            let name = UILabel()
+            name.font = UIFontMetrics(forTextStyle: .subheadline).scaledFont(for: .systemFont(ofSize: 15, weight: .medium))
+            name.adjustsFontForContentSizeCategory = true
+            name.lineBreakMode = .byTruncatingMiddle
+            name.text = item.name
+            let size = UILabel()
+            size.font = .preferredFont(forTextStyle: .footnote)
+            size.adjustsFontForContentSizeCategory = true
+            size.textColor = .secondaryLabel
+            size.text = item.bytes.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) }
+            size.isHidden = item.bytes == nil
+            let labels = UIStackView(arrangedSubviews: [name, size])
+            labels.axis = .vertical
+            labels.spacing = 1
+            let row = UIStackView(arrangedSubviews: [thumbnail(for: item.name, url: nil, image: item.thumbnail), labels])
+            row.alignment = .center
+            row.spacing = 12
+            row.layoutMargins = UIEdgeInsets(top: 9, left: 14, bottom: 9, right: 14)
+            row.isLayoutMarginsRelativeArrangement = true
+            row.heightAnchor.constraint(greaterThanOrEqualToConstant: 62).isActive = true
+            fileStack.addArrangedSubview(row)
+            if index < items.count - 1 {
+                let rule = UIView()
+                rule.backgroundColor = .separator
+                rule.heightAnchor.constraint(equalToConstant: 1 / UIScreen.main.scale).isActive = true
+                let inset = UIStackView(arrangedSubviews: [rule])
+                inset.layoutMargins = UIEdgeInsets(top: 0, left: 14, bottom: 0, right: 0)
+                inset.isLayoutMarginsRelativeArrangement = true
+                fileStack.addArrangedSubview(inset)
+            }
+        }
+        let videos = ["mov", "mp4", "m4v", "hevc"]
+        let allVideos = items.allSatisfy { videos.contains(($0.name as NSString).pathExtension.lowercased()) }
+        if items.count == 1 {
+            noticeTitle.text = allVideos ? "This video is too large to send from here" : "This item is too large to send from here"
+        } else {
+            noticeTitle.text = "These items are too large to send from here"
+        }
+        noticeBody.text = "Send with Porthole instead. You can leave Porthole while it sends."
+        notice.isHidden = false
+        status.text = "Paired PC"
+        handingOff = true
+        configureButton("Send with Porthole", enabled: true)
+        UIAccessibility.post(notification: .announcement, argument: noticeTitle.text)
+    }
+
     private func updateStatus(_ text: String, progress: Double?, announce: Bool) {
         guard !closing else { return }
         status.text = text
@@ -490,7 +613,38 @@ private final class ShareTransfer {
         let digest: String
         var id = UUID()
         var generatedName = false
+        var source: TransferSource = .staged
+        var isMedia = false
         var ticket: String { id.uuidString.replacingOccurrences(of: "-", with: "").lowercased() }
+    }
+
+    /// A photo or video that doesn't fit as a copy here: Porthole sends it
+    /// from the Photo Library instead.
+    struct Handoff {
+        let name: String
+        let bytes: Int64?
+        var thumbnail: UIImage? = nil
+    }
+
+    /// iOS's thumbnail for a file that is about to go away (waits briefly).
+    fileprivate static func quickThumbnail(_ url: URL) -> UIImage? {
+        let done = DispatchSemaphore(value: 0)
+        var picture: UIImage?
+        let request = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: 120, height: 120), scale: 2,
+                                                   representationTypes: .thumbnail)
+        QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { representation, _ in
+            picture = representation?.uiImage
+            done.signal()
+        }
+        _ = done.wait(timeout: .now() + 3)
+        return picture
+    }
+
+    private enum Outcome { case item(Item), handoff(Handoff) }
+
+    private enum ShareError: LocalizedError {
+        case noSpace
+        var errorDescription: String? { "There isn’t enough space on this iPhone to send this file from here." }
     }
 
     private let peer: TrustedPeer
@@ -498,6 +652,10 @@ private final class ShareTransfer {
     private let onStatus: @MainActor (String, Double?, Bool) -> Void
     private let onSaved: @MainActor (Int) -> Void
     private let onAction: @MainActor (String, Bool) -> Void
+    var onHandoff: (@MainActor ([Handoff]) -> Void)?
+    private var handoffs: [Handoff] = []
+    /// Files app originals read in place, kept open while the sheet is.
+    private var scopedURLs: [URL] = []
     private let queue = DispatchQueue(label: "porthole.share")
     private let preparation = Preparation()
     private var connection: NWConnection?
@@ -597,16 +755,33 @@ private final class ShareTransfer {
             fail("Porthole could not keep the prepared files.", retry: false); return
         }
         guard index < providers.count else {
+            if !handoffs.isEmpty {
+                // The whole selection goes to Porthole, together.
+                // Thumbnails for the first few only: each takes a moment.
+                let all = handoffs + files.filter(\.isMedia).enumerated().map { index, file in
+                    Handoff(name: file.name, bytes: file.bytes,
+                            thumbnail: index < 6 ? Self.quickThumbnail(file.url) : nil)
+                }
+                handoffs = all
+                let list = all
+                DispatchQueue.main.async { self.onHandoff?(list) }
+                return
+            }
+            let originals = files
             let manifest = OutboundTransferManifest(id: batch.id, destination: peer.remembered,
                                                     files: files.map { item in
                 .init(id: item.id, name: item.name, bytes: item.bytes, digest: item.digest,
-                      sent: false, generatedName: item.generatedName)
+                      sent: false, generatedName: item.generatedName,
+                      source: item.source.isStaged ? nil : item.source)
             })
             do {
                 let reviewed = try batch.saveSelection(manifest, version: peer.receiveVersion)
                 files = reviewed.files.enumerated().map { index, file in
-                    Item(url: batch.itemURL(named: file.name, index: index), name: file.name,
-                         bytes: file.bytes, digest: file.digest, id: file.id, generatedName: file.generatedName == true)
+                    // An original is read from where it is; a copy from this batch.
+                    let url = file.isStaged ? batch.itemURL(named: file.name, index: index) : originals[index].url
+                    return Item(url: url, name: file.name, bytes: file.bytes, digest: file.digest, id: file.id,
+                                generatedName: file.generatedName == true, source: file.source ?? .staged,
+                                isMedia: originals[index].isMedia)
                 }
                 self.manifest = reviewed
                 protocolVersion = reviewed.version
@@ -626,34 +801,127 @@ private final class ShareTransfer {
         let token = preparation.beginItem()
         let activity = ActivityClock()
         updateStatus("Preparing file \(index + 1) of \(providers.count)…")
-        // Copy inside the provider callback. Its temporary item expires when the callback returns.
-        let progress = provider.loadFileRepresentation(forTypeIdentifier: type.identifier) { [weak self] url, providerError in
-            guard let self, !self.preparation.isCancelled(token) else { return }
-            let result = Result<Item, Error> {
-                guard let url else { throw providerError ?? CocoaError(.fileReadNoSuchFile) }
-                let (name, generated) = Self.wireName(provider.suggestedName, url: url, type: type, index: index)
-                let target = itemDirectory.appendingPathComponent(name)
-                let snapshot = try TransferStaging.snapshot(url, to: target, remaining: remaining, reserve: batch.reserve) {
-                    activity.touch() // called for each chunk copied
-                    return self.preparation.isCancelled(token) || batch.isRevoked
-                }
-                return Item(url: target, name: name, bytes: snapshot.bytes, digest: snapshot.digest,
-                            generatedName: generated)
-            }
+        // Prepared inside the provider callback: a temporary item expires
+        // when the callback returns.
+        let finish: (Result<Outcome, Error>) -> Void = { [weak self] result in
+            guard let self else { return }
             self.queue.async {
                 guard !self.stopped, !self.preparation.isCancelled(token) else { return }
                 self.preparation.finishItem(token)
                 switch result {
-                case .success(let item):
+                case .success(.item(let item)):
                     self.files.append(item)
-                    self.collect(providers, at: index + 1, in: directory, remaining: remaining - item.bytes)
+                    self.collect(providers, at: index + 1, in: directory,
+                                 remaining: remaining - (item.source.isStaged ? item.bytes : 0))
+                case .success(.handoff(let handoff)):
+                    self.handoffs.append(handoff)
+                    self.collect(providers, at: index + 1, in: directory, remaining: remaining)
                 case .failure(let error):
                     self.fail("Could not prepare item \(index + 1). \(error.localizedDescription)", retry: false)
                 }
             }
         }
+        let progress: Progress
+        if provider.hasRepresentationConforming(toTypeIdentifier: type.identifier, fileOptions: [.openInPlace]) {
+            progress = provider.loadInPlaceFileRepresentation(forTypeIdentifier: type.identifier) { [weak self] url, inPlace, error in
+                guard let self, !self.preparation.isCancelled(token) else { return }
+                finish(self.load(url, inPlace: inPlace, error: error, provider: provider, type: type, index: index,
+                                 directory: itemDirectory, remaining: remaining, batch: batch, token: token,
+                                 activity: activity))
+            }
+        } else {
+            progress = provider.loadFileRepresentation(forTypeIdentifier: type.identifier) { [weak self] url, error in
+                guard let self, !self.preparation.isCancelled(token) else { return }
+                finish(self.load(url, inPlace: false, error: error, provider: provider, type: type, index: index,
+                                 directory: itemDirectory, remaining: remaining, batch: batch, token: token,
+                                 activity: activity))
+            }
+        }
         preparation.install(progress, for: token)
         watchPreparation(token, progress: progress, activity: activity, seen: progress.completedUnitCount)
+    }
+
+    /// One item, as the provider handed it over:
+    /// - a Files original is sent from where it is, nothing copied;
+    /// - anything else is copied, if the copy leaves room on the iPhone;
+    /// - a photo or video that doesn't fit (or that iOS couldn't hand over)
+    ///   goes to Porthole, which sends it from the Photo Library.
+    private func load(_ url: URL?, inPlace: Bool, error providerError: Error?, provider: NSItemProvider, type: UTType,
+                      index: Int, directory: URL, remaining: Int64, batch: OutboundTransferJournal.Batch,
+                      token: UUID, activity: ActivityClock) -> Result<Outcome, Error> {
+        let media = type.conforms(to: .movie) || type.conforms(to: .image)
+        guard let url else {
+            guard media else { return .failure(providerError ?? CocoaError(.fileReadNoSuchFile)) }
+            let base = provider.suggestedName ?? "Item \(index + 1)"
+            let ext = type.preferredFilenameExtension.map { ".\($0)" } ?? ""
+            let name = (base as NSString).pathExtension.isEmpty ? base + ext : base
+            return .success(.handoff(Handoff(name: name, bytes: nil)))
+        }
+        return Result {
+            let (name, generated) = Self.wireName(provider.suggestedName, url: url, type: type, index: index)
+            let cancelled = { () -> Bool in
+                activity.touch() // called for each chunk read
+                return self.preparation.isCancelled(token) || batch.isRevoked
+            }
+            if inPlace {
+                let scoped = url.startAccessingSecurityScopedResource()
+                if let bookmark = try? url.bookmarkData() {
+                    if scoped { queue.async { self.scopedURLs.append(url) } }
+                    let reader = try FileBodyReader(url: url)
+                    defer { reader.close() }
+                    let measured = try TransferMeasure.measure(reader, cancelled: cancelled)
+                    return .item(Item(url: url, name: name, bytes: measured.bytes, digest: measured.digest,
+                                      generatedName: generated, source: .file(bookmark: bookmark), isMedia: media))
+                }
+                if scoped { url.stopAccessingSecurityScopedResource() }
+            }
+            let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+            if let free = TransferMeasure.freeSpace(at: directory), free - size < TransferMeasure.keepFree {
+                if media { return .handoff(Handoff(name: name, bytes: size, thumbnail: Self.quickThumbnail(url))) }
+                throw ShareError.noSpace
+            }
+            let target = directory.appendingPathComponent(name)
+            let snapshot = try TransferStaging.snapshot(url, to: target, remaining: remaining, reserve: batch.reserve,
+                                                        cancelled: cancelled)
+            return .item(Item(url: target, name: name, bytes: snapshot.bytes, digest: snapshot.digest,
+                              generatedName: generated, isMedia: media))
+        }
+    }
+
+    /// Passes the photos and videos to Porthole and tells the person.
+    func handOff(then done: @escaping @MainActor () -> Void) {
+        queue.async {
+            let items = self.handoffs
+            guard let container = PortholeAppGroup.containerURL, !items.isEmpty else {
+                self.fail("Porthole could not take these items. Send them from Porthole instead.", retry: false)
+                return
+            }
+            let record = ShareHandoff(id: UUID(), date: Date(),
+                                      items: items.map { ShareHandoff.Item(name: $0.name, bytes: $0.bytes) })
+            do { try ShareHandoff.save(record, in: container) }
+            catch {
+                self.fail("Porthole could not take these items. Send them from Porthole instead.", retry: false)
+                return
+            }
+            let content = UNMutableNotificationContent()
+            content.title = "Ready to send"
+            content.body = items.count == 1 ? "\(items[0].name). Tap to send." : "\(items.count) items from the Share Sheet. Tap to send."
+            content.sound = .default
+            content.userInfo = ["porthole.send": "handoff"]
+            content.threadIdentifier = "porthole.send"
+            if let picture = items.first(where: { $0.thumbnail != nil })?.thumbnail,
+               let data = picture.jpegData(compressionQuality: 0.8) {
+                let file = FileManager.default.temporaryDirectory.appendingPathComponent("porthole-handoff-\(UUID().uuidString).jpg")
+                if (try? data.write(to: file)) != nil,
+                   let attachment = try? UNNotificationAttachment(identifier: "thumbnail", url: file) {
+                    content.attachments = [attachment]
+                }
+            }
+            UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "porthole.send.handoff",
+                                                                        content: content, trigger: nil))
+            self.stop()
+            DispatchQueue.main.async { done() }
+        }
     }
 
     /// Gives up on an item only when nothing has moved for two minutes: a
@@ -933,6 +1201,8 @@ private final class ShareTransfer {
         stopped = true
         preparation.cancel()
         disconnect()
+        scopedURLs.forEach { $0.stopAccessingSecurityScopedResource() }
+        scopedURLs = []
         if (manifest?.pendingCount ?? 0) == 0 { try? journalBatch?.discard() }
         journalBatch = nil
         manifest = nil
