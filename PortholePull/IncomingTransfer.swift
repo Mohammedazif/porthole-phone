@@ -11,7 +11,7 @@ struct IncomingTransfer: Codable, Equatable {
         guard fields.count == 5, fields[0] == "PUSH2" || fields[0] == "PUSH3", fields[1].utf8.count == 32,
               fields[1].utf8.allSatisfy(Self.isHex), fields[2].utf8.count == 64,
               fields[2].utf8.allSatisfy(Self.isHex),
-              let bytes = Int(fields[3]), (1...512 * 1024 * 1024).contains(bytes),
+              let bytes = Int(fields[3]), (1...Int(TransferStaging.maxFileBytes)).contains(bytes),
               fields[4].utf8.count <= 200, ReceivedFileWriter.validName(fields[4]) else { return nil }
         id = fields[1]
         digest = fields[2]
@@ -80,7 +80,12 @@ struct IncomingTransferStore {
                 return .saved(pending, at: receipt)
             }
         } else {
-            guard count < 64, reserved + Int64(transfer.bytes) <= 1024 * 1024 * 1024 else {
+            // Any size, as long as this iPhone has room for it and the other
+            // unfinished files (plus a little to spare).
+            let free = (try? root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
+                .volumeAvailableCapacityForImportantUsage
+            guard count < 64,
+                  free.map({ reserved + Int64(transfer.bytes) + 256 * 1024 * 1024 <= $0 }) ?? true else {
                 throw CocoaError(.fileWriteOutOfSpace)
             }
             try manager.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -173,7 +178,7 @@ struct IncomingTransferStore {
                 if !manager.fileExists(atPath: candidate.path) { continue }
             }
             if !saved, let existing = loadManifest(candidate.appendingPathComponent("manifest.json")),
-               (1...512 * 1024 * 1024).contains(existing.bytes) {
+               (1...Int(TransferStaging.maxFileBytes)).contains(existing.bytes) {
                 reserved += Int64(existing.bytes)
                 count += 1
             }

@@ -307,7 +307,8 @@ final class OutboundFileSender: ObservableObject {
             return
         }
         do {
-            guard let data = try handle?.read(upToCount: Int(min(remaining, 1 << 20))), !data.isEmpty else {
+            let data = try autoreleasepool { try handle?.read(upToCount: Int(min(remaining, 1 << 20))) }
+            guard let data, !data.isEmpty else {
                 fail("Unable to finish reading \(file.name)."); return
             }
             if Int64(data.count) == remaining { awaitingReceipt = true }

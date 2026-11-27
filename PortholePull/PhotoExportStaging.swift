@@ -10,6 +10,14 @@ final class PhotoExportStaging {
     private var bytes: Int64 = 0
     private var request: PHAssetResourceDataRequestID?
     private var active = true
+    private var lastData = Date()
+
+    /// Seconds since Photos last delivered data (or since the start).
+    var idleSeconds: TimeInterval {
+        lock.lock()
+        defer { lock.unlock() }
+        return Date().timeIntervalSince(lastData)
+    }
 
     init(file: URL, sourceIdentifier: String) throws {
         self.file = file
@@ -57,7 +65,8 @@ final class PhotoExportStaging {
         lock.lock()
         defer { lock.unlock() }
         guard active else { return nil }
-        guard Int64(data.count) <= 512 * 1024 * 1024 - bytes else { return false }
+        guard Int64(data.count) <= TransferStaging.maxFileBytes - bytes else { return false }
+        lastData = Date()
         do {
             try handle.write(contentsOf: data)
             bytes += Int64(data.count)

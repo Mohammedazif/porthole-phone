@@ -6,9 +6,11 @@ import CryptoKit
 /// Copies picker items into a private snapshot, without reading a whole item into memory.
 enum TransferStaging {
     static let maxItems = 500
-    static let maxFileBytes: Int64 = 16 * 1024 * 1024 * 1024
-    static let maxBatchBytes: Int64 = 32 * 1024 * 1024 * 1024
-    static let desktopFileBytes: Int64 = 512 * 1024 * 1024
+    /// No practical size limit: free space on each side is what counts.
+    /// The PC accepts the same (PH_TRANSFER_MAX_BYTES).
+    static let maxFileBytes: Int64 = 1 << 40   // 1 TiB
+    static let maxBatchBytes: Int64 = 2 * maxFileBytes
+    static let desktopFileBytes: Int64 = maxFileBytes
     private static let freeReserve: Int64 = 256 * 1024 * 1024
 
     enum Failure: LocalizedError {
@@ -17,9 +19,9 @@ enum TransferStaging {
         var errorDescription: String? {
             switch self {
             case .cancelled: return "File preparation was cancelled."
-            case .invalidFile: return "Select non-empty regular files up to 16 GB each."
-            case .desktopFileLimit: return "Porthole on the PC accepts files up to 512 MiB each. Select a smaller file."
-            case .batchLimit: return "Select up to 32 GB of files per transfer."
+            case .invalidFile: return "Select non-empty regular files."
+            case .desktopFileLimit: return "This file is larger than Porthole on the PC accepts. Update Porthole on the PC."
+            case .batchLimit: return "Select up to 2 TB of files per transfer."
             case .sharedBudget: return "Pending transfers use the shared file limit. Complete or discard a pending transfer first."
             case .insufficientSpace: return "Not enough space to prepare these files. Free space or select fewer files."
             case .changed: return "A selected file changed while it was being prepared. Select it again."
@@ -71,10 +73,18 @@ enum TransferStaging {
         var left = size
         while left > 0 {
             if cancelled() { throw Failure.cancelled }
-            guard let chunk = try input.read(upToCount: Int(min(left, 1 << 20))), !chunk.isEmpty else { throw Failure.changed }
-            try output.write(contentsOf: chunk)
-            inspect?(chunk)
-            left -= Int64(chunk.count)
+            // Each chunk is let go before the next: without the pool iOS kept
+            // every chunk until the copy ended, and a 400 MB file pushed the
+            // Share extension past its memory limit (the sheet just closed).
+            let count: Int = try autoreleasepool {
+                guard let chunk = try input.read(upToCount: Int(min(left, 1 << 20))), !chunk.isEmpty else {
+                    throw Failure.changed
+                }
+                try output.write(contentsOf: chunk)
+                inspect?(chunk)
+                return chunk.count
+            }
+            left -= Int64(count)
         }
         if cancelled() { throw Failure.cancelled }
         guard (try input.read(upToCount: 1))?.isEmpty != false else { throw Failure.changed }

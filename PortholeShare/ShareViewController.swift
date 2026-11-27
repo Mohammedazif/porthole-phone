@@ -624,6 +624,7 @@ private final class ShareTransfer {
         do { try FileManager.default.createDirectory(at: itemDirectory, withIntermediateDirectories: true) }
         catch { fail(error.localizedDescription, retry: false); return }
         let token = preparation.beginItem()
+        let activity = ActivityClock()
         updateStatus("Preparing file \(index + 1) of \(providers.count)…")
         // Copy inside the provider callback. Its temporary item expires when the callback returns.
         let progress = provider.loadFileRepresentation(forTypeIdentifier: type.identifier) { [weak self] url, providerError in
@@ -633,7 +634,8 @@ private final class ShareTransfer {
                 let (name, generated) = Self.wireName(provider.suggestedName, url: url, type: type, index: index)
                 let target = itemDirectory.appendingPathComponent(name)
                 let snapshot = try TransferStaging.snapshot(url, to: target, remaining: remaining, reserve: batch.reserve) {
-                    self.preparation.isCancelled(token) || batch.isRevoked
+                    activity.touch() // called for each chunk copied
+                    return self.preparation.isCancelled(token) || batch.isRevoked
                 }
                 return Item(url: target, name: name, bytes: snapshot.bytes, digest: snapshot.digest,
                             generatedName: generated)
@@ -651,9 +653,30 @@ private final class ShareTransfer {
             }
         }
         preparation.install(progress, for: token)
+        watchPreparation(token, progress: progress, activity: activity, seen: progress.completedUnitCount)
+    }
+
+    /// Gives up on an item only when nothing has moved for two minutes: a
+    /// large file takes as long as it takes to copy or download.
+    private func watchPreparation(_ token: UUID, progress: Progress, activity: ActivityClock, seen: Int64) {
         queue.asyncAfter(deadline: .now() + 120) { [weak self] in
             guard let self, !self.stopped, !self.preparation.isCancelled(token) else { return }
-            self.fail("A selected file took too long to prepare. Open the file in its app and try sharing again.", retry: false)
+            let now = progress.completedUnitCount
+            if now != seen || activity.idleSeconds < 120 {
+                self.watchPreparation(token, progress: progress, activity: activity, seen: now)
+                return
+            }
+            self.fail("A selected file stopped preparing. Open the file in its app and try sharing again.", retry: false)
+        }
+    }
+
+    private final class ActivityClock {
+        private let lock = NSLock()
+        private var last = Date()
+        func touch() { lock.lock(); last = Date(); lock.unlock() }
+        var idleSeconds: TimeInterval {
+            lock.lock(); defer { lock.unlock() }
+            return Date().timeIntervalSince(last)
         }
     }
 
@@ -780,7 +803,8 @@ private final class ShareTransfer {
             return
         }
         do {
-            guard let chunk = try activeHandle?.read(upToCount: Int(min(left, 1 << 20))), !chunk.isEmpty else {
+            let chunk = try autoreleasepool { try activeHandle?.read(upToCount: Int(min(left, 1 << 20))) }
+            guard let chunk, !chunk.isEmpty else {
                 fail("Unable to finish reading \(item.name)."); return
             }
             if Int64(chunk.count) == left { awaitingReceipt = true }

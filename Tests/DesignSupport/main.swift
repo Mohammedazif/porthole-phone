@@ -216,13 +216,14 @@ func testTransferStaging() throws {
     let oversized = root.appendingPathComponent("oversized.bin")
     try Data([0]).write(to: oversized)
     let writer = try FileHandle(forWritingTo: oversized)
-    try writer.truncate(atOffset: UInt64(TransferStaging.desktopFileBytes) + 1)
+    try writer.truncate(atOffset: UInt64(TransferStaging.maxFileBytes) + 1)
     try writer.close()
     do {
         _ = try TransferStaging.copy(oversized, to: root.appendingPathComponent("oversized-copy.bin"),
                                      remaining: TransferStaging.maxBatchBytes, forDesktop: true) { false }
-        fatalError("PC upload checked the file size after staging")
-    } catch TransferStaging.Failure.desktopFileLimit { }
+        fatalError("staging checked the file size after copying")
+    } catch TransferStaging.Failure.invalidFile { }
+    try? FileManager.default.removeItem(at: oversized)
 }
 
 func testShareReceipts() throws {

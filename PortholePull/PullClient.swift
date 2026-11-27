@@ -1915,12 +1915,7 @@ final class PullClient: ObservableObject {
         monitor.resume()
         let options = PHAssetResourceRequestOptions()
         options.isNetworkAccessAllowed = true
-        let deadline = DispatchWorkItem { [weak self, weak stage] in
-            guard let self, let stage, self.originalDownload === stage else { return }
-            self.failOriginalPreparation(stage, peer: peer, reason: "Original preparation timed out.")
-        }
-        originalTimer = deadline
-        queue.asyncAfter(deadline: .now() + 60, execute: deadline)
+        armOriginalDeadline(stage, peer: peer)
         DispatchQueue.main.async {
             if self.fileSendPeer?.id == peer.id { self.status = "Preparing \(name) for transfer" }
         }
@@ -1934,12 +1929,27 @@ final class PullClient: ObservableObject {
                     return
                 }
                 guard let size else {
-                    self.failOriginalPreparation(stage, peer: peer, reason: "Unable to read the original or it exceeds the 512 MB limit.")
+                    self.failOriginalPreparation(stage, peer: peer, reason: "Unable to read the original from Photos.")
                     return
                 }
                 self.streamOriginal(stage, name: name, size: size, peer: peer, link: link)
             }
         }
+    }
+
+    /// A large original (often downloaded from iCloud first) takes as long
+    /// as it takes; only a minute with no data from Photos gives up.
+    private func armOriginalDeadline(_ stage: PhotoExportStaging, peer: TrustedPeer) {
+        let deadline = DispatchWorkItem { [weak self, weak stage] in
+            guard let self, let stage, self.originalDownload === stage else { return }
+            if stage.idleSeconds < 60 {
+                self.armOriginalDeadline(stage, peer: peer)
+                return
+            }
+            self.failOriginalPreparation(stage, peer: peer, reason: "Original preparation stopped.")
+        }
+        originalTimer = deadline
+        queue.asyncAfter(deadline: .now() + 60, execute: deadline)
     }
 
     private func clearOriginalDownload() {
@@ -2004,7 +2014,8 @@ final class PullClient: ObservableObject {
                 return
             }
             do {
-                guard let chunk = try handle.read(upToCount: Int(min(remaining, 1 << 19))), !chunk.isEmpty else {
+                let chunk = try autoreleasepool { try handle.read(upToCount: Int(min(remaining, 1 << 19))) }
+                guard let chunk, !chunk.isEmpty else {
                     throw CocoaError(.fileReadCorruptFile)
                 }
                 self.originalBodyQueued = Int64(chunk.count) == remaining
@@ -2123,7 +2134,11 @@ final class PullClient: ObservableObject {
         let file = try FileHandle(forReadingFrom: url)
         defer { try? file.close() }
         var hash = SHA256()
-        while let data = try file.read(upToCount: 1 << 20), !data.isEmpty { hash.update(data: data) }
+        while try autoreleasepool(invoking: {
+            guard let data = try file.read(upToCount: 1 << 20), !data.isEmpty else { return false }
+            hash.update(data: data)
+            return true
+        }) {}
         return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
