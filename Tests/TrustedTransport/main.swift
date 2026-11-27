@@ -77,7 +77,8 @@ let header = "PUSH2 \(fileID) \(pin) 10 Original name.pdf"
 let transfer = IncomingTransfer(header: header)!
 require(transfer.name == "Original name.pdf", "Preserve a valid filename containing spaces")
 require(IncomingTransfer(header: "PUSH2 \(fileID) \(pin) 1 ../private.pdf") == nil, "Reject directory syntax")
-require(IncomingTransfer(header: "PUSH2 \(fileID) \(pin) 536870913 large.pdf") == nil, "Reject a file above the declared limit")
+require(IncomingTransfer(header: "PUSH2 \(fileID) \(pin) 536870913 large.pdf") != nil, "Accept a file over 512 MB")
+require(IncomingTransfer(header: "PUSH2 \(fileID) \(pin) \(TransferStaging.maxFileBytes + 1) large.pdf") == nil, "Reject a file above the declared limit")
 
 let root = FileManager.default.temporaryDirectory.appendingPathComponent("incoming-tests-" + UUID().uuidString)
 defer { try? FileManager.default.removeItem(at: root) }
