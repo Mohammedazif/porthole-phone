@@ -1047,7 +1047,8 @@ private final class ShareTransfer {
         }
         write(Data(header.utf8), on: link) {
             if (self.protocolVersion ?? 1) < 2 { self.pump(at: cursor, left: item.bytes, on: link); return }
-            self.readLine(on: link) { response in
+            // Continuing a large file, the PC first checks what it kept.
+            self.readLine(on: link, wait: TransferStaging.receiptWait(item.bytes)) { response in
                 if response == "SAVED" { self.accept(cursor, on: link); return }
                 guard response.hasPrefix("OFFSET "), let offset = Int64(response.dropFirst(7)),
                       (0...item.bytes).contains(offset) else { self.fail("The PC could not resume \(item.name)."); return }
@@ -1064,7 +1065,8 @@ private final class ShareTransfer {
         if left == 0 {
             try? activeHandle?.close(); activeHandle = nil
             awaitingReceipt = true
-            readLine(on: link) { response in
+            // The PC checks and saves the whole file before it answers.
+            readLine(on: link, wait: TransferStaging.receiptWait(item.bytes)) { response in
                 if response == "OK" { self.accept(cursor, on: link) }
                 else { self.fail("The PC did not confirm saving \(item.name).") }
             }
@@ -1130,8 +1132,8 @@ private final class ShareTransfer {
         })
     }
 
-    private func readLine(on link: NWConnection, then completion: @escaping (String) -> Void) {
-        armTimeout(link)
+    private func readLine(on link: NWConnection, wait seconds: Double = 30, then completion: @escaping (String) -> Void) {
+        armTimeout(link, seconds: seconds)
         readLineFragment(on: link, then: completion)
     }
 
@@ -1153,14 +1155,14 @@ private final class ShareTransfer {
         }
     }
 
-    private func armTimeout(_ link: NWConnection) {
+    private func armTimeout(_ link: NWConnection, seconds: Double = 30) {
         deadline?.cancel()
         let timer = DispatchWorkItem { [weak self, weak link] in
             guard let self, let link, self.connection === link else { return }
             self.fail("The PC stopped responding.")
         }
         deadline = timer
-        queue.asyncAfter(deadline: .now() + 30, execute: timer)
+        queue.asyncAfter(deadline: .now() + seconds, execute: timer)
     }
 
     private func disconnect() {

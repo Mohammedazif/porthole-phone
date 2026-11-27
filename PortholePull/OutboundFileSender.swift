@@ -400,7 +400,8 @@ final class OutboundFileSender: ObservableObject {
         }
         write(Data(header.utf8), token: token) {
             if !self.resumable { self.pump(cursor, remaining: file.bytes, token: token); return }
-            self.readLine(token: token) { response in
+            // Continuing a large file, the PC first checks what it kept.
+            self.readLine(token: token, wait: TransferStaging.receiptWait(file.bytes)) { response in
                 if response == "SAVED" { self.accept(cursor, token: token); return }
                 guard response.hasPrefix("OFFSET "), let offset = Int64(response.dropFirst(7)), (0...file.bytes).contains(offset) else {
                     self.fail("The PC could not resume this transfer."); return
@@ -450,7 +451,8 @@ final class OutboundFileSender: ObservableObject {
         if remaining == 0 {
             reader = nil
             awaitingReceipt = true
-            readLine(token: token) { line in
+            // The PC checks and saves the whole file before it answers.
+            readLine(token: token, wait: TransferStaging.receiptWait(file.bytes)) { line in
                 guard line == "OK" else { self.fail("The PC did not save \(file.name). Reconnect and retry unsent files."); return }
                 self.accept(cursor, token: token)
             }
@@ -494,8 +496,8 @@ final class OutboundFileSender: ObservableObject {
         })
     }
 
-    private func readLine(token: UUID, completion: @escaping (String) -> Void) {
-        armTimeout(token)
+    private func readLine(token: UUID, wait seconds: Double = 30, completion: @escaping (String) -> Void) {
+        armTimeout(token, seconds: seconds)
         readLineFragment(token: token, completion: completion)
     }
 
@@ -517,14 +519,14 @@ final class OutboundFileSender: ObservableObject {
         }
     }
 
-    private func armTimeout(_ token: UUID) {
+    private func armTimeout(_ token: UUID, seconds: Double = 30) {
         timer?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.generation == token, self.link != nil else { return }
             self.fail("The PC stopped responding. Retry unsent files.")
         }
         timer = work
-        queue.asyncAfter(deadline: .now() + 30, execute: work)
+        queue.asyncAfter(deadline: .now() + seconds, execute: work)
     }
 
     private func stopConnection() {

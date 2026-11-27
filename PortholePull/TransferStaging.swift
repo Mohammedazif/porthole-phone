@@ -13,6 +13,13 @@ enum TransferStaging {
     static let desktopFileBytes: Int64 = maxFileBytes
     private static let freeReserve: Int64 = 256 * 1024 * 1024
 
+    /// How long to wait for the PC to confirm a file once all of it is sent:
+    /// it checks and saves the whole file first (an older PC reads it twice
+    /// more), so a large file takes minutes, not seconds.
+    static func receiptWait(_ bytes: Int64) -> Double {
+        min(3600, 30 + Double(bytes) / 20_000_000)
+    }
+
     enum Failure: LocalizedError {
         case cancelled, invalidFile, desktopFileLimit, batchLimit, sharedBudget, insufficientSpace, changed
 
