@@ -724,9 +724,25 @@ private final class ShareTransfer {
         }
     }
 
+    /// Closing mid-send keeps what's left for Porthole: iOS gives a Share
+    /// Sheet no time once it closes, so Porthole continues it (with its
+    /// progress on the Lock Screen) when the person taps the notice.
     func cancel() {
         preparation.cancel()
-        queue.async { self.stop() }
+        queue.async {
+            let sending = self.connection != nil && !self.stopped && (self.manifest?.pendingCount ?? 0) > 0
+            let next = self.files.indices.first { !self.acknowledged.contains($0) }.map { self.files[$0].name }
+            self.stop()
+            guard sending, let next else { return }
+            let content = UNMutableNotificationContent()
+            content.title = "Sending paused"
+            content.body = "Tap to continue sending \(next) in Porthole."
+            content.sound = .default
+            content.userInfo = ["porthole.send": "resume"]
+            content.threadIdentifier = "porthole.send"
+            UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "porthole.send.resume",
+                                                                        content: content, trigger: nil))
+        }
     }
 
     private func updateStatus(_ text: String, progress: Double? = nil, announce: Bool = false) {

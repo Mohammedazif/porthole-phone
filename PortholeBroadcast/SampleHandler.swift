@@ -105,7 +105,9 @@ final class SampleHandler: RPBroadcastSampleHandler {
     private let packetTimeout = DispatchTimeInterval.seconds(5)
     private let longEdge = 1080
     private let frameRate = 30
-    private let bitrate = 3_500_000
+    // At 30 fps; 3.5 Mbit/s spread thinner than at 20 fps made each frame
+    // softer, and the photo the PC matches against with it.
+    private let bitrate = 6_000_000
     // Match PH_SCREEN_FRAME_MAX in the PC receiver.
     private static let maxFrameBytes = 8 * 1024 * 1024
 

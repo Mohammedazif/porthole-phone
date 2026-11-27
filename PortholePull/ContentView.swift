@@ -570,7 +570,7 @@ struct ContentView: View {
         case .handoff:
             takeShareHandoff()
         case .resume:
-            guard let peer = client.fileSendPeer, fileSender.pendingCount > 0 else { return }
+            guard let peer = client.fileSendPeer else { return }
             // Continue where it stopped; the sheet shows the progress.
             fileSender.restorePending(for: peer)
             fileSender.send(to: peer) { client.importSentReceipts() }
@@ -950,10 +950,25 @@ struct ContentView: View {
                 .fixedSize(horizontal: false, vertical: true)
             sharingDetails(diameter: 184)
                 .fixedSize(horizontal: false, vertical: true)
-            ScrollView { sharingDetails(diameter: 184) }
+            sharingDetails(diameter: 152)
+                .fixedSize(horizontal: false, vertical: true)
+            sharingDetails(diameter: 124)
+                .fixedSize(horizontal: false, vertical: true)
+            ScrollView { sharingDetails(diameter: 124) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .safeAreaInset(edge: .bottom) { sharingStopButton }
+    }
+
+    /// Send Files and Send Clipboard stay in reach while sharing; the lens
+    /// above shrinks to make room, so the page doesn't scroll.
+    private var sharingSendActions: some View {
+        let actions = dynamicTypeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 10)) : AnyLayout(HStackLayout(spacing: 10))
+        return actions {
+            actionCard("Send files", systemImage: "doc") { openSendPicker() }
+            ClipboardSendButton(client: client)
+        }
+        .disabled(client.fileSendPeer == nil)
     }
 
     private func sharingDetails(diameter: CGFloat) -> some View {
@@ -1014,20 +1029,23 @@ struct ContentView: View {
     }
 
     private var sharingStopButton: some View {
-        Button(role: .destructive, action: {
-            if deliveryStopped {
-                actionError = "Open Control Center, then tap the active Screen Recording control to finish the broadcast."
-            } else {
-                confirmingStopBroadcast = true
+        VStack(spacing: 10) {
+            sharingSendActions
+            Button(role: .destructive, action: {
+                if deliveryStopped {
+                    actionError = "Open Control Center, then tap the active Screen Recording control to finish the broadcast."
+                } else {
+                    confirmingStopBroadcast = true
+                }
+            }) {
+                Text(deliveryStopped ? "End in Control Center" : stoppingBroadcast ? "Stopping…" : "Stop sharing")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity, minHeight: 44)
             }
-        }) {
-            Text(deliveryStopped ? "End in Control Center" : stoppingBroadcast ? "Stopping…" : "Stop sharing")
-                .font(.headline)
-                .frame(maxWidth: .infinity, minHeight: 44)
+            .buttonStyle(.bordered)
+            .buttonBorderShape(.capsule)
+            .disabled(stoppingBroadcast)
         }
-        .buttonStyle(.bordered)
-        .buttonBorderShape(.capsule)
-        .disabled(stoppingBroadcast)
         .padding(.horizontal, 20)
         .padding(.vertical, 8)
         .background(.regularMaterial)
