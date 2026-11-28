@@ -318,8 +318,10 @@ final class PullClient: ObservableObject {
         let pc = computerName
         if UIApplication.shared.applicationState == .active {
             UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["porthole.receive.show"])
-            BackgroundSend.receiving.begin(title: "Receiving from \(pc)", subtitle: name) { [weak self] in
-                self?.cancelReceive()
+            BackgroundSend.receiving.begin(title: "Receiving from \(pc)", subtitle: name) { [weak self] byPerson in
+                // The stop button cancels. If iOS gives up, Porthole keeps
+                // receiving in the background while paired.
+                if byPerson { self?.cancelReceive() }
             }
         } else if PhoneNotice.enabled {
             let content = UNMutableNotificationContent()
@@ -331,8 +333,8 @@ final class PullClient: ObservableObject {
         }
     }
 
-    /// Stops the file arriving from the PC. What arrived is kept, so
-    /// sending it again from the PC continues from there.
+    /// Stops the file arriving from the PC. Cancelled means gone: what
+    /// arrived is deleted once the PC confirms, and nothing continues it.
     func cancelReceive() {
         queue.async {
             guard let transfer = self.pushTransfer, self.pushStage != nil, !self.pushStopping else { return }
@@ -1531,8 +1533,19 @@ final class PullClient: ObservableObject {
                 disconnect(peer, message: "Update Porthole on your PC to send files securely.")
                 return
             } else if text.hasPrefix("ENDPUSH ") {
-                // The PC stopped sending the file the person cancelled here.
-                if pushStopping, String(text.dropFirst(8)) == pushTransfer?.id { abortPush() }
+                // Cancelled here or on the PC: what arrived is deleted.
+                if let transfer = pushTransfer, String(text.dropFirst(8)) == transfer.id {
+                    let onPC = !pushStopping
+                    abortPush(discard: true)
+                    if onPC {
+                        DispatchQueue.main.async {
+                            if self.receiveProgress?.transferID == transfer.id { self.setReceiveProgress(nil) }
+                            if self.fileSendPeer?.id == peer.id {
+                                self.status = "\(self.computerName) cancelled sending \(transfer.name)."
+                            }
+                        }
+                    }
+                }
             } else {
                 handle(text)
             }
@@ -2276,7 +2289,7 @@ final class PullClient: ObservableObject {
         if pushStopping {
             // A PC that didn't know STOP sent it all: don't save it.
             send("NO \(transfer.id)\n")
-            abortPush()
+            abortPush(discard: true)
             return
         }
         do { try stage.handle.synchronize(); try stage.handle.close() }
@@ -2351,8 +2364,13 @@ final class PullClient: ObservableObject {
         }
     }
 
-    private func abortPush() {
+    /// `discard` deletes what arrived (a cancel); otherwise it's kept for
+    /// the PC to continue (a failure).
+    private func abortPush(discard: Bool = false) {
         try? pushStage?.handle.close()
+        if discard, let stage = pushStage {
+            try? FileManager.default.removeItem(at: stage.data.deletingLastPathComponent())
+        }
         pushStage = nil
         pushHasher = nil
         pushTransfer = nil

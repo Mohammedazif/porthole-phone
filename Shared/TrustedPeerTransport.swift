@@ -39,3 +39,37 @@ enum TrustedPeerTransport {
         })
     }
 }
+
+/// Deletes on the PC what arrived of files the person cancelled here, so
+/// nothing continues them later. Only a PC that takes the checksum after
+/// the file (inbox 4) knows DROP; an older one keeps the part.
+enum TransferDrop {
+    static func send(_ ids: [UUID], to peer: TrustedPeer) {
+        guard !ids.isEmpty, ids.count <= 500 else { return }
+        let queue = DispatchQueue(label: "porthole.transfer.drop")
+        let connection = TrustedPeerTransport.connection(to: peer, port: 47733)
+        let lines = ids.map { "DROP \($0.uuidString.replacingOccurrences(of: "-", with: "").lowercased())\n" }.joined()
+        var received = Data()
+        func read() {
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { data, _, done, error in
+                if let data { received.append(data) }
+                // The PC answers DROPPED for each, then BYE.
+                if done || error != nil || String(decoding: received, as: UTF8.self).contains("BYE\n") {
+                    connection.cancel()
+                } else {
+                    read()
+                }
+            }
+        }
+        connection.stateUpdateHandler = { state in
+            guard case .ready = state else { return }
+            TrustedPeerTransport.authenticate(connection: connection, peer: peer) { authorized in
+                guard authorized else { connection.cancel(); return }
+                connection.send(content: Data("PSHR 4 \(ids.count)\n\(lines)DONE\n".utf8),
+                                completion: .contentProcessed { _ in read() })
+            }
+        }
+        connection.start(queue: queue)
+        queue.asyncAfter(deadline: .now() + 20) { connection.cancel() }
+    }
+}

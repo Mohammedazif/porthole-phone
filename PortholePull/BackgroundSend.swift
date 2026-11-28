@@ -15,15 +15,18 @@ final class BackgroundSend {
     static let identifierPrefix = "local.porthole.pull.send"
 
     private var task: AnyObject?
-    private var onExpire: (() -> Void)?
+    private var onExpire: ((Bool) -> Void)?
+    /// When the work last moved on.
+    private var movedAt = Date()
     private var title = ""
     private var subtitle = ""
     private var fraction = 0.0
     private var active = false
 
     /// From the foreground, as the person taps Send. `onExpire` runs if iOS
-    /// stops the work; sending then pauses and can continue later.
-    func begin(title: String, subtitle: String, onExpire: @escaping () -> Void) {
+    /// stops the work: with true when the person tapped iOS's stop button
+    /// while it was moving (a cancel), false when it had stalled (iOS gave up).
+    func begin(title: String, subtitle: String, onExpire: @escaping (Bool) -> Void) {
         DispatchQueue.main.async {
             self.end(success: false)
             self.active = true
@@ -31,6 +34,7 @@ final class BackgroundSend {
             self.title = title
             self.subtitle = subtitle
             self.fraction = 0
+            self.movedAt = Date()
             #if compiler(>=6.2)
             guard #available(iOS 26.0, *) else { return }
             let identifier = "\(Self.identifierPrefix).\(UUID().uuidString)"
@@ -52,6 +56,7 @@ final class BackgroundSend {
     func update(fraction: Double, subtitle: String) {
         DispatchQueue.main.async {
             guard self.active else { return }
+            if fraction != self.fraction { self.movedAt = Date() }
             self.fraction = min(1, max(0, fraction))
             self.subtitle = subtitle
             #if compiler(>=6.2)
@@ -95,11 +100,12 @@ final class BackgroundSend {
         task.expirationHandler = { [weak self] in
             DispatchQueue.main.async {
                 guard let self else { return }
+                let byPerson = Date().timeIntervalSince(self.movedAt) < 15
                 let expire = self.onExpire
                 self.onExpire = nil
                 self.active = false
                 self.task = nil
-                expire?()
+                expire?(byPerson)
             }
             task.setTaskCompleted(success: false)
         }

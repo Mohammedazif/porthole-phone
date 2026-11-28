@@ -1207,12 +1207,18 @@ private final class ShareTransfer {
         buffer = Data()
     }
 
-    /// The person stopped sending. What the PC already saved stays sent;
-    /// the rest can be sent again from here.
+    /// The person cancelled. What the PC already saved stays sent; what
+    /// arrived of the rest is deleted there, and nothing continues it.
     func stopSending() {
         queue.async {
             guard !self.stopped else { return }
-            self.fail("Sending cancelled. Items already sent stay on \(self.peer.name).")
+            let unsent = self.files.indices.filter { !self.acknowledged.contains($0) }.map { self.files[$0].id }
+            if (TrustedPeerStore.load()?.receiveVersion ?? 0) >= 4,
+               let destination = TrustedPeerStore.fileSharePeer(matching: self.peer) {
+                TransferDrop.send(unsent, to: destination)
+            }
+            try? self.journalBatch?.discard()
+            self.fail("Sending cancelled. Items already sent stay on \(self.peer.name).", retry: false)
         }
     }
 

@@ -223,7 +223,7 @@ struct SendFilesSheet: View {
     }
 
     private var canSend: Bool {
-        reviewingConnectedPeer && remaining > 0 && [.ready, .failed, .cancelled].contains(sender.phase)
+        reviewingConnectedPeer && remaining > 0 && [.ready, .failed].contains(sender.phase)
     }
 
     var body: some View {

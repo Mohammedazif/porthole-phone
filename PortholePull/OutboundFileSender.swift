@@ -319,8 +319,9 @@ final class OutboundFileSender: ObservableObject {
             let first = self.files[self.batch[0]].name
             let more = self.batch.count - 1
             BackgroundSend.shared.begin(title: "Sending to \(current.name)",
-                                        subtitle: more > 0 ? "\(first) and \(more) more" : first) { [weak self] in
-                self?.pauseForBackground()
+                                        subtitle: more > 0 ? "\(first) and \(more) more" : first) { [weak self] byPerson in
+                // The stop button cancels; iOS giving up only pauses.
+                if byPerson { self?.cancel() } else { self?.pauseForBackground() }
             }
             SendNotice.clear()
             self.onSaved = onSaved
@@ -362,12 +363,16 @@ final class OutboundFileSender: ObservableObject {
             guard self.link != nil || !self.files.isEmpty else { return }
             let uncertain = self.awaitingReceipt && !self.resumable
             self.stopConnection()
+            self.dropUnsentOnPC()
+            try? self.journalBatch?.discard()
+            self.journalBatch = nil
+            DispatchQueue.main.async { self.pendingCount = 0 }
             if !self.files.isEmpty, self.files.allSatisfy(\.sent) {
                 self.publish(.sent, progress: 1, message: "All files have already been saved on your PC.")
             } else if uncertain {
                 self.publish(.cancelled, message: "Transfer cancelled while confirming a file. Check the PC before retrying that file.")
             } else {
-                self.publish(.cancelled, message: "Transfer cancelled. Files already acknowledged by the PC remain sent.")
+                self.publish(.cancelled, message: "Sending cancelled. Items already sent stay on the PC.")
             }
         }
     }
@@ -390,11 +395,26 @@ final class OutboundFileSender: ObservableObject {
         queue.async { self.cleanUp(); self.publish(.idle, message: "") }
     }
 
+    /// Cancel Sending: cancelled means gone, on this iPhone and the PC.
     func discardPending() {
+        preparation.cancel()
+        (reader as? PhotoBodyReader)?.close()
+        BackgroundSend.shared.finish(success: false)
         queue.async {
+            self.stopConnection()
+            self.dropUnsentOnPC()
             self.cleanUp(discard: true)
             self.publish(.idle, message: "")
+            DispatchQueue.main.async { self.pendingCount = 0 }
         }
+    }
+
+    /// What reached the PC of the unsent files is deleted there, so nothing
+    /// continues them later. Needs a PC that knows DROP (inbox 4).
+    private func dropUnsentOnPC() {
+        guard let target = verifiedPeer ?? self.destination, target.receiveVersion >= 4,
+              target.channelTicket != nil else { return }
+        TransferDrop.send(files.filter { !$0.sent }.map(\.id), to: target)
     }
 
     private func sendFile(_ cursor: Int, token: UUID) {
