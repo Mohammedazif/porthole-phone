@@ -77,6 +77,8 @@ final class ShareViewController: UIViewController {
     private var transfer: ShareTransfer?
     private var readyToSend = false
     private var handingOff = false
+    /// Sending now: the main button stops it.
+    private var sendingNow = false
     private lazy var notice: UIStackView = Self.card()
     private let noticeTitle = UILabel()
     private let noticeBody = UILabel()
@@ -385,6 +387,7 @@ final class ShareViewController: UIViewController {
                                          self.marks[index].isHidden = false
                                      }, onAction: { [weak self] title, retry in
                                          guard let self, !self.closing else { return }
+                                         self.sendingNow = false
                                          self.readyToSend = retry
                                          self.finished = !retry
                                          self.statusDot.isHidden = title != "Done"
@@ -396,18 +399,22 @@ final class ShareViewController: UIViewController {
         transfer.prepare(providers)
     }
 
-    private func configureButton(_ title: String, enabled: Bool) {
+    private func configureButton(_ title: String, enabled: Bool, secondary: Bool = false) {
         // The prominent system glass style is available on iOS 26. A filled
         // capsule provides the same hierarchy on the deployment target.
-        var configuration = UIButton.Configuration.filled()
+        var configuration = secondary ? UIButton.Configuration.gray() : UIButton.Configuration.filled()
         #if compiler(>=6.2)
-        if #available(iOS 26, *) { configuration = .prominentGlass() }
+        if #available(iOS 26, *) { configuration = secondary ? .glass() : .prominentGlass() }
         #endif
         configuration.cornerStyle = .capsule
         configuration.buttonSize = .large
         configuration.title = title
-        configuration.baseBackgroundColor = UIColor { $0.userInterfaceStyle == .dark ? .white : UIColor(white: 0.08, alpha: 1) }
-        configuration.baseForegroundColor = UIColor { $0.userInterfaceStyle == .dark ? .black : .white }
+        if !secondary {
+            configuration.baseBackgroundColor = UIColor { $0.userInterfaceStyle == .dark ? .white : UIColor(white: 0.08, alpha: 1) }
+            configuration.baseForegroundColor = UIColor { $0.userInterfaceStyle == .dark ? .black : .white }
+        } else {
+            configuration.baseForegroundColor = .systemRed
+        }
         configuration.titleTextAttributesTransformer = .init { attributes in
             var output = attributes
             output.font = UIFontMetrics(forTextStyle: .headline).scaledFont(for: .systemFont(ofSize: 17, weight: .semibold))
@@ -420,6 +427,12 @@ final class ShareViewController: UIViewController {
 
     @objc private func sendTapped() {
         if finished { close(); return }
+        if sendingNow {
+            sendingNow = false
+            button.isEnabled = false
+            transfer?.stopSending()
+            return
+        }
         if handingOff {
             button.isEnabled = false
             transfer?.handOff { [weak self] in self?.close() }
@@ -427,7 +440,8 @@ final class ShareViewController: UIViewController {
         }
         guard readyToSend else { return }
         readyToSend = false
-        button.isEnabled = false
+        sendingNow = true
+        configureButton("Cancel sending", enabled: true, secondary: true)
         transfer?.send()
     }
 
@@ -1191,6 +1205,15 @@ private final class ShareTransfer {
         link?.cancel()
         try? activeHandle?.close(); activeHandle = nil
         buffer = Data()
+    }
+
+    /// The person stopped sending. What the PC already saved stays sent;
+    /// the rest can be sent again from here.
+    func stopSending() {
+        queue.async {
+            guard !self.stopped else { return }
+            self.fail("Sending cancelled. Items already sent stay on \(self.peer.name).")
+        }
     }
 
     private func fail(_ text: String, retry: Bool = true) {

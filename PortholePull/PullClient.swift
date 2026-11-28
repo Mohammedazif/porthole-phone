@@ -277,6 +277,10 @@ final class PullClient: ObservableObject {
     private var pushLeft = 0
     private var pushChunkLeft = 0
     private var chunkedPush = false
+    /// The person cancelled the file arriving now: its remaining bytes are
+    /// let go until the PC confirms with ENDPUSH.
+    private var pushStopping = false
+    private var activeObserver: NSObjectProtocol?
     private var lastReceiveProgressAt = DispatchTime(uptimeNanoseconds: 0)
     private var pushStage: IncomingTransferStore.Stage?
     /// The checksum of an incoming file, taken as it arrives, so a large
@@ -298,6 +302,48 @@ final class PullClient: ObservableObject {
         clipboardSyncEnabled = clipboardPreference.generation != nil
         inputControlsEnabled = inputPreference.enabled
         inputScreenSharingOnly = inputPreference.screenSharingOnly
+        // iOS starts the Lock Screen progress only while Porthole is open:
+        // a file that began arriving in the background gets it now.
+        activeObserver = NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification,
+                                                                object: nil, queue: .main) { [weak self] _ in
+            guard let self, let receive = self.receiveProgress, receive.phase == .receiving else { return }
+            self.showReceiveProgress(name: receive.name)
+        }
+    }
+
+    /// Lock Screen and Dynamic Island progress, with iOS's stop button,
+    /// for a file arriving from the PC. Main thread.
+    private func showReceiveProgress(name: String) {
+        guard !BackgroundSend.receiving.isRunning else { return }
+        let pc = computerName
+        if UIApplication.shared.applicationState == .active {
+            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["porthole.receive.show"])
+            BackgroundSend.receiving.begin(title: "Receiving from \(pc)", subtitle: name) { [weak self] in
+                self?.cancelReceive()
+            }
+        } else if PhoneNotice.enabled {
+            let content = UNMutableNotificationContent()
+            content.title = "Receiving from \(pc)"
+            content.body = "\(name). Tap to see the progress."
+            content.threadIdentifier = "porthole.receive"
+            UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "porthole.receive.show",
+                                                                        content: content, trigger: nil))
+        }
+    }
+
+    /// Stops the file arriving from the PC. What arrived is kept, so
+    /// sending it again from the PC continues from there.
+    func cancelReceive() {
+        queue.async {
+            guard let transfer = self.pushTransfer, self.pushStage != nil, !self.pushStopping else { return }
+            self.pushStopping = true
+            self.send("STOP \(transfer.id)\n")
+            BackgroundSend.receiving.finish(success: false)
+            DispatchQueue.main.async {
+                if self.receiveProgress?.transferID == transfer.id { self.setReceiveProgress(nil) }
+                UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["porthole.receive.show"])
+            }
+        }
     }
 
     var inputControlSummary: String {
@@ -1484,6 +1530,9 @@ final class PullClient: ObservableObject {
             } else if text.hasPrefix("PUSH ") {
                 disconnect(peer, message: "Update Porthole on your PC to send files securely.")
                 return
+            } else if text.hasPrefix("ENDPUSH ") {
+                // The PC stopped sending the file the person cancelled here.
+                if pushStopping, String(text.dropFirst(8)) == pushTransfer?.id { abortPush() }
             } else {
                 handle(text)
             }
@@ -2088,6 +2137,13 @@ final class PullClient: ObservableObject {
     }
 
     private func reportReceive(_ transfer: IncomingTransfer, received: Int, phase: ReceiveProgress.Phase) {
+        if phase == .receiving || phase == .saving, transfer.bytes > 0 {
+            let got = ByteCountFormatter.string(fromByteCount: Int64(received), countStyle: .file)
+            let all = ByteCountFormatter.string(fromByteCount: Int64(transfer.bytes), countStyle: .file)
+            BackgroundSend.receiving.update(fraction: Double(received) / Double(transfer.bytes),
+                                            subtitle: phase == .saving ? "\(transfer.name) · Saving"
+                                                                       : "\(transfer.name) · \(got) of \(all)")
+        }
         let progress = ReceiveProgress(transferID: transfer.id, name: transfer.name, bytes: transfer.bytes,
                                        received: received, phase: phase)
         DispatchQueue.main.async {
@@ -2146,6 +2202,7 @@ final class PullClient: ObservableObject {
                     self.pushChunkLeft = chunked ? 0 : self.pushLeft
                     self.reportReceive(transfer, received: staged.offset, phase: .receiving)
                     self.send("OFFSET \(transfer.id) \(staged.offset)\n")
+                    DispatchQueue.main.async { self.showReceiveProgress(name: transfer.name) }
                     DispatchQueue.main.async {
                         if self.fileSendPeer?.id == peer.id { self.status = "Receiving \(transfer.name)" }
                     }
@@ -2188,6 +2245,12 @@ final class PullClient: ObservableObject {
         guard let stage = pushStage else { return false }
         let take = min(pushChunkLeft, buffer.count)
         guard take > 0 else { return true }
+        if pushStopping {
+            buffer.removeFirst(take)
+            pushLeft -= take
+            pushChunkLeft -= take
+            return true
+        }
         do {
             let piece = buffer.prefix(take)
             try stage.handle.write(contentsOf: piece)
@@ -2210,6 +2273,12 @@ final class PullClient: ObservableObject {
     private func finishPush() {
         guard let stage = pushStage, let transfer = pushTransfer, let peer = transportPeer,
               let operation = incomingOperation else { return }
+        if pushStopping {
+            // A PC that didn't know STOP sent it all: don't save it.
+            send("NO \(transfer.id)\n")
+            abortPush()
+            return
+        }
         do { try stage.handle.synchronize(); try stage.handle.close() }
         catch {
             rejectPush(transfer, peer: peer)
@@ -2256,6 +2325,7 @@ final class PullClient: ObservableObject {
                 let sameSession = self.transportPeer?.id == peer.id && self.incomingOperation == operation
                 switch result {
                 case .success(let saved):
+                    BackgroundSend.receiving.finish(success: true)
                     if sameSession {
                         self.send("SAVED \(transfer.id)\n")
                         self.abortPush()
@@ -2289,6 +2359,11 @@ final class PullClient: ObservableObject {
         pushLeft = 0
         pushChunkLeft = 0
         chunkedPush = false
+        pushStopping = false
+        BackgroundSend.receiving.finish(success: false)
+        DispatchQueue.main.async {
+            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["porthole.receive.show"])
+        }
         if let operation = incomingOperation {
             DispatchQueue.main.async { self.endReceiveBackgroundTask(operation) }
         }

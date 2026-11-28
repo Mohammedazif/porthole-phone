@@ -765,6 +765,8 @@ struct ContentView: View {
                         Text("\(ByteCountFormatter.string(fromByteCount: Int64(receive.received), countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: Int64(receive.bytes), countStyle: .file))")
                     }
                     .accessibilityLabel("Receiving \(receive.name)")
+                    Button("Cancel", role: .destructive) { client.cancelReceive() }
+                        .font(.subheadline.weight(.semibold))
                 } else if receive.phase == .saving {
                     ProgressView("Saving file")
                 } else {

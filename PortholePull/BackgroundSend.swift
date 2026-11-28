@@ -9,6 +9,8 @@ import UserNotifications
 /// title and subtitle set here. Earlier iOS gives the usual short grace.
 final class BackgroundSend {
     static let shared = BackgroundSend()
+    /// The same for a file arriving from the PC.
+    static let receiving = BackgroundSend()
     /// Listed in Info.plist under BGTaskSchedulerPermittedIdentifiers.
     static let identifierPrefix = "local.porthole.pull.send"
 
