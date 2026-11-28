@@ -119,6 +119,9 @@ jobs:
                   assert info["PortholeAppGroup"] == companion_group
               widget_info = plistlib.loads(package.read(f"{widget}/Info.plist"))
               assert widget_info["NSExtension"]["NSExtensionPointIdentifier"] == "com.apple.widgetkit-extension"
+              # The Lock Screen progress (Live Activity) needs this key in the app.
+              app_info = plistlib.loads(package.read(f"{app}/Info.plist"))
+              assert app_info.get("NSSupportsLiveActivities") is True
           PY
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
