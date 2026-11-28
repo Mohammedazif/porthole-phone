@@ -173,6 +173,9 @@ struct ContentView: View {
                 client.cameForward()
                 fileSender.refreshPending(for: client.fileSendPeer)
                 index.refreshAuthorization()
+                // With access already given, the saved index is ready at once
+                // for a drag from the PC; it never asks for access here.
+                index.refreshIfNeeded()
                 input.refresh()
                 updateCapture()
                 refreshBroadcast()

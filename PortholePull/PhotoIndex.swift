@@ -38,7 +38,6 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
     private var indexing = false
     private var observing = false
     private var refreshPending = false
-    private var lastRefresh = Date.distantPast
     // Permission and snapshot changes invalidate work already in flight.
     private var libraryAccess: PHAuthorizationStatus?
     private var libraryGeneration = 0
@@ -64,11 +63,14 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         noteAccess(PHPhotoLibrary.authorizationStatus(for: .readWrite))
     }
 
-    /// Only Photos entry points warm the index. Permission prompts require an explicit action.
+    /// Warms the index when access was already given; never asks for it.
+    /// Once ready it stays ready: library changes come from the change
+    /// observer while Porthole runs, and from iOS's change history since the
+    /// last time it ran, so nothing is read again from the start.
     func refreshIfNeeded() {
         let access = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         noteAccess(access)
-        if canAccessLibrary, !indexing, !ready || Date().timeIntervalSince(lastRefresh) >= 30 {
+        if canAccessLibrary, !indexing, !ready {
             requestAccessAndIndex(refresh: true)
         }
     }
@@ -88,7 +90,8 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
     func photoLibraryDidChange(_ changeInstance: PHChange) {
         let access = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         lock.lock()
-        if access == .limited || access != libraryAccess {
+        // What's indexed stays usable; the update reads only what changed.
+        if access != libraryAccess {
             invalidateLocked(access: access)
         } else {
             libraryGeneration += 1
@@ -97,10 +100,6 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         DispatchQueue.main.async {
             let latest = PHPhotoLibrary.authorizationStatus(for: .readWrite)
             self.noteAccess(latest)
-            if latest == .limited {
-                self.ready = false
-                self.status = "Updating selected photos"
-            }
             self.changeWork?.cancel()
             guard self.canAccessLibrary else { return }
             let work = DispatchWorkItem { [weak self] in self?.requestAccessAndIndex(refresh: true) }
@@ -118,7 +117,6 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         }
         if ready && !refresh { return }
         indexing = true
-        lastRefresh = Date()
         if access == .notDetermined {
             PHPhotoLibrary.requestAuthorization(for: .readWrite) { [weak self] _ in
                 DispatchQueue.main.async {
@@ -142,7 +140,10 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         lock.lock()
         let generation = libraryGeneration
         lock.unlock()
-        indexQueue.async { self.index(generation: generation, diskCache: access == .authorized) }
+        indexQueue.async {
+            self.index(generation: generation, access: access,
+                       diskCache: access == .authorized || access == .limited)
+        }
     }
 
     private func invalidateLocked(access: PHAuthorizationStatus) {
@@ -156,8 +157,8 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         videoSkipped = 0
         fitKey = ""
         fitCells.removeAll()
-        if access != .authorized {
-            for name in ["photo-index-v2.bin", "video-frames-v2.bin"] {
+        if access != .authorized && access != .limited {
+            for name in ["photo-index-v2.bin", "video-frames-v2.bin", Self.tokenName] {
                 if let url = Self.cacheURL(name) { try? FileManager.default.removeItem(at: url) }
             }
         }
@@ -884,7 +885,187 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
         }
     }
 
-    private func index(generation: Int, diskCache: Bool) {
+    // MARK: Opening with the saved index, then only what changed
+
+    fileprivate static let tokenName = "photo-index-token.bin"
+
+    private var videoCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return videos.count
+    }
+
+    private static func readyStatus(photos: Int, videos: Int) -> String {
+        "Photo library ready · \(itemCount(photos))" + (videos > 0 ? " · \(videos) \(videos == 1 ? "video" : "videos")" : "")
+    }
+
+    /// Shows the index saved last time at once, so matching works straight
+    /// away; the check for changes follows. With limited access, only the
+    /// items this iPhone still lets Porthole see.
+    private func showSaved(access: PHAuthorizationStatus, generation: Int) {
+        var saved = Self.loadPhotoList()
+        guard !saved.isEmpty else { return }
+        var movies = Self.loadVideoList()
+        if access == .limited {
+            let visible = Self.accessibleIDs(saved.map(\.localIdentifier))
+            saved = saved.filter { visible.contains($0.localIdentifier) }
+            movies = movies.filter { visible.contains($0.localIdentifier) }
+        }
+        lock.lock()
+        let accepted = isCurrentLocked(generation) && photos.isEmpty && !saved.isEmpty
+        if accepted {
+            photos = saved
+            videos = movies
+            videoTotal = movies.count
+            photosGeneration += 1
+            fitKey = ""
+            fitCells.removeAll()
+        }
+        lock.unlock()
+        guard accepted else { return }
+        let count = saved.count, videoCount = movies.count
+        DispatchQueue.main.async {
+            guard self.isCurrent(generation) else { return }
+            self.ready = true
+            self.status = Self.readyStatus(photos: count, videos: videoCount)
+        }
+    }
+
+    private static func accessibleIDs(_ ids: [String]) -> Set<String> {
+        var visible = Set<String>()
+        var start = 0
+        while start < ids.count {
+            let end = min(ids.count, start + 2000)
+            PHAsset.fetchAssets(withLocalIdentifiers: Array(ids[start..<end]), options: nil)
+                .enumerateObjects { asset, _, _ in visible.insert(asset.localIdentifier) }
+            start = end
+        }
+        return visible
+    }
+
+    private static func loadToken() -> PHPersistentChangeToken? {
+        guard let url = cacheURL(tokenName), let data = try? Data(contentsOf: url) else { return nil }
+        return try? NSKeyedUnarchiver.unarchivedObject(ofClass: PHPersistentChangeToken.self, from: data)
+    }
+
+    private func saveToken(_ token: PHPersistentChangeToken, generation: Int) {
+        guard let data = try? NSKeyedArchiver.archivedData(withRootObject: token, requiringSecureCoding: true) else { return }
+        writeCache(Self.tokenName, generation: generation) { writer in try writer.append(Array(data)) }
+    }
+
+    private struct LibraryChanges {
+        var changed = Set<String>()
+        var deleted = Set<String>()
+    }
+
+    /// What iOS says changed in the library since the token, in order. Nil
+    /// when iOS no longer has that history (then a full pass).
+    private static func changes(since token: PHPersistentChangeToken) -> LibraryChanges? {
+        guard let result = try? PHPhotoLibrary.shared().fetchPersistentChanges(since: token) else { return nil }
+        var found = LibraryChanges()
+        for change in result {
+            guard let details = try? change.changeDetails(for: PHObjectType.asset) else { return nil }
+            for id in details.insertedLocalIdentifiers.union(details.updatedLocalIdentifiers) {
+                found.changed.insert(id)
+                found.deleted.remove(id)
+            }
+            for id in details.deletedLocalIdentifiers {
+                found.deleted.insert(id)
+                found.changed.remove(id)
+            }
+        }
+        return found
+    }
+
+    /// Reads only the new and edited items and drops deleted ones. False
+    /// when so much changed that a full pass is quicker.
+    private func applyChanges(_ changes: LibraryChanges, generation: Int, token: PHPersistentChangeToken) -> Bool {
+        guard changes.changed.count <= 400 else { return false }
+        lock.lock()
+        guard isCurrentLocked(generation), !photos.isEmpty else {
+            lock.unlock()
+            return false
+        }
+        var nextPhotos = photos
+        var nextVideos = videos
+        lock.unlock()
+        guard !changes.changed.isEmpty || !changes.deleted.isEmpty else {
+            saveToken(token, generation: generation)
+            return true
+        }
+        let gone = changes.deleted.union(changes.changed)
+        nextPhotos.removeAll { gone.contains($0.localIdentifier) }
+        nextVideos.removeAll { gone.contains($0.localIdentifier) }
+        let current = { self.isCurrent(generation) }
+        var newPhotos: [IndexedPhoto] = []
+        var newVideos: [VideoEntry] = []
+        if !changes.changed.isEmpty {
+            let options = PHFetchOptions()
+            options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+            let assets = PHAsset.fetchAssets(withLocalIdentifiers: Array(changes.changed), options: options)
+            var stopped = false
+            assets.enumerateObjects { asset, _, stop in
+                guard current(), asset.mediaType == .image || asset.mediaType == .video,
+                      asset.pixelWidth >= 2, asset.pixelHeight >= 2 else {
+                    if !current() { stopped = true; stop.pointee = true }
+                    return
+                }
+                let modified = asset.modificationDate?.timeIntervalSince1970 ?? 0
+                if let thumbnail = Self.render(asset, longSide: 64, timeout: 5, current: current) {
+                    newPhotos.append(IndexedPhoto(luma: thumbnail.luma, gridW: thumbnail.width, gridH: thumbnail.height,
+                                                  localIdentifier: asset.localIdentifier, modified: modified))
+                }
+                if asset.mediaType == .video,
+                   let entry = autoreleasepool(invoking: { Self.sampleVideo(asset, modified: modified, current: current) }) {
+                    newVideos.append(entry)
+                }
+            }
+            if stopped { return false }
+        }
+        // New items are the newest: they go first, where matching looks first.
+        nextPhotos = Array((newPhotos + nextPhotos).prefix(Self.maxPhotoEntries))
+        nextVideos = Array((newVideos + nextVideos).prefix(Self.maxVideoEntries))
+        lock.lock()
+        let accepted = isCurrentLocked(generation)
+        if accepted {
+            photos = nextPhotos
+            videos = nextVideos
+            videoTotal = nextVideos.count
+            photosGeneration += 1
+            fitKey = ""
+            fitCells.removeAll()
+        }
+        let movieGeneration = videoGeneration
+        lock.unlock()
+        guard accepted else { return false }
+        savePhotoCache(nextPhotos, generation: generation)
+        saveVideoCache(nextVideos, generation: generation, movieGeneration: movieGeneration)
+        saveToken(token, generation: generation)
+        let count = nextPhotos.count, videoCount = nextVideos.count
+        DispatchQueue.main.async {
+            guard self.isCurrent(generation) else { return }
+            self.ready = true
+            self.status = Self.readyStatus(photos: count, videos: videoCount)
+        }
+        return true
+    }
+
+    private func index(generation: Int, access: PHAuthorizationStatus, diskCache: Bool) {
+        // Taken first, so anything that changes while this runs is caught next time.
+        let startToken = PHPhotoLibrary.shared().currentChangeToken
+        lock.lock()
+        let empty = photos.isEmpty
+        lock.unlock()
+        if diskCache, empty { showSaved(access: access, generation: generation) }
+        // With full access, iOS says what changed since the saved index: only
+        // that is read. Limited access, no saved index, or too much changed:
+        // a full pass, which still reuses every item that didn't change.
+        if diskCache, access == .authorized, let token = Self.loadToken(),
+           let changes = Self.changes(since: token),
+           applyChanges(changes, generation: generation, token: startToken) {
+            DispatchQueue.main.async { self.finishIndex() }
+            return
+        }
         lock.lock()
         guard isCurrentLocked(generation) else {
             lock.unlock()
@@ -937,6 +1118,7 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
                sampledNew > 0 || Set(finished.map(\.localIdentifier)) != oldIDs {
                 self.savePhotoCache(finished, generation: generation)
             }
+            if diskCache { self.saveToken(startToken, generation: generation) }
             DispatchQueue.main.async {
                 self.lock.lock()
                 let accepted = self.isCurrentLocked(generation)
@@ -950,7 +1132,7 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
                 if accepted {
                     self.ready = true
                     self.status = total == 0 ? "No accessible media in the photo library"
-                        : "Photo library ready · \(finished.count) of \(total) items indexed"
+                        : Self.readyStatus(photos: finished.count, videos: self.videoCount)
                     self.indexVideos(photoCount: finished.count, generation: generation,
                                      movieGeneration: movieGeneration, diskCache: diskCache)
                 }
@@ -986,6 +1168,9 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
             var cache = Dictionary(self.videos.map { ($0.localIdentifier, $0) }, uniquingKeysWith: { _, new in new })
             self.lock.unlock()
             if diskCache, cache.isEmpty { cache = Self.loadVideoCache() }
+            // Progress is shown only the first time; after that the list in
+            // use stays whole until the updated one replaces it.
+            let firstTime = cache.isEmpty
             let decodeUntil = DispatchTime.now() + .seconds(90)
             var built: [VideoEntry] = []
             var skipped = 0
@@ -1003,9 +1188,12 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
                 }
                 self.lock.unlock()
                 let count = built.count
+                let done = built.count >= min(total, Self.maxVideoEntries)
                 DispatchQueue.main.async {
                     guard accepted, current() else { return }
-                    self.status = "Library ready · \(Self.itemCount(photoCount)) · \(count) of \(total) videos analyzed"
+                    self.status = firstTime && !done
+                        ? "Library ready · \(Self.itemCount(photoCount)) · \(count) of \(total) videos analyzed"
+                        : Self.readyStatus(photos: photoCount, videos: count)
                 }
                 return accepted
             }
@@ -1031,7 +1219,7 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
                 } else {
                     skipped += 1
                 }
-                if built.count - lastProgress >= 64 {
+                if firstTime, built.count - lastProgress >= 64 {
                     lastProgress = built.count
                     guard publish() else { return }
                 }
@@ -1152,7 +1340,7 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
             }
             lock.lock()
             defer { lock.unlock() }
-            guard isCurrentLocked(generation), libraryAccess == .authorized,
+            guard isCurrentLocked(generation), libraryAccess == .authorized || libraryAccess == .limited,
                   movieGeneration.map({ $0 == videoGeneration }) ?? true else { return }
             if files.fileExists(atPath: url.path) {
                 _ = try files.replaceItemAt(url, withItemAt: temp)
@@ -1184,23 +1372,28 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
     }
 
     private static func loadPhotoCache() -> [String: IndexedPhoto] {
+        Dictionary(loadPhotoList().map { ($0.localIdentifier, $0) }, uniquingKeysWith: { _, new in new })
+    }
+
+    /// The saved index, newest first, as it was written.
+    private static func loadPhotoList() -> [IndexedPhoto] {
         guard var reader = CacheReader(url: cacheURL("photo-index-v2.bin"), magic: "PHI2",
                                        maximumBytes: photoPixelBudget + 96 * 1024 * 1024),
-              let count = reader.number(UInt32.self), count <= maxPhotoEntries else { return [:] }
-        var result: [String: IndexedPhoto] = [:]
+              let count = reader.number(UInt32.self), count <= maxPhotoEntries else { return [] }
+        var result: [IndexedPhoto] = []
         var pixels = 0
         for _ in 0..<count {
             guard let idLength = reader.number(UInt16.self), (1...1024).contains(idLength),
                   let idBytes = reader.take(Int(idLength)), let id = String(bytes: idBytes, encoding: .utf8),
                   let modified = reader.number(Double.self), modified.isFinite,
                   let width = reader.number(UInt16.self), (2...64).contains(width),
-                  let height = reader.number(UInt16.self), (2...64).contains(height) else { return [:] }
+                  let height = reader.number(UInt16.self), (2...64).contains(height) else { return [] }
             let bytes = Int(width) * Int(height)
-            guard bytes <= photoPixelBudget - pixels, let luma = reader.take(bytes) else { return [:] }
-            result[id] = IndexedPhoto(luma: luma, gridW: Int(width), gridH: Int(height), localIdentifier: id, modified: modified)
+            guard bytes <= photoPixelBudget - pixels, let luma = reader.take(bytes) else { return [] }
+            result.append(IndexedPhoto(luma: luma, gridW: Int(width), gridH: Int(height), localIdentifier: id, modified: modified))
             pixels += bytes
         }
-        return reader.offset == reader.data.count ? result : [:]
+        return reader.offset == reader.data.count ? result : []
     }
 
     private func saveVideoCache(_ entries: [VideoEntry], generation: Int, movieGeneration: Int) {
@@ -1230,11 +1423,15 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
     }
 
     private static func loadVideoCache() -> [String: VideoEntry] {
+        Dictionary(loadVideoList().map { ($0.localIdentifier, $0) }, uniquingKeysWith: { _, new in new })
+    }
+
+    private static func loadVideoList() -> [VideoEntry] {
         guard var reader = CacheReader(url: cacheURL("video-frames-v2.bin"), magic: "PVF2",
                                        maximumBytes: videoPixelBudget + 24 * 1024 * 1024),
-              let count = reader.number(UInt32.self), count <= maxVideoEntries else { return [:] }
+              let count = reader.number(UInt32.self), count <= maxVideoEntries else { return [] }
         let cells = PictureHash.videoSide * PictureHash.videoSide
-        var result: [String: VideoEntry] = [:]
+        var result: [VideoEntry] = []
         var pixels = 0
         for _ in 0..<count {
             guard let idLength = reader.number(UInt16.self), (1...1024).contains(idLength),
@@ -1242,17 +1439,17 @@ final class PhotoIndex: NSObject, ObservableObject, PHPhotoLibraryChangeObserver
                   let modified = reader.number(Double.self), modified.isFinite,
                   let aspect = reader.number(Double.self), aspect.isFinite, aspect > 0,
                   let frameCount = reader.number(UInt16.self), (1...PictureHash.videoFramesMax).contains(Int(frameCount)),
-                  Int(frameCount) * cells <= videoPixelBudget - pixels else { return [:] }
+                  Int(frameCount) * cells <= videoPixelBudget - pixels else { return [] }
             var frames: [VideoEntry.Frame] = []
             for _ in 0..<frameCount {
                 guard let seconds = reader.number(Double.self), seconds.isFinite, seconds >= 0,
-                      seconds >= (frames.last?.seconds ?? 0), let frame = reader.take(cells) else { return [:] }
+                      seconds >= (frames.last?.seconds ?? 0), let frame = reader.take(cells) else { return [] }
                 frames.append(VideoEntry.Frame(seconds: seconds, pixels: frame))
             }
-            result[id] = VideoEntry(localIdentifier: id, modified: modified, aspect: aspect, frames: frames)
+            result.append(VideoEntry(localIdentifier: id, modified: modified, aspect: aspect, frames: frames))
             pixels += Int(frameCount) * cells
         }
-        return reader.offset == reader.data.count ? result : [:]
+        return reader.offset == reader.data.count ? result : []
     }
 
     private struct SampledPhoto {
