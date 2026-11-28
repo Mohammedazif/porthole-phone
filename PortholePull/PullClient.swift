@@ -2720,6 +2720,9 @@ final class PullClient: ObservableObject {
         }
         let delay = min(2 << min(reconnectAttempt, 3), 15)
         reconnectAttempt += 1
+        if reconnectAttempt <= 3 || reconnectAttempt % 20 == 0 {
+            DiagnosticLog.note("reconnect: try \(reconnectAttempt) in \(delay) s (\(foreground ? "open" : "in the background, silent audio \(backgroundAudio?.requested == true ? "on" : "off")"))")
+        }
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.requestedPeer?.id == peer.id else { return }
             self.reconnectWork = nil

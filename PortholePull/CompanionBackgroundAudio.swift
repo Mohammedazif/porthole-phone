@@ -67,6 +67,7 @@ final class CompanionBackgroundAudio {
             player.scheduleBuffer(buffer, at: nil, options: .loops)
             player.play()
         } catch {
+            DiagnosticLog.note("staying connected in the background: iOS refused the silent audio (\(error.localizedDescription))")
             stopPlayback()
         }
     }
@@ -76,11 +77,13 @@ final class CompanionBackgroundAudio {
               let interruption = AVAudioSession.InterruptionType(rawValue: raw) else { return }
         switch interruption {
         case .began:
+            DiagnosticLog.note("staying connected in the background: another app took the audio; iOS may pause Porthole")
             interrupted = true
             sessionActive = false
             player.stop()
             engine.stop()
         case .ended:
+            DiagnosticLog.note("staying connected in the background: audio back")
             interrupted = false
             restartIfNeeded()
         @unknown default:
