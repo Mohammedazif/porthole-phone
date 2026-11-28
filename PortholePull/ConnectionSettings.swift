@@ -27,7 +27,6 @@ struct ConnectionSettings: View {
     @ObservedObject var input: InputDeviceMonitor
     var verifiesBluetooth = false
     @State private var showingSelectedPhotos = false
-    @State private var choosingOriginal: OriginalSelection?
     @State private var settingsHelp: String?
 
     var body: some View {
@@ -51,17 +50,6 @@ struct ConnectionSettings: View {
             }
         }
         .background { if verifiesBluetooth { BluetoothAutoVerification(client: client, available: true) } }
-        .sheet(item: $choosingOriginal) { selection in
-            OriginalPicker { identifier in
-                choosingOriginal = nil
-                guard let identifier else { return }
-                guard client.fileSendPeer?.id == selection.peer.id else {
-                    settingsHelp = "The connected PC changed. Select the original again after reconnecting."
-                    return
-                }
-                client.chooseOriginal(identifier)
-            }
-        }
         .alert("Porthole", isPresented: Binding(
             get: { settingsHelp != nil },
             set: { if !$0 { settingsHelp = nil } }
@@ -131,24 +119,6 @@ struct ConnectionSettings: View {
                 }
                 Button("Open app settings", action: openAppSettings)
             }
-            Section {
-                if let peer = client.fileSendPeer {
-                    LabeledContent("Send to", value: peer.name)
-                    Button("Select original") { choosingOriginal = OriginalSelection(peer: peer) }
-                        .disabled(!index.ready)
-                } else {
-                    Text("Connect to your PC to select an original.")
-                        .foregroundStyle(.secondary)
-                }
-                if !client.chosenOriginal.isEmpty {
-                    LabeledContent("Selected file", value: client.chosenOriginal)
-                    Button("Clear selection") { client.clearChosenOriginal() }
-                }
-            } header: {
-                Text("Original file transfer")
-            } footer: {
-                Text("Original files may include their saved metadata.")
-            }
         }
     }
 
@@ -199,11 +169,6 @@ struct ConnectionSettings: View {
             ? "Open Settings › Accessibility › Touch › AssistiveTouch › Dwell Control, then disable Dwell Control."
             : "Open Settings › Accessibility › Touch › AssistiveTouch, then enable AssistiveTouch."
     }
-}
-
-private struct OriginalSelection: Identifiable {
-    let peer: TrustedPeer
-    var id: UUID { peer.id }
 }
 
 struct ClipboardHistorySettings: View {

@@ -121,7 +121,6 @@ final class PullClient: ObservableObject {
     @Published private(set) var linked = false
     /// The PC's hostname, as advertised on this Wi-Fi.
     @Published private(set) var deviceName = ""
-    @Published private(set) var chosenOriginal = ""
     @Published private(set) var clipStatus = ""
     @Published private(set) var clipboardSyncEnabled = true
     private let clipboardPreference = ClipboardSyncPreference()
@@ -266,7 +265,6 @@ final class PullClient: ObservableObject {
     private var volumeLinkReady = false
     private weak var index: PhotoIndex?
     // Accessed only on queue. Explicit selection bypasses visual matching once.
-    private var chosenIdentifier: String?
     private var syncReady = false
     // Accessed only on queue. The PC accepts the sound choice.
     private var soundReady = false
@@ -604,22 +602,6 @@ final class PullClient: ObservableObject {
         return true
     }
 
-    func chooseOriginal(_ identifier: String) {
-        guard let peer = fileSendPeer else { return }
-        queue.async {
-            guard self.transportPeer?.id == peer.id else { return }
-            guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject else {
-                DispatchQueue.main.async {
-                    if self.fileSendPeer?.id == peer.id { self.status = "Photo access required for the selected item. Review Settings › Porthole › Photos." }
-                }
-                return
-            }
-            self.chosenIdentifier = identifier
-            let name = PHAssetResource.assetResources(for: asset).first?.originalFilename ?? "Selected original"
-            DispatchQueue.main.async { if self.fileSendPeer?.id == peer.id { self.chosenOriginal = name } }
-        }
-    }
-
     /// The user picked one of two similar photos, or neither.
     func pickChoice(_ id: String?) {
         queue.async {
@@ -668,13 +650,6 @@ final class PullClient: ObservableObject {
 
     func clearArrival() {
         arrival = nil
-    }
-
-    func clearChosenOriginal() {
-        queue.async {
-            self.chosenIdentifier = nil
-            DispatchQueue.main.async { self.chosenOriginal = "" }
-        }
     }
 
     func bind(index: PhotoIndex) {
@@ -1148,7 +1123,6 @@ final class PullClient: ObservableObject {
         inputVerificationSupported = false
         endInputVerification(.required)
         choiceIDs = []
-        chosenOriginal = ""
         deviceName = ""
         clipStatus = ""
         clipboardLinkReady = false
@@ -1194,7 +1168,6 @@ final class PullClient: ObservableObject {
         acceptedClipboardGeneration = nil
         pendingData = nil
         pendingClipboardGeneration = nil
-        chosenIdentifier = nil
         choicePending = false
         matching = false
         exporting = false
@@ -1892,16 +1865,6 @@ final class PullClient: ObservableObject {
         }
         guard parts.count < 4 || thumb != nil, parts.count < 5 || detail != nil,
               parts.count < 6 || screen != nil else { send("MISS invalid-preview\n"); return }
-        if let identifier = chosenIdentifier {
-            chosenIdentifier = nil
-            DispatchQueue.main.async { self.chosenOriginal = "" }
-            guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject else {
-                send("MISS selected-item-unavailable\n")
-                return
-            }
-            export(asset, approved: true)
-            return
-        }
         guard thumb != nil || screen != nil else { send("MISS preview-required\n"); return }
         matchOriginal(index: index, hash: hash, aspect: aspect, thumb: thumb,
                       detail: detail, screen: screen, peer: peer)
@@ -1966,8 +1929,8 @@ final class PullClient: ObservableObject {
                     DispatchQueue.main.async {
                         guard self.fileSendPeer?.id == peer.id else { return }
                         self.status = found.videoUnavailable
-                            ? "Some videos were unavailable for comparison. Select the original in Photo access."
-                            : "Unable to identify this item. Select an original in Photo access to try again."
+                            ? "Some videos couldn’t be compared. Send it with Send files › Photo Library instead."
+                            : "Unable to identify this item. Send it with Send files › Photo Library instead."
                     }
                 }
             }

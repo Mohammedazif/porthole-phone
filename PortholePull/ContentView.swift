@@ -1813,33 +1813,6 @@ private struct ChoiceThumb: View {
     }
 }
 
-/// The system picker gives the exact Photos identifier, without guessing from a
-/// playback frame. The file is still exported through PhotoKit as original bytes.
-struct OriginalPicker: UIViewControllerRepresentable {
-    let onChoose: (String?) -> Void
-
-    func makeUIViewController(context: Context) -> PHPickerViewController {
-        var config = PHPickerConfiguration(photoLibrary: .shared())
-        config.filter = .any(of: [.images, .videos])
-        config.selectionLimit = 1
-        config.preferredAssetRepresentationMode = .current
-        let picker = PHPickerViewController(configuration: config)
-        picker.delegate = context.coordinator
-        return picker
-    }
-
-    func updateUIViewController(_ controller: PHPickerViewController, context: Context) {}
-    func makeCoordinator() -> Coordinator { Coordinator(onChoose: onChoose) }
-
-    final class Coordinator: NSObject, PHPickerViewControllerDelegate {
-        let onChoose: (String?) -> Void
-        init(onChoose: @escaping (String?) -> Void) { self.onChoose = onChoose }
-        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
-            onChoose(results.first?.assetIdentifier)
-        }
-    }
-}
-
 /// A picture when the file is one, otherwise the type (PDF, ZIP) on a page.
 private struct FileMark: View {
     let name: String
