@@ -1,81 +1,82 @@
-import BackgroundTasks
+import ActivityKit
 import Foundation
 import UIKit
 import UserNotifications
 
-/// Keeps sending after the person leaves Porthole or locks the iPhone. On
-/// iOS 26 a send started in Porthole continues as a background task; iOS
-/// shows its progress on the Lock Screen and in the Dynamic Island with the
-/// title and subtitle set here. Earlier iOS gives the usual short grace.
+/// The progress of a file going to the PC (or, as `receiving`, coming from
+/// it) on the Lock Screen, in Notification Center and in the Dynamic Island,
+/// as a Live Activity with a Stop button. Porthole keeps running in the
+/// background while paired, so it keeps the progress current itself.
+/// iOS lets a Live Activity start only while Porthole is open.
 final class BackgroundSend {
-    static let shared = BackgroundSend()
+    static let shared = BackgroundSend(incoming: false)
     /// The same for a file arriving from the PC.
-    static let receiving = BackgroundSend()
-    /// Listed in Info.plist under BGTaskSchedulerPermittedIdentifiers.
-    static let identifierPrefix = "local.porthole.pull.send"
+    static let receiving = BackgroundSend(incoming: true)
 
-    private var task: AnyObject?
+    private let incoming: Bool
+    private var activity: Activity<TransferActivityAttributes>?
     private var onExpire: ((Bool) -> Void)?
-    /// When the work last moved on.
-    private var movedAt = Date()
     private var title = ""
-    private var subtitle = ""
+    private var detail = ""
     private var fraction = 0.0
     private var active = false
+    private var shownAt = Date.distantPast
+    private var stopObserver: NSObjectProtocol?
 
-    /// From the foreground, as the person taps Send. `onExpire` runs if iOS
-    /// stops the work: with true when the person tapped iOS's stop button
-    /// while it was moving (a cancel), false when it had stalled (iOS gave up).
+    private init(incoming: Bool) {
+        self.incoming = incoming
+        stopObserver = NotificationCenter.default.addObserver(forName: .portholeStopTransfer, object: nil,
+                                                              queue: .main) { [weak self] note in
+            guard let self, (note.userInfo?["incoming"] as? Bool) == self.incoming, self.active else { return }
+            DiagnosticLog.note("progress: Stop tapped on the Lock Screen (\(self.incoming ? "receiving" : "sending"))")
+            let expire = self.onExpire
+            self.end(success: false)
+            expire?(true)
+        }
+    }
+
+    /// From the foreground, as the person taps Send (or as a file starts
+    /// arriving). `onExpire(true)` runs when the person taps Stop.
     func begin(title: String, subtitle: String, onExpire: @escaping (Bool) -> Void) {
         DispatchQueue.main.async {
             self.end(success: false)
             self.active = true
             self.onExpire = onExpire
             self.title = title
-            self.subtitle = subtitle
+            self.detail = subtitle
             self.fraction = 0
-            self.movedAt = Date()
-            #if compiler(>=6.2)
-            guard #available(iOS 26.0, *) else { return }
-            let identifier = "\(Self.identifierPrefix).\(UUID().uuidString)"
-            let registered = BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: .main) { [weak self] task in
-                guard let continued = task as? BGContinuedProcessingTask, let self else {
-                    task.setTaskCompleted(success: false)
-                    return
-                }
-                DiagnosticLog.note("progress card: iOS started it for \(title)")
-                self.attach(continued)
+            guard ActivityAuthorizationInfo().areActivitiesEnabled else {
+                DiagnosticLog.note("progress: Live Activities are turned off for Porthole in Settings")
+                return
             }
-            let request = BGContinuedProcessingTaskRequest(identifier: identifier, title: title, subtitle: subtitle)
-            // Queued rather than refused when iOS can't start it this instant.
-            request.strategy = .queue
-            // If iOS declines, sending still runs while Porthole is open.
+            let state = TransferActivityAttributes.ContentState(fraction: 0, detail: subtitle)
             do {
-                try BGTaskScheduler.shared.submit(request)
-                DiagnosticLog.note("progress card: asked iOS for \(title) (registered \(registered))")
+                self.activity = try Activity.request(
+                    attributes: TransferActivityAttributes(title: title, incoming: self.incoming),
+                    content: ActivityContent(state: state, staleDate: nil), pushType: nil)
+                self.shownAt = Date()
+                DiagnosticLog.note("progress: shown on the Lock Screen for \(title)")
             } catch {
-                DiagnosticLog.note("progress card: iOS refused \(title): \(error) (registered \(registered), bundle \(Bundle.main.bundleIdentifier ?? "?"))")
+                DiagnosticLog.note("progress: iOS refused the Live Activity for \(title): \(error)")
             }
-            #endif
         }
     }
 
     func update(fraction: Double, subtitle: String) {
         DispatchQueue.main.async {
             guard self.active else { return }
-            if fraction != self.fraction { self.movedAt = Date() }
             self.fraction = min(1, max(0, fraction))
-            self.subtitle = subtitle
-            #if compiler(>=6.2)
-            guard #available(iOS 26.0, *), let task = self.task as? BGContinuedProcessingTask else { return }
-            task.progress.completedUnitCount = Int64(self.fraction * 1000)
-            task.updateTitle(self.title, subtitle: subtitle)
-            #endif
+            self.detail = subtitle
+            // About once a second: iOS limits how often it redraws one.
+            guard let activity = self.activity, Date().timeIntervalSince(self.shownAt) >= 1 else { return }
+            self.shownAt = Date()
+            let state = TransferActivityAttributes.ContentState(fraction: self.fraction, detail: subtitle)
+            Task { await activity.update(ActivityContent(state: state, staleDate: nil)) }
         }
     }
 
-    /// iOS is keeping the send going in the background. Main thread.
-    var isRunning: Bool { task != nil }
+    /// The Live Activity is showing. Main thread.
+    var isRunning: Bool { activity != nil }
 
     func finish(success: Bool) {
         DispatchQueue.main.async { self.end(success: success) }
@@ -84,41 +85,15 @@ final class BackgroundSend {
     private func end(success: Bool) {
         active = false
         onExpire = nil
-        #if compiler(>=6.2)
-        if #available(iOS 26.0, *), let task = task as? BGContinuedProcessingTask {
-            if success { task.progress.completedUnitCount = task.progress.totalUnitCount }
-            task.setTaskCompleted(success: success)
-        }
-        #endif
-        task = nil
-    }
-
-    #if compiler(>=6.2)
-    @available(iOS 26.0, *)
-    private func attach(_ task: BGContinuedProcessingTask) {
-        guard active else {
-            task.setTaskCompleted(success: true) // already done
-            return
-        }
-        self.task = task
-        task.progress.totalUnitCount = 1000
-        task.progress.completedUnitCount = Int64(fraction * 1000)
-        task.updateTitle(title, subtitle: subtitle)
-        task.expirationHandler = { [weak self] in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                let byPerson = Date().timeIntervalSince(self.movedAt) < 15
-                DiagnosticLog.note("progress card: ended by \(byPerson ? "the stop button" : "iOS")")
-                let expire = self.onExpire
-                self.onExpire = nil
-                self.active = false
-                self.task = nil
-                expire?(byPerson)
-            }
-            task.setTaskCompleted(success: false)
+        guard let activity else { return }
+        self.activity = nil
+        let state = TransferActivityAttributes.ContentState(fraction: success ? 1 : fraction,
+                                                             detail: success ? "Done" : detail)
+        Task {
+            await activity.end(ActivityContent(state: state, staleDate: nil),
+                               dismissalPolicy: success ? .after(.now + 4) : .immediate)
         }
     }
-    #endif
 
     static var appInForeground: Bool {
         if Thread.isMainThread { return UIApplication.shared.applicationState == .active }

@@ -35,6 +35,13 @@ struct PortholeInboxProvider: TimelineProvider {
 }
 
 @main
+struct PortholeWidgets: WidgetBundle {
+    var body: some Widget {
+        PortholeInboxWidget()
+        TransferLiveActivityWidget()
+    }
+}
+
 struct PortholeInboxWidget: Widget {
     var body: some WidgetConfiguration {
         StaticConfiguration(kind: WidgetInboxSnapshot.kind, provider: PortholeInboxProvider()) { entry in

@@ -133,7 +133,16 @@ final class OutboundFileSender: ObservableObject {
                     case .file(let url):
                         item = try Self.original(url, index: index, batch: batch, quick: quick, cancelled: cancelled)
                     case .photo(let identifier, let provider):
-                        if let identifier, let photo = try Self.libraryItem(identifier, index: index, batch: batch,
+                        // iOS's own copy first, as the Share Sheet gets: on the same
+                        // volume it's a clone, quick and taking no extra space. When
+                        // there isn't room for it, the original streams from Photos.
+                        if quick, let provider, Self.roomForCopy(identifier, in: batch.folder),
+                           let copied = try? Self.copy(provider, index: index, batch: batch, remaining: remaining,
+                                                       quick: true, cancelled: cancelled) {
+                            item = copied
+                            how = "iOS's copy"
+                            remaining -= item.bytes
+                        } else if let identifier, let photo = try Self.libraryItem(identifier, index: index, batch: batch,
                                                                              quick: quick, cancelled: cancelled) {
                             item = photo
                             how = "photo library"
@@ -199,6 +208,16 @@ final class OutboundFileSender: ObservableObject {
         let result = try measured.get()
         return Item(id: UUID(), url: batch.itemURL(named: name, index: index), name: name, bytes: result.bytes,
                     digest: result.digest, source: .file(bookmark: bookmark))
+    }
+
+    /// Whether iOS's copy of a Photo Library item still leaves room on this iPhone.
+    private static func roomForCopy(_ identifier: String?, in folder: URL) -> Bool {
+        guard let identifier,
+              let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject,
+              let resource = PhotoBodyReader.resource(of: asset, named: nil),
+              let bytes = PhotoLibraryLookup.size(of: resource),
+              let free = TransferMeasure.freeSpace(at: folder) else { return true }
+        return free - bytes >= TransferMeasure.keepFree
     }
 
     /// The size of a file already on this iPhone (not one still in iCloud).

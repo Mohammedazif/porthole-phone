@@ -67,7 +67,7 @@ targets:
       - PortholePull/TransferFileName.swift
       - PortholePull/ShareReceiptJournal.swift
       - path: Shared
-        excludes: [Porthole.entitlements, WidgetInbox.swift]
+        excludes: [Porthole.entitlements, WidgetInbox.swift, TransferActivity.swift]
     settings:
       base:
         PRODUCT_NAME: PortholeShare
@@ -82,6 +82,7 @@ targets:
         excludes: [PortholeWidgets.entitlements]
       - Shared/WidgetInbox.swift
       - Shared/PortholeAppGroup.swift
+      - Shared/TransferActivity.swift
     settings:
       base:
         PRODUCT_NAME: PortholeWidgets
