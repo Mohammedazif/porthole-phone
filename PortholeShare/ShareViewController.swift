@@ -707,8 +707,8 @@ private final class ShareTransfer {
                 self.fail("Open Porthole to finish setting up Share for this PC.")
                 return
             }
-            let version = self.protocolVersion ?? destination.receiveVersion
-            guard destination.receiveVersion >= version else {
+            let version = self.protocolVersion ?? destination.shareReceiveVersion
+            guard destination.shareReceiveVersion >= version else {
                 self.fail("Update Porthole on the PC to resume this transfer.")
                 return
             }
@@ -792,7 +792,7 @@ private final class ShareTransfer {
                       source: item.source.isStaged ? nil : item.source)
             })
             do {
-                let reviewed = try batch.saveSelection(manifest, version: peer.receiveVersion)
+                let reviewed = try batch.saveSelection(manifest, version: peer.shareReceiveVersion)
                 files = reviewed.files.enumerated().map { index, file in
                     // An original is read from where it is; a copy from this batch.
                     let url = file.isStaged ? batch.itemURL(named: file.name, index: index) : originals[index].url

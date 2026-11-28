@@ -169,7 +169,7 @@ enum PhotoLibraryLookup {
         return found ?? fallback
     }
 
-    private static func size(of resource: PHAssetResource) -> Int64? {
+    static func size(of resource: PHAssetResource) -> Int64? {
         guard resource.responds(to: Selector(("fileSize"))) else { return nil }
         return (resource.value(forKey: "fileSize") as? NSNumber)?.int64Value
     }

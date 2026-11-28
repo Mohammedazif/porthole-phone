@@ -3,6 +3,7 @@ import Network
 import Combine
 import Photos
 import UniformTypeIdentifiers
+import CryptoKit
 
 /// What the person picked to send: a file in Files, or a Photo Library item
 /// (its identifier when Porthole can read the library, and the picker's
@@ -86,6 +87,8 @@ final class OutboundFileSender: ObservableObject {
     private var protocolVersion: Int?
     private var resumable: Bool { (protocolVersion ?? 1) >= 2 }
     private var awaitingReceipt = false
+    /// Version 4: the checksum of the file being sent, taken as it goes.
+    private var bodyHash: SHA256?
     private var lastProgressAt = DispatchTime.now()
     private var onSaved: (() -> Void)?
 
@@ -110,16 +113,19 @@ final class OutboundFileSender: ObservableObject {
                 self.destination = peer.remembered
                 var remaining = TransferStaging.maxBatchBytes
                 let cancelled = { self.preparation.isCancelled(attempt) || batch.isRevoked }
+                // A PC that takes the checksum after the file needs only the
+                // size now: nothing is read before sending starts.
+                let quick = peer.receiveVersion >= 4
                 for (index, pick) in picks.enumerated() {
                     if cancelled() { throw TransferStaging.Failure.cancelled }
                     if picks.count > 1 { self.publish(.preparing, message: "Preparing \(index + 1) of \(picks.count)…") }
                     let item: Item
                     switch pick {
                     case .file(let url):
-                        item = try Self.original(url, index: index, batch: batch, cancelled: cancelled)
+                        item = try Self.original(url, index: index, batch: batch, quick: quick, cancelled: cancelled)
                     case .photo(let identifier, let provider):
                         if let identifier, let photo = try Self.libraryItem(identifier, index: index, batch: batch,
-                                                                             cancelled: cancelled) {
+                                                                             quick: quick, cancelled: cancelled) {
                             item = photo
                         } else if let provider {
                             item = try Self.copy(provider, index: index, batch: batch, remaining: remaining,
@@ -154,12 +160,16 @@ final class OutboundFileSender: ObservableObject {
     }
 
     /// A file picked in Files: measured where it is and kept as a bookmark.
-    private static func original(_ url: URL, index: Int, batch: OutboundTransferJournal.Batch,
+    private static func original(_ url: URL, index: Int, batch: OutboundTransferJournal.Batch, quick: Bool,
                                  cancelled: @escaping () -> Bool) throws -> Item {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         let bookmark = try url.bookmarkData()
         let name = TransferFileName.make(url.lastPathComponent, index: index)
+        if quick, let bytes = localSize(of: url), bytes > 0 {
+            return Item(id: UUID(), url: batch.itemURL(named: name, index: index), name: name, bytes: bytes,
+                        digest: "", source: .file(bookmark: bookmark))
+        }
         var coordinatorError: NSError?
         var measured: Result<(bytes: Int64, digest: String), Error>?
         // Coordinated, so a file still in iCloud Drive is downloaded first.
@@ -177,13 +187,25 @@ final class OutboundFileSender: ObservableObject {
                     digest: result.digest, source: .file(bookmark: bookmark))
     }
 
+    /// The size of a file already on this iPhone (not one still in iCloud).
+    private static func localSize(of url: URL) -> Int64? {
+        let keys: Set<URLResourceKey> = [.fileSizeKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey]
+        guard let values = try? url.resourceValues(forKeys: keys), let size = values.fileSize else { return nil }
+        if values.isUbiquitousItem == true, values.ubiquitousItemDownloadingStatus != .current { return nil }
+        return Int64(size)
+    }
+
     /// A Photo Library item, read from the library itself. Nil when this
     /// iPhone does not let Porthole read it (limited access).
     private static func libraryItem(_ identifier: String, index: Int, batch: OutboundTransferJournal.Batch,
-                                    cancelled: @escaping () -> Bool) throws -> Item? {
+                                    quick: Bool, cancelled: @escaping () -> Bool) throws -> Item? {
         guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject,
               let resource = PhotoBodyReader.resource(of: asset, named: nil) else { return nil }
         let name = TransferFileName.make(resource.originalFilename, index: index)
+        if quick, let bytes = PhotoLibraryLookup.size(of: resource), bytes > 0 {
+            return Item(id: UUID(), url: batch.itemURL(named: name, index: index), name: name, bytes: bytes,
+                        digest: "", source: .photo(asset: identifier, resource: resource.originalFilename))
+        }
         let reader = try PhotoBodyReader(asset: identifier, resource: resource.originalFilename)
         defer { reader.close() }
         let measured = try TransferMeasure.measure(reader, cancelled: cancelled)
@@ -226,9 +248,11 @@ final class OutboundFileSender: ObservableObject {
 
     func refreshPending(for peer: TrustedPeer?) {
         queue.async {
-            self.verifiedPeer = peer
-            if self.link != nil, self.destination?.id != peer?.id {
-                self.fail("The PC disconnected. Retry when it reconnects.")
+            // The file transfer has its own connection: a moment without
+            // Porthole's link to the PC doesn't stop it. Only another PC does.
+            if peer != nil || self.link == nil { self.verifiedPeer = peer }
+            if self.link != nil, let peer, let destination = self.destination, !destination.samePairing(as: peer) {
+                self.fail("The PC changed. Choose the files again to send them to this PC.")
             }
             let count = peer.flatMap { Self.pending(for: $0)?.1.pendingCount } ?? 0
             DispatchQueue.main.async { self.pendingCount = count }
@@ -315,7 +339,7 @@ final class OutboundFileSender: ObservableObject {
                         self.queue.async {
                             guard self.generation == token, self.link === connection else { return }
                             guard authorized else { self.fail("The PC did not authorize this transfer. Reconnect in Porthole and retry."); return }
-                            guard self.verifiedPeer?.id == current.id else {
+                            guard let verified = self.verifiedPeer, verified.samePairing(as: current) else {
                                 self.fail("The paired PC changed before the transfer started."); return
                             }
                             self.write(Data("PSHR \(version) \(self.batch.count)\n".utf8), token: token) {
@@ -386,14 +410,26 @@ final class OutboundFileSender: ObservableObject {
             }
             return
         }
-        let file = files[batch[cursor]]
+        var file = files[batch[cursor]]
         activeIndex = batch[cursor]
         activeDone = 0
-        do { reader = try Self.reader(for: file) }
+        bodyHash = protocolVersion == 4 ? SHA256() : nil
+        do {
+            // Picked for a newer PC and sent to an older one: it needs the
+            // checksum first after all.
+            if protocolVersion == 3, file.digest.isEmpty {
+                let measuring = try Self.reader(for: file)
+                defer { measuring.close() }
+                file.digest = try TransferMeasure.measure(measuring, cancelled: { self.generation != token }).digest
+                files[batch[cursor]].digest = file.digest
+            }
+            reader = try Self.reader(for: file)
+        }
         catch { fail("\(file.name): \(error.localizedDescription)"); return }
         let ticket = file.id.uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         let header: String
         switch protocolVersion {
+        case 4: header = "ITEM \(ticket) FILE \(file.bytes) \(file.name)\n"
         case 3: header = "ITEM \(ticket) \(file.digest) \(file.bytes) \(file.name)\n"
         case 2: header = "ITEM \(ticket) FILE \(file.bytes) \(file.name)\n"
         default: header = "FILE \(file.bytes) \(file.name)\n"
@@ -406,11 +442,17 @@ final class OutboundFileSender: ObservableObject {
                 guard response.hasPrefix("OFFSET "), let offset = Int64(response.dropFirst(7)), (0...file.bytes).contains(offset) else {
                     self.fail("The PC could not resume this transfer."); return
                 }
-                do { try self.reader?.seek(to: offset) }
-                catch { self.fail("Unable to read \(file.name)."); return }
                 // What the PC already has counts as sent, not toward the speed.
                 self.activeDone = offset
                 self.rateBase = nil
+                if self.bodyHash != nil {
+                    // The checksum covers the whole file: read again what the
+                    // PC kept, without sending it.
+                    self.hashKept(cursor, left: offset, token: token)
+                    return
+                }
+                do { try self.reader?.seek(to: offset) }
+                catch { self.fail("Unable to read \(file.name)."); return }
                 self.pump(cursor, remaining: file.bytes - offset, token: token)
             }
         }
@@ -445,9 +487,39 @@ final class OutboundFileSender: ObservableObject {
         sendFile(cursor + 1, token: token)
     }
 
+    /// Reads what the PC already has into the checksum, a piece per turn
+    /// so the connection's own work goes on in between.
+    private func hashKept(_ cursor: Int, left: Int64, token: UUID) {
+        guard generation == token, link != nil else { return }
+        let file = files[batch[cursor]]
+        if left == 0 {
+            pump(cursor, remaining: file.bytes - activeDone, token: token)
+            return
+        }
+        armTimeout(token, seconds: 120)
+        do {
+            guard let data = try reader?.read(upTo: Int(min(left, 8 << 20))), !data.isEmpty else {
+                fail("Unable to finish reading \(file.name)."); return
+            }
+            bodyHash?.update(data: data)
+            queue.async { self.hashKept(cursor, left: left - Int64(data.count), token: token) }
+        } catch { fail("\(file.name): \(error.localizedDescription)") }
+    }
+
     private func pump(_ cursor: Int, remaining: Int64, token: UUID) {
         guard generation == token, link != nil else { return }
         let index = batch[cursor], file = files[index]
+        if remaining == 0, let hash = bodyHash {
+            // Version 4: the checksum follows the last byte.
+            bodyHash = nil
+            reader = nil
+            awaitingReceipt = true
+            let hex = hash.finalize().map { String(format: "%02x", $0) }.joined()
+            write(Data("SUM \(hex)\n".utf8), token: token) {
+                self.pump(cursor, remaining: 0, token: token)
+            }
+            return
+        }
         if remaining == 0 {
             reader = nil
             awaitingReceipt = true
@@ -462,7 +534,8 @@ final class OutboundFileSender: ObservableObject {
             guard let data = try reader?.read(upTo: Int(min(remaining, 1 << 20))), !data.isEmpty else {
                 fail("Unable to finish reading \(file.name)."); return
             }
-            if Int64(data.count) == remaining { awaitingReceipt = true }
+            if Int64(data.count) == remaining, bodyHash == nil { awaitingReceipt = true }
+            bodyHash?.update(data: data)
             write(data, token: token) {
                 let left = remaining - Int64(data.count)
                 self.activeDone = file.bytes - left
@@ -484,8 +557,8 @@ final class OutboundFileSender: ObservableObject {
     private func write(_ data: Data, token: UUID, then completion: @escaping () -> Void) {
         guard generation == token, let connection = link else { return }
         guard checkRevocation() else { return }
-        guard verifiedPeer?.id == destination?.id else {
-            fail("The PC disconnected. Retry when it reconnects.")
+        if let verifiedPeer, let destination, !verifiedPeer.samePairing(as: destination) {
+            fail("The PC changed. Choose the files again to send them to this PC.")
             return
         }
         armTimeout(token)
@@ -537,6 +610,7 @@ final class OutboundFileSender: ObservableObject {
         activeIndex = nil
         buffer = Data()
         awaitingReceipt = false
+        bodyHash = nil
     }
 
     private func checkRevocation() -> Bool {

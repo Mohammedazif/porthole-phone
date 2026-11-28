@@ -19,7 +19,10 @@ struct TrustedPeer: Codable, Equatable {
 
     var stableID: UUID { pairingID ?? id }
     var screenProtocolVersion: Int { min(max(broadcastVersion ?? 1, 1), 4) }
-    var receiveVersion: Int { inboxVersion == 3 ? 3 : resumable ? 2 : 1 }
+    /// 4: the PC takes the checksum after the file, so sending starts at once.
+    var receiveVersion: Int { (inboxVersion ?? 0) >= 4 ? 4 : inboxVersion == 3 ? 3 : resumable ? 2 : 1 }
+    /// The Share Sheet sends with version 3 at most.
+    var shareReceiveVersion: Int { min(receiveVersion, 3) }
     var credentialProfile: String { "\(stableID.uuidString.lowercased())/\(fingerprint)" }
 
     /// The PC's own name, exactly as it is: "UNKNOWN", "-" or blank-looking
