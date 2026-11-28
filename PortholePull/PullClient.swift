@@ -38,6 +38,20 @@ enum PhoneNotice {
         }
     }
 
+    /// A photo or video dragged to the PC from the shared screen. Quiet (no
+    /// sound, no lit screen: the person is watching the PC), and grouped so
+    /// several drags stack into one entry.
+    static func originalSent(_ name: String, to pc: String) {
+        guard enabled else { return }
+        let content = UNMutableNotificationContent()
+        content.title = "Sent to \(pc)"
+        content.body = name
+        content.threadIdentifier = "porthole.drag"
+        content.interruptionLevel = .passive
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "porthole.drag.\(UUID().uuidString)",
+                                                                    content: content, trigger: nil))
+    }
+
     static func removePreviousFileAlerts() {
         let center = UNUserNotificationCenter.current()
         func shouldRemove(_ request: UNNotificationRequest) -> Bool {
@@ -2142,7 +2156,9 @@ final class PullClient: ObservableObject {
         DispatchQueue.main.async {
             guard self.fileSendPeer?.id == peer.id else { return }
             switch saved {
-            case true?: self.status = "Saved \(receipt.name) on \(peer.name)."
+            case true?:
+                self.status = "Saved \(receipt.name) on \(peer.name)."
+                PhoneNotice.originalSent(receipt.name, to: self.computerName)
             case false?: self.status = "The PC could not save \(receipt.name)."
             case nil: self.status = "The PC has not confirmed saving \(receipt.name). Check the PC before retrying."
             }
