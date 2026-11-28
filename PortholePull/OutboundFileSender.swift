@@ -89,6 +89,13 @@ final class OutboundFileSender: ObservableObject {
     private var awaitingReceipt = false
     /// Version 4: the checksum of the file being sent, taken as it goes.
     private var bodyHash: SHA256?
+    /// Bytes of the active file not read yet, and pieces on their way.
+    private var unread: Int64 = 0
+    private var inFlight = 0
+    private var fileStartedAt: Date?
+    private var watching = false
+    private var lineWaiter: (() -> Void)?
+    private var startOffset: Int64 = 0
     private var lastProgressAt = DispatchTime.now()
     private var onSaved: (() -> Void)?
 
@@ -119,6 +126,8 @@ final class OutboundFileSender: ObservableObject {
                 for (index, pick) in picks.enumerated() {
                     if cancelled() { throw TransferStaging.Failure.cancelled }
                     if picks.count > 1 { self.publish(.preparing, message: "Preparing \(index + 1) of \(picks.count)…") }
+                    let began = Date()
+                    var how = "file"
                     let item: Item
                     switch pick {
                     case .file(let url):
@@ -127,15 +136,20 @@ final class OutboundFileSender: ObservableObject {
                         if let identifier, let photo = try Self.libraryItem(identifier, index: index, batch: batch,
                                                                              quick: quick, cancelled: cancelled) {
                             item = photo
+                            how = "photo library"
                         } else if let provider {
+                            how = "copy from the picker"
                             item = try Self.copy(provider, index: index, batch: batch, remaining: remaining,
-                                                 cancelled: cancelled)
+                                                 quick: quick, cancelled: cancelled)
                             remaining -= item.bytes
                         } else {
                             throw SendError.message("This item is no longer in your Photo Library.")
                         }
                     }
                     self.files.append(item)
+                    DiagnosticLog.note(String(format: "send: prepared %@ (%lld bytes, %@%@) in %.1f s", item.name, item.bytes,
+                                              how, item.digest.isEmpty ? ", checksum while sending" : ", read through first",
+                                              Date().timeIntervalSince(began)))
                 }
                 if cancelled() { throw TransferStaging.Failure.cancelled }
                 let manifest = OutboundTransferManifest(id: batch.id, destination: peer.remembered,
@@ -215,7 +229,7 @@ final class OutboundFileSender: ObservableObject {
 
     /// The picker's own copy, when the library itself can't be read.
     private static func copy(_ provider: NSItemProvider, index: Int, batch: OutboundTransferJournal.Batch,
-                             remaining: Int64, cancelled: @escaping () -> Bool) throws -> Item {
+                             remaining: Int64, quick: Bool, cancelled: @escaping () -> Bool) throws -> Item {
         let types = provider.registeredTypeIdentifiers.compactMap(UTType.init)
         guard let type = types.first(where: { $0.conforms(to: .movie) || $0.conforms(to: .image) }) ?? types.first else {
             throw SendError.message("This item can't be sent.")
@@ -237,6 +251,9 @@ final class OutboundFileSender: ObservableObject {
                 let directory = batch.folder.appendingPathComponent(String(index), isDirectory: true)
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 let target = directory.appendingPathComponent(name)
+                if quick, let moved = try? TransferMeasure.takeOver(url, to: target) {
+                    return Item(id: UUID(), url: target, name: name, bytes: moved, digest: "")
+                }
                 let snapshot = try TransferStaging.snapshot(url, to: target, remaining: remaining,
                                                             reserve: batch.reserve, cancelled: cancelled)
                 return Item(id: UUID(), url: target, name: name, bytes: snapshot.bytes, digest: snapshot.digest)
@@ -526,39 +543,35 @@ final class OutboundFileSender: ObservableObject {
         } catch { fail("\(file.name): \(error.localizedDescription)") }
     }
 
+    /// Sends the rest of the file: `remaining` bytes from where the reader
+    /// is. Up to three pieces are on their way at once, so reading the next
+    /// overlaps sending this one; small pieces from Photos are joined first.
     private func pump(_ cursor: Int, remaining: Int64, token: UUID) {
         guard generation == token, link != nil else { return }
-        let index = batch[cursor], file = files[index]
-        if remaining == 0, let hash = bodyHash {
-            // Version 4: the checksum follows the last byte.
-            bodyHash = nil
-            reader = nil
-            awaitingReceipt = true
-            let hex = hash.finalize().map { String(format: "%02x", $0) }.joined()
-            write(Data("SUM \(hex)\n".utf8), token: token) {
-                self.pump(cursor, remaining: 0, token: token)
-            }
-            return
+        unread = remaining
+        watchForCancel(token)
+        if fileStartedAt == nil {
+            fileStartedAt = Date()
+            startOffset = files[batch[cursor]].bytes - remaining
         }
-        if remaining == 0 {
-            reader = nil
-            awaitingReceipt = true
-            // The PC checks and saves the whole file before it answers.
-            readLine(token: token, wait: TransferStaging.receiptWait(file.bytes)) { line in
-                guard line == "OK" else { self.fail("The PC did not save \(file.name). Reconnect and retry unsent files."); return }
-                self.accept(cursor, token: token)
-            }
-            return
-        }
-        do {
-            guard let data = try reader?.read(upTo: Int(min(remaining, 1 << 20))), !data.isEmpty else {
-                fail("Unable to finish reading \(file.name)."); return
-            }
-            if Int64(data.count) == remaining, bodyHash == nil { awaitingReceipt = true }
+        fill(cursor, token: token)
+    }
+
+    private func fill(_ cursor: Int, token: UUID) {
+        guard generation == token, link != nil else { return }
+        let file = files[batch[cursor]]
+        while inFlight < 3, unread > 0 {
+            let data: Data
+            do { data = try readPiece(Int(min(unread, 1 << 20))) }
+            catch { fail("\(file.name): \(error.localizedDescription)"); return }
+            guard !data.isEmpty else { fail("Unable to finish reading \(file.name)."); return }
+            unread -= Int64(data.count)
             bodyHash?.update(data: data)
+            if unread == 0, bodyHash == nil { awaitingReceipt = true }
+            inFlight += 1
             write(data, token: token) {
-                let left = remaining - Int64(data.count)
-                self.activeDone = file.bytes - left
+                self.inFlight -= 1
+                self.activeDone += Int64(data.count)
                 let now = DispatchTime.now()
                 if now.uptimeNanoseconds - self.lastProgressAt.uptimeNanoseconds >= 150_000_000 {
                     self.lastProgressAt = now
@@ -569,9 +582,48 @@ final class OutboundFileSender: ObservableObject {
                     let total = ByteCountFormatter.string(fromByteCount: self.batchBytes, countStyle: .file)
                     BackgroundSend.shared.update(fraction: fraction, subtitle: "\(file.name) · \(sent) of \(total)")
                 }
-                self.pump(cursor, remaining: left, token: token)
+                self.fill(cursor, token: token)
             }
-        } catch { fail("\(file.name): \(error.localizedDescription)") }
+            guard generation == token, link != nil else { return }
+        }
+        if unread == 0, inFlight == 0 { finishBody(cursor, token: token) }
+    }
+
+    /// Up to `count` bytes, joining the reader's smaller pieces.
+    private func readPiece(_ count: Int) throws -> Data {
+        guard let reader else { return Data() }
+        var data = Data()
+        while data.count < count {
+            let part = try reader.read(upTo: count - data.count)
+            if part.isEmpty { break }
+            data.append(part)
+        }
+        return data
+    }
+
+    /// Every byte is out: the checksum (version 4), then the PC's answer.
+    private func finishBody(_ cursor: Int, token: UUID) {
+        guard generation == token, link != nil else { return }
+        let file = files[batch[cursor]]
+        reader = nil
+        awaitingReceipt = true
+        if let hash = bodyHash {
+            bodyHash = nil
+            let hex = hash.finalize().map { String(format: "%02x", $0) }.joined()
+            write(Data("SUM \(hex)\n".utf8), token: token) { self.finishBody(cursor, token: token) }
+            return
+        }
+        if let started = fileStartedAt {
+            let seconds = max(0.001, Date().timeIntervalSince(started))
+            DiagnosticLog.note(String(format: "send: %@ sent in %.1f s (%.1f MB/s); waiting for the PC to save it",
+                                      file.name, seconds, Double(file.bytes - startOffset) / seconds / 1_000_000))
+            fileStartedAt = nil
+        }
+        // The PC checks and saves the whole file before it answers.
+        readLine(token: token, wait: TransferStaging.receiptWait(file.bytes)) { line in
+            guard line == "OK" else { self.fail("The PC did not save \(file.name). Reconnect and retry unsent files."); return }
+            self.accept(cursor, token: token)
+        }
     }
 
     private func write(_ data: Data, token: UUID, then completion: @escaping () -> Void) {
@@ -604,12 +656,50 @@ final class OutboundFileSender: ObservableObject {
             return
         }
         guard buffer.count <= 128 else { fail("Invalid PC response."); return }
+        if buffer.starts(with: Data("CANCELLED".utf8)) { cancelledOnPC(); return }
+        // The listener started with the file gets the PC's next words.
+        if watching {
+            lineWaiter = { [weak self] in self?.readLineFragment(token: token, completion: completion) }
+            return
+        }
         connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { [weak self, weak connection] data, _, complete, error in
             guard let self, self.generation == token, self.link === connection else { return }
             if let data, !data.isEmpty { self.buffer.append(data) }
             if (complete || error != nil) && !self.buffer.contains(10) { self.fail("PC connection closed before confirmation.") }
             else { self.readLineFragment(token: token, completion: completion) }
         }
+    }
+
+    /// Listens while the file goes: the PC may say CANCELLED (the person
+    /// cancelled it there). Anything else waits for the line reader.
+    private func watchForCancel(_ token: UUID) {
+        guard generation == token, let connection = link, !watching else { return }
+        watching = true
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 512) { [weak self, weak connection] data, _, complete, error in
+            guard let self else { return }
+            self.watching = false
+            guard self.generation == token, self.link === connection else { return }
+            if let data, !data.isEmpty { self.buffer.append(data) }
+            if self.buffer.starts(with: Data("CANCELLED".utf8)) { self.cancelledOnPC(); return }
+            if let waiter = self.lineWaiter {
+                self.lineWaiter = nil
+                waiter()
+            } else if !complete, error == nil {
+                self.watchForCancel(token)
+            }
+        }
+    }
+
+    /// Cancelled on the PC: it deleted what arrived, so nothing continues.
+    private func cancelledOnPC() {
+        let name = activeIndex.map { files[$0].name } ?? ""
+        DiagnosticLog.note("send: \(name) cancelled on the PC")
+        stopConnection()
+        BackgroundSend.shared.finish(success: false)
+        try? journalBatch?.discard()
+        journalBatch = nil
+        DispatchQueue.main.async { self.pendingCount = 0 }
+        publish(.cancelled, message: "Cancelled on \(destination?.name ?? "the PC"). Items already sent stay there.")
     }
 
     private func armTimeout(_ token: UUID, seconds: Double = 30) {
@@ -631,6 +721,11 @@ final class OutboundFileSender: ObservableObject {
         buffer = Data()
         awaitingReceipt = false
         bodyHash = nil
+        unread = 0
+        inFlight = 0
+        fileStartedAt = nil
+        watching = false
+        lineWaiter = nil
     }
 
     private func checkRevocation() -> Bool {

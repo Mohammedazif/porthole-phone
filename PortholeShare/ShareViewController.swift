@@ -80,6 +80,8 @@ final class ShareViewController: UIViewController {
     private var handingOff = false
     /// Sending now: the main button stops it.
     private var sendingNow = false
+    private var leftWhileSending = false
+    private var hostObservers: [NSObjectProtocol] = []
     private lazy var notice: UIStackView = Self.card()
     private let noticeTitle = UILabel()
     private let noticeBody = UILabel()
@@ -164,6 +166,30 @@ final class ShareViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        // Leaving for another app mid-send keeps sending while iOS allows;
+        // coming back continues by itself if it stopped meanwhile.
+        hostObservers = [
+            NotificationCenter.default.addObserver(forName: .NSExtensionHostDidEnterBackground, object: nil,
+                                                   queue: .main) { [weak self] _ in
+                guard let self, self.sendingNow else { return }
+                self.leftWhileSending = true
+                self.transfer?.hostLeft()
+            },
+            NotificationCenter.default.addObserver(forName: .NSExtensionHostWillEnterForeground, object: nil,
+                                                   queue: .main) { [weak self] _ in
+                guard let self else { return }
+                self.transfer?.hostReturned()
+                guard self.leftWhileSending else { return }
+                self.leftWhileSending = false
+                if self.readyToSend, !self.finished, !self.closing {
+                    DiagnosticLog.note("share sheet: back from another app; continuing the send")
+                    self.readyToSend = false
+                    self.sendingNow = true
+                    self.configureButton("Cancel sending", enabled: true, secondary: true)
+                    self.transfer?.send()
+                }
+            }
+        ]
         view.backgroundColor = .clear
         preferredContentSize = CGSize(width: 420, height: 600)
         dim.backgroundColor = UIColor.black.withAlphaComponent(0.35)
@@ -429,9 +455,17 @@ final class ShareViewController: UIViewController {
     @objc private func sendTapped() {
         if finished { close(); return }
         if sendingNow {
-            sendingNow = false
-            button.isEnabled = false
-            transfer?.stopSending()
+            let ask = UIAlertController(title: "Cancel sending?",
+                                        message: "Items already sent stay on the PC. The rest is deleted from it.",
+                                        preferredStyle: .alert)
+            ask.addAction(UIAlertAction(title: "Keep Sending", style: .cancel))
+            ask.addAction(UIAlertAction(title: "Cancel Sending", style: .destructive) { [weak self] _ in
+                guard let self, self.sendingNow else { return }
+                self.sendingNow = false
+                self.button.isEnabled = false
+                self.transfer?.stopSending()
+            })
+            present(ask, animated: true)
             return
         }
         if handingOff {
@@ -690,6 +724,7 @@ private final class ShareTransfer {
     private var awaitingReceipt = false
     private var protocolVersion: Int?
     private var lastProgressAt = DispatchTime.now()
+    private var awayWait: DispatchSemaphore?
 
     init(peer: TrustedPeer, onFiles: @escaping @MainActor ([Item]) -> Void,
          onStatus: @escaping @MainActor (String, Double?, Bool) -> Void,
@@ -752,15 +787,56 @@ private final class ShareTransfer {
             let next = self.files.indices.first { !self.acknowledged.contains($0) }.map { self.files[$0].name }
             self.stop()
             guard sending, let next else { return }
-            let content = UNMutableNotificationContent()
-            content.title = "Sending paused"
-            content.body = "Tap to continue sending \(next) in Porthole."
-            content.sound = .default
-            content.userInfo = ["porthole.send": "resume"]
-            content.threadIdentifier = "porthole.send"
-            UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "porthole.send.resume",
-                                                                        content: content, trigger: nil))
+            Self.postPaused(next)
         }
+    }
+
+    private static func postPaused(_ next: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "Sending paused"
+        content.body = "Tap to continue sending \(next) in Porthole."
+        content.sound = .default
+        content.userInfo = ["porthole.send": "resume"]
+        content.threadIdentifier = "porthole.send"
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "porthole.send.resume",
+                                                                    content: content, trigger: nil))
+    }
+
+    /// Open while the person is in another app: it keeps sending for as long
+    /// as iOS lets it. If iOS stops it, the notice says how to continue in
+    /// Porthole, from where it stopped.
+    func hostLeft() {
+        queue.async {
+            guard self.connection != nil, !self.stopped, self.awayWait == nil else { return }
+            let wait = DispatchSemaphore(value: 0)
+            self.awayWait = wait
+            DiagnosticLog.note("share sheet: the person left mid-send; asking iOS for time")
+            ProcessInfo.processInfo.performExpiringActivity(withReason: "Sending files to the PC") { expired in
+                if expired {
+                    let next: String? = self.queue.sync {
+                        guard self.connection != nil, !self.stopped else { return nil }
+                        return self.files.indices.first { !self.acknowledged.contains($0) }.map { self.files[$0].name }
+                    }
+                    if let next {
+                        DiagnosticLog.note("share sheet: iOS stopped the send in the background")
+                        Self.postPaused(next)
+                    }
+                    wait.signal()
+                    return
+                }
+                _ = wait.wait(timeout: .now() + 600)
+            }
+        }
+    }
+
+    /// Back in the Share Sheet: the background wait ends.
+    func hostReturned() {
+        queue.async { self.endAway() }
+    }
+
+    private func endAway() {
+        awayWait?.signal()
+        awayWait = nil
     }
 
     private func updateStatus(_ text: String, progress: Double? = nil, announce: Bool = false) {
@@ -914,6 +990,12 @@ private final class ShareTransfer {
                                       generatedName: generated, source: .file(bookmark: bookmark), isMedia: media))
                 }
                 if scoped { url.stopAccessingSecurityScopedResource() }
+            }
+            // A PC that takes the checksum after the file: iOS's copy is taken
+            // over as it is (no second copy, no reading through first).
+            if peer.receiveVersion >= 4, let bytes = try? TransferMeasure.takeOver(url, to: directory.appendingPathComponent(name)) {
+                return .item(Item(url: directory.appendingPathComponent(name), name: name, bytes: bytes, digest: "",
+                                  generatedName: generated, isMedia: media))
             }
             let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
             if let free = TransferMeasure.freeSpace(at: directory), free - size < TransferMeasure.keepFree {
@@ -1100,6 +1182,12 @@ private final class ShareTransfer {
             // Continuing a large file, the PC first checks what it kept.
             self.readLine(on: link, wait: TransferStaging.receiptWait(item.bytes)) { response in
                 if response == "SAVED" { self.accept(cursor, on: link); return }
+                if response == "CANCELLED" {
+                    // Cancelled on the PC: it deleted what arrived; nothing continues it.
+                    try? self.journalBatch?.discard()
+                    self.fail("Cancelled on \(self.peer.name). Items already sent stay there.", retry: false)
+                    return
+                }
                 guard response.hasPrefix("OFFSET "), let offset = Int64(response.dropFirst(7)),
                       (0...item.bytes).contains(offset) else { self.fail("The PC could not resume \(item.name)."); return }
                 if self.bodyHash != nil {
@@ -1276,6 +1364,7 @@ private final class ShareTransfer {
 
     private func fail(_ text: String, retry: Bool = true) {
         guard !stopped else { return }
+        endAway()
         if !files.isEmpty, acknowledged.count == files.count { sent(sessionClosed: false); return }
         let canRetry = retry && !files.isEmpty
         let uncertain = awaitingReceipt && (protocolVersion ?? 1) < 2
@@ -1288,6 +1377,8 @@ private final class ShareTransfer {
     }
 
     private func sent(sessionClosed: Bool) {
+        endAway()
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["porthole.send.resume"])
         let destination = peer.name
         let count = files.count
         let result = sessionClosed ? "Saved \(count) \(count == 1 ? "file" : "files") on \(destination)."

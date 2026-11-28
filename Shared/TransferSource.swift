@@ -109,6 +109,18 @@ enum TransferMeasure {
         return nil
     }
 
+    /// iOS's own temporary copy becomes the one sent: moved (or cloned on
+    /// the same volume, which takes no time and no space), never read through.
+    static func takeOver(_ url: URL, to target: URL) throws -> Int64 {
+        let files = FileManager.default
+        do { try files.moveItem(at: url, to: target) }
+        catch { try files.copyItem(at: url, to: target) }
+        guard let size = try target.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 0 else {
+            throw CocoaError(.fileReadUnknown)
+        }
+        return Int64(size)
+    }
+
     /// Always left free when Porthole makes a copy, so the iPhone keeps working.
     static let keepFree: Int64 = 1 << 30
 }

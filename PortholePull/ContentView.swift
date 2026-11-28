@@ -60,6 +60,7 @@ struct ContentView: View {
     @State private var pendingFiles: [ReceivedFileReference] = []
     @State private var openingFile: ReceivedFileReference?
     @State private var pendingSend: SendSelection?
+    @State private var confirmingReceiveCancel = false
     @State private var pendingSendSource: (SendChoiceSheet.SendSource, TrustedPeer)?
     @State private var sendBackgroundTask: UIBackgroundTaskIdentifier = .invalid
     @State private var pendingWidgetDestination: WidgetOpenRequest?
@@ -759,7 +760,7 @@ struct ContentView: View {
     private var receiveStatus: some View {
         if let receive = client.receiveProgress {
             VStack(alignment: .leading, spacing: 8) {
-                Text(receive.name).font(.headline)
+                Text(receive.name).font(.headline).lineLimit(1).truncationMode(.middle)
                 Text(receive.message).font(.subheadline).foregroundStyle(.secondary)
                 if receive.phase == .receiving {
                     ProgressView(value: Double(receive.received), total: Double(receive.bytes)) {
@@ -768,11 +769,11 @@ struct ContentView: View {
                         Text("\(ByteCountFormatter.string(fromByteCount: Int64(receive.received), countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: Int64(receive.bytes), countStyle: .file))")
                     }
                     .accessibilityLabel("Receiving \(receive.name)")
-                    Button("Cancel", role: .destructive) { client.cancelReceive() }
+                    Button("Cancel", role: .destructive) { confirmingReceiveCancel = true }
                         .font(.subheadline.weight(.semibold))
                 } else if receive.phase == .saving {
                     ProgressView("Saving file")
-                    Button("Cancel", role: .destructive) { client.cancelReceive() }
+                    Button("Cancel", role: .destructive) { confirmingReceiveCancel = true }
                         .font(.subheadline.weight(.semibold))
                 } else {
                     Button("Dismiss") { client.dismissReceiveStatus() }
@@ -781,6 +782,13 @@ struct ContentView: View {
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(cardFill, in: RoundedRectangle(cornerRadius: 18))
+            .confirmationDialog("Stop receiving \(receive.name)?", isPresented: $confirmingReceiveCancel,
+                                titleVisibility: .visible) {
+                Button("Stop Receiving", role: .destructive) { client.cancelReceive() }
+                Button("Keep Receiving", role: .cancel) { }
+            } message: {
+                Text("What has arrived so far is deleted.")
+            }
         } else if let phase = client.widgetReceiveAttention {
             VStack(alignment: .leading, spacing: 8) {
                 Text(phase == .failed ? "File could not be saved" : "Transfer interrupted").font(.headline)

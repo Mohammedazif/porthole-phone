@@ -1116,6 +1116,7 @@ final class PullClient: ObservableObject {
     }
 
     private func setDisconnected() {
+        DiagnosticLog.setSink(nil)
         fileSendPeer = nil
         linked = false
         inputControlSupported = false
@@ -1600,6 +1601,16 @@ final class PullClient: ObservableObject {
         transportPeer = verified
         greeted = true
         send("RESUME?\n")
+        // Lines for the PC's log: what happened on this iPhone.
+        DiagnosticLog.setSink { [weak self] line in
+            self?.queue.async {
+                guard let self, self.greeted, !self.sendingOriginal else { return }
+                self.send("LOG \(line)\n")
+            }
+        }
+        let kept = DiagnosticLog.takeKept()
+        for line in kept.suffix(40) where !sendingOriginal { send("LOG \(line)\n") }
+        DiagnosticLog.note("Porthole \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] ?? "?") (\(Bundle.main.infoDictionary?["CFBundleVersion"] ?? "?")), bundle \(Bundle.main.bundleIdentifier ?? "?"), iOS \(UIDevice.current.systemVersion)")
         if !enrolling { completePairing(verified) }
         return true
     }

@@ -38,17 +38,24 @@ final class BackgroundSend {
             #if compiler(>=6.2)
             guard #available(iOS 26.0, *) else { return }
             let identifier = "\(Self.identifierPrefix).\(UUID().uuidString)"
-            BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: .main) { [weak self] task in
+            let registered = BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: .main) { [weak self] task in
                 guard let continued = task as? BGContinuedProcessingTask, let self else {
                     task.setTaskCompleted(success: false)
                     return
                 }
+                DiagnosticLog.note("progress card: iOS started it for \(title)")
                 self.attach(continued)
             }
             let request = BGContinuedProcessingTaskRequest(identifier: identifier, title: title, subtitle: subtitle)
-            request.strategy = .fail
+            // Queued rather than refused when iOS can't start it this instant.
+            request.strategy = .queue
             // If iOS declines, sending still runs while Porthole is open.
-            try? BGTaskScheduler.shared.submit(request)
+            do {
+                try BGTaskScheduler.shared.submit(request)
+                DiagnosticLog.note("progress card: asked iOS for \(title) (registered \(registered))")
+            } catch {
+                DiagnosticLog.note("progress card: iOS refused \(title): \(error) (registered \(registered), bundle \(Bundle.main.bundleIdentifier ?? "?"))")
+            }
             #endif
         }
     }
@@ -101,6 +108,7 @@ final class BackgroundSend {
             DispatchQueue.main.async {
                 guard let self else { return }
                 let byPerson = Date().timeIntervalSince(self.movedAt) < 15
+                DiagnosticLog.note("progress card: ended by \(byPerson ? "the stop button" : "iOS")")
                 let expire = self.onExpire
                 self.onExpire = nil
                 self.active = false

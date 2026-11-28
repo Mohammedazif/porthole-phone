@@ -8,6 +8,9 @@ enum TrustedPeerTransport {
 
     /// The fingerprint comes from the desktop QR or an explicit manual entry.
     /// A pinned leaf identifies this peer even on a local IP or with a self-signed cert.
+    /// While the screen is shared, files go as background traffic (47733) so
+    /// the shared screen (interactive video) and the controls keep the Wi-Fi
+    /// first.
     static func connection(to peer: TrustedPeer, port: NWEndpoint.Port, wifiOnly: Bool = false) -> NWConnection {
         let options = NWProtocolTLS.Options()
         let security = options.securityProtocolOptions
@@ -25,6 +28,16 @@ enum TrustedPeerTransport {
         }, trustQueue)
         let parameters = NWParameters(tls: options, tcp: .init())
         if wifiOnly { parameters.requiredInterfaceType = .wifi }
+        switch port {
+        case 47733:
+            // Background only while the screen is shared: then the screen and
+            // the controls go first. Otherwise a file goes at full speed.
+            let phase = TrustedPeerStore.broadcastStatus()?.phase
+            let sharing = phase == .live || phase == .waitingForFrames || phase == .connecting
+            parameters.serviceClass = sharing ? .background : .bestEffort
+        case 47732: parameters.serviceClass = .interactiveVideo
+        default: parameters.serviceClass = .responsiveData
+        }
         return NWConnection(host: NWEndpoint.Host(peer.host), port: port, using: parameters)
     }
 
