@@ -64,7 +64,7 @@ struct ClipboardHistorySheet: View {
                                 AccessibilityNotification.Announcement(success ? "Copied to this iPhone." : client.activityMessage).post()
                             }
                         }
-                        GlassCapsuleButton(title: "Send to PC", systemImage: "arrow.up") { client.sendActivity(item) }
+                        GlassCapsuleButton(title: "Send to \(client.computerName)", systemImage: "arrow.up") { client.sendActivity(item) }
                             .disabled(!client.linked || !client.clipboardSyncEnabled)
                         if copied {
                             Text("Copied to this iPhone. Ready to paste.")
@@ -142,16 +142,8 @@ struct SendChoiceSheet: View {
             }
             .padding(20)
             .background(Color(.systemGroupedBackground))
-            .navigationTitle("Send to PC")
+            .navigationTitle("Send to \(peerName)")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .principal) {
-                    VStack(spacing: 1) {
-                        Text("Send to PC").font(.headline)
-                        Text(peerName).font(.footnote).foregroundStyle(.secondary)
-                    }
-                }
-            }
         }
         .presentationDetents([.height(300)])
     }
@@ -265,7 +257,7 @@ struct SendFilesSheet: View {
             }
             .safeAreaInset(edge: .bottom) { transferActions }
             .background(Color(.systemGroupedBackground))
-            .navigationTitle(sender.phase == .sending ? "Sending" : sender.phase == .sent ? "Sent" : "Send to PC")
+            .navigationTitle(sender.phase == .sending ? "Sending to \(peerName)" : sender.phase == .sent ? "Sent to \(peerName)" : "Send to \(peerName)")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

@@ -708,7 +708,7 @@ struct ContentView: View {
                 receiveStatus.id(ConnectionJump.Target.transfer)
             }
             if fileSender.phase == .sending, let peer = client.fileSendPeer {
-                linkRow("Sending", "\(Int((fileSender.progress * 100).rounded()))% · \(ByteCountFormatter.string(fromByteCount: fileSender.sentBytes, countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: fileSender.totalBytes, countStyle: .file))",
+                linkRow("Sending to \(client.computerName)", "\(Int((fileSender.progress * 100).rounded()))% · \(ByteCountFormatter.string(fromByteCount: fileSender.sentBytes, countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: fileSender.totalBytes, countStyle: .file))",
                         icon: "arrow.up.circle", last: true) {
                     showSheet(.sendReview(peer))
                 }
@@ -950,25 +950,10 @@ struct ContentView: View {
                 .fixedSize(horizontal: false, vertical: true)
             sharingDetails(diameter: 184)
                 .fixedSize(horizontal: false, vertical: true)
-            sharingDetails(diameter: 152)
-                .fixedSize(horizontal: false, vertical: true)
-            sharingDetails(diameter: 124)
-                .fixedSize(horizontal: false, vertical: true)
-            ScrollView { sharingDetails(diameter: 124) }
+            ScrollView { sharingDetails(diameter: 184) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .safeAreaInset(edge: .bottom) { sharingStopButton }
-    }
-
-    /// Send Files and Send Clipboard stay in reach while sharing; the lens
-    /// above shrinks to make room, so the page doesn't scroll.
-    private var sharingSendActions: some View {
-        let actions = dynamicTypeSize.isAccessibilitySize ? AnyLayout(VStackLayout(spacing: 10)) : AnyLayout(HStackLayout(spacing: 10))
-        return actions {
-            actionCard("Send files", systemImage: "doc") { openSendPicker() }
-            ClipboardSendButton(client: client)
-        }
-        .disabled(client.fileSendPeer == nil)
     }
 
     private func sharingDetails(diameter: CGFloat) -> some View {
@@ -1029,23 +1014,20 @@ struct ContentView: View {
     }
 
     private var sharingStopButton: some View {
-        VStack(spacing: 10) {
-            sharingSendActions
-            Button(role: .destructive, action: {
-                if deliveryStopped {
-                    actionError = "Open Control Center, then tap the active Screen Recording control to finish the broadcast."
-                } else {
-                    confirmingStopBroadcast = true
-                }
-            }) {
-                Text(deliveryStopped ? "End in Control Center" : stoppingBroadcast ? "Stopping…" : "Stop sharing")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity, minHeight: 44)
+        Button(role: .destructive, action: {
+            if deliveryStopped {
+                actionError = "Open Control Center, then tap the active Screen Recording control to finish the broadcast."
+            } else {
+                confirmingStopBroadcast = true
             }
-            .buttonStyle(.bordered)
-            .buttonBorderShape(.capsule)
-            .disabled(stoppingBroadcast)
+        }) {
+            Text(deliveryStopped ? "End in Control Center" : stoppingBroadcast ? "Stopping…" : "Stop sharing")
+                .font(.headline)
+                .frame(maxWidth: .infinity, minHeight: 44)
         }
+        .buttonStyle(.bordered)
+        .buttonBorderShape(.capsule)
+        .disabled(stoppingBroadcast)
         .padding(.horizontal, 20)
         .padding(.vertical, 8)
         .background(.regularMaterial)

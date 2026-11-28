@@ -171,13 +171,15 @@ final class PullClient: ObservableObject {
         let bytes: Int
         let received: Int
         let phase: Phase
+        /// The PC's own name, as everywhere else in Porthole.
+        var from = "PC"
 
         var message: String {
             switch phase {
-            case .receiving: return "Receiving from PC"
+            case .receiving: return "Receiving from \(from)"
             case .saving: return "Saving to Files"
-            case .interrupted: return "Transfer interrupted. Retry from your PC to resume."
-            case .failed: return "Unable to save the file. Check available storage and retry from your PC."
+            case .interrupted: return "Transfer interrupted. It continues when \(from) is back."
+            case .failed: return "Unable to save the file. Check available storage, then send it again from \(from)."
             }
         }
     }
@@ -2087,7 +2089,11 @@ final class PullClient: ObservableObject {
     private func reportReceive(_ transfer: IncomingTransfer, received: Int, phase: ReceiveProgress.Phase) {
         let progress = ReceiveProgress(transferID: transfer.id, name: transfer.name, bytes: transfer.bytes,
                                        received: received, phase: phase)
-        DispatchQueue.main.async { self.setReceiveProgress(progress) }
+        DispatchQueue.main.async {
+            var named = progress
+            named.from = self.computerName
+            self.setReceiveProgress(named)
+        }
     }
 
     private func beginPush(_ transfer: IncomingTransfer, chunked: Bool) {

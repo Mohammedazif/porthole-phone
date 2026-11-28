@@ -370,6 +370,7 @@ final class ShareViewController: UIViewController {
             return
         }
         destinationLabel.text = peer.name
+        if let name = TrustedPeer.computerName(peer.name) { titleLabel.text = "Send to \(name)" }
         guard TrustedPeerStore.fileSharePeer(matching: peer) != nil else {
             status.text = "Open Porthole once to finish setting up Share for this PC."
             finished = true
