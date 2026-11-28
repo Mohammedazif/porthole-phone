@@ -292,6 +292,9 @@ final class PullClient: ObservableObject {
     /// The person cancelled the file arriving now: its remaining bytes are
     /// let go until the PC confirms with ENDPUSH.
     private var pushStopping = false
+    /// A file the PC paused to let a drag through: how far it got, and its
+    /// checksum so far, so it continues without reading that part again.
+    private var pausedPush: (id: String, offset: Int, hasher: SHA256?)?
     /// Files cancelled while being saved, read on the saving queue.
     private let cancelledSavesLock = NSLock()
     private var cancelledSaves = Set<String>()
@@ -1533,6 +1536,13 @@ final class PullClient: ObservableObject {
             } else if text.hasPrefix("PUSH ") {
                 disconnect(peer, message: "Update Porthole on your PC to send files securely.")
                 return
+            } else if text.hasPrefix("PAUSEPUSH ") {
+                // Paused for a drag; the PC sends the rest right after.
+                if let transfer = pushTransfer, String(text.dropFirst(10)) == transfer.id, !pushStopping,
+                   pushStage != nil {
+                    pausedPush = (transfer.id, transfer.bytes - pushLeft, pushHasher)
+                    abortPush(pausing: true)
+                }
             } else if text.hasPrefix("ENDPUSH ") {
                 // Cancelled here or on the PC: what arrived is deleted.
                 if let transfer = pushTransfer, String(text.dropFirst(8)) == transfer.id {
@@ -2194,6 +2204,8 @@ final class PullClient: ObservableObject {
         reportReceive(transfer, received: 0, phase: .receiving)
         beginReceiveBackgroundTask(operation, peer: peer)
         reportIncomingPending(transfer, operation: operation, peer: peer, deadline: deadline)
+        let paused = pausedPush?.id == transfer.id ? pausedPush : nil
+        pausedPush = nil
         incomingQueue.async {
             let profile = SHA256.hash(data: Data(peer.credentialProfile.utf8)).map { String(format: "%02x", $0) }.joined()
             let state = Result { try self.incomingStore.prepare(transfer, profile: profile) }
@@ -2202,7 +2214,10 @@ final class PullClient: ObservableObject {
             }
             // Continuing: what was kept goes into the checksum first, read once.
             var hasher = SHA256()
-            if case .success(.staged(let staged)) = state, staged.offset > 0,
+            if case .success(.staged(let staged)) = state, let paused, paused.offset == staged.offset,
+               let kept = paused.hasher {
+                hasher = kept // paused for a drag: nothing to read again
+            } else if case .success(.staged(let staged)) = state, staged.offset > 0,
                let kept = try? FileHandle(forReadingFrom: staged.data) {
                 var left = staged.offset
                 while left > 0, let chunk = autoreleasepool(invoking: { try? kept.read(upToCount: min(left, 1 << 20)) }),
@@ -2400,7 +2415,7 @@ final class PullClient: ObservableObject {
 
     /// `discard` deletes what arrived (a cancel); otherwise it's kept for
     /// the PC to continue (a failure).
-    private func abortPush(discard: Bool = false) {
+    private func abortPush(discard: Bool = false, pausing: Bool = false) {
         try? pushStage?.handle.close()
         if discard, let stage = pushStage {
             try? FileManager.default.removeItem(at: stage.data.deletingLastPathComponent())
@@ -2412,9 +2427,11 @@ final class PullClient: ObservableObject {
         pushChunkLeft = 0
         chunkedPush = false
         pushStopping = false
-        BackgroundSend.receiving.finish(success: false)
-        DispatchQueue.main.async {
-            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["porthole.receive.show"])
+        if !pausing {
+            BackgroundSend.receiving.finish(success: false)
+            DispatchQueue.main.async {
+                UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["porthole.receive.show"])
+            }
         }
         if let operation = incomingOperation {
             DispatchQueue.main.async { self.endReceiveBackgroundTask(operation) }
