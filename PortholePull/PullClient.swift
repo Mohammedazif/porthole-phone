@@ -1865,7 +1865,10 @@ final class PullClient: ObservableObject {
                 if found.asset == nil, !found.choices.isEmpty {
                     self.askToSendOriginal(found.choices, to: peer)
                 } else if let asset = found.asset {
-                    self.askToSendOriginal([asset.localIdentifier], to: peer)
+                    // One sure match goes straight to the PC, as it used to:
+                    // the person is in Photos and can't see a question here.
+                    // An edited item still asks first (export checks that).
+                    self.export(asset)
                 } else {
                     self.send(found.videoUnavailable ? "MISS video-unavailable\n" : "MISS \(found.closest)\n")
                     DispatchQueue.main.async {
