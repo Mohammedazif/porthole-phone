@@ -21,8 +21,6 @@ struct TrustedPeer: Codable, Equatable {
     var screenProtocolVersion: Int { min(max(broadcastVersion ?? 1, 1), 4) }
     /// 4: the PC takes the checksum after the file, so sending starts at once.
     var receiveVersion: Int { (inboxVersion ?? 0) >= 4 ? 4 : inboxVersion == 3 ? 3 : resumable ? 2 : 1 }
-    /// The Share Sheet sends with version 3 at most.
-    var shareReceiveVersion: Int { min(receiveVersion, 3) }
     var credentialProfile: String { "\(stableID.uuidString.lowercased())/\(fingerprint)" }
 
     /// The PC's own name, exactly as it is: "UNKNOWN", "-" or blank-looking
@@ -178,7 +176,7 @@ enum TrustedPeerStore {
         let authorization: PairedChannelAuthorization? = read("file-share.json")
         if var destination = authorization?.connectionPeer(for: current) {
             destination.resumable = true
-            destination.inboxVersion = 3
+            destination.inboxVersion = max(3, current.inboxVersion ?? 3)
             return destination
         }
         return current.resumable && current.channelTicket.map(TrustedPeer.isChannelTicket) == true ? current : nil

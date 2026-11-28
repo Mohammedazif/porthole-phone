@@ -616,7 +616,10 @@ final class PullClient: ObservableObject {
             guard self.choicePending else { return }
             self.choiceTimer?.cancel()
             self.choicePending = false
-            DispatchQueue.main.async { self.choiceIDs = [] }
+            DispatchQueue.main.async {
+                self.choiceIDs = []
+                UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["porthole.drag.choose"])
+            }
             guard let id,
                   let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject else {
                 self.send("MISS\n")
@@ -1967,19 +1970,33 @@ final class PullClient: ObservableObject {
             guard self.fileSendPeer?.id == peer.id else { return }
             self.choiceIDs = ids
             self.status = ids.count == 1 ? "Confirm transfer of the unedited original." : "Select the original to transfer."
+            // The person is dragging on the PC, likely in Photos: ask where
+            // they'll see it. Opening Porthole shows the choice.
+            guard UIApplication.shared.applicationState != .active, PhoneNotice.enabled else { return }
+            let content = UNMutableNotificationContent()
+            content.title = ids.count == 1 ? "Send the original to \(self.computerName)?" : "Choose the photo to send"
+            content.body = ids.count == 1 ? "This item was edited. Tap to send its original."
+                                          : "Some photos look alike. Tap to choose the one to send to \(self.computerName)."
+            content.sound = .default
+            content.threadIdentifier = "porthole.drag"
+            UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: "porthole.drag.choose",
+                                                                        content: content, trigger: nil))
         }
         let timer = DispatchWorkItem { [weak self] in
             guard let self, self.transportPeer?.id == peer.id, self.choicePending else { return }
             self.choicePending = false
             self.send("MISS confirmation-expired\n")
             DispatchQueue.main.async {
+                UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["porthole.drag.choose"])
                 guard self.fileSendPeer?.id == peer.id else { return }
                 self.choiceIDs = []
                 self.status = "Original transfer confirmation expired."
             }
         }
         choiceTimer = timer
-        queue.asyncAfter(deadline: .now() + 30, execute: timer)
+        // Long enough to see the notification, open Porthole and choose; the
+        // PC waits up to five minutes.
+        queue.asyncAfter(deadline: .now() + 120, execute: timer)
     }
 
     private func export(_ proposedAsset: PHAsset, approved: Bool = false) {

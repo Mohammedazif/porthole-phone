@@ -1,3 +1,4 @@
+import CryptoKit
 import Network
 import QuickLookThumbnailing
 import UIKit
@@ -677,6 +678,8 @@ private final class ShareTransfer {
     private var savedPCSearch: SavedPCConnection?
     private var deadline: DispatchWorkItem?
     private var activeHandle: FileHandle?
+    /// Version 4: the checksum of the file being sent, taken as it goes.
+    private var bodyHash: SHA256?
     private var files: [Item] = []
     private var acknowledged = Set<Int>()
     private var batch: [Int] = []
@@ -721,8 +724,8 @@ private final class ShareTransfer {
                 self.fail("Open Porthole to finish setting up Share for this PC.")
                 return
             }
-            let version = self.protocolVersion ?? destination.shareReceiveVersion
-            guard destination.shareReceiveVersion >= version else {
+            let version = self.protocolVersion ?? destination.receiveVersion
+            guard destination.receiveVersion >= version else {
                 self.fail("Update Porthole on the PC to resume this transfer.")
                 return
             }
@@ -806,7 +809,7 @@ private final class ShareTransfer {
                       source: item.source.isStaged ? nil : item.source)
             })
             do {
-                let reviewed = try batch.saveSelection(manifest, version: peer.shareReceiveVersion)
+                let reviewed = try batch.saveSelection(manifest, version: peer.receiveVersion)
                 files = reviewed.files.enumerated().map { index, file in
                     // An original is read from where it is; a copy from this batch.
                     let url = file.isStaged ? batch.itemURL(named: file.name, index: index) : originals[index].url
@@ -898,6 +901,12 @@ private final class ShareTransfer {
                 let scoped = url.startAccessingSecurityScopedResource()
                 if let bookmark = try? url.bookmarkData() {
                     if scoped { queue.async { self.scopedURLs.append(url) } }
+                    // A PC that takes the checksum after the file needs only
+                    // the size now: sending starts at once.
+                    if peer.receiveVersion >= 4, let bytes = Self.localSize(of: url), bytes > 0 {
+                        return .item(Item(url: url, name: name, bytes: bytes, digest: "", generatedName: generated,
+                                          source: .file(bookmark: bookmark), isMedia: media))
+                    }
                     let reader = try FileBodyReader(url: url)
                     defer { reader.close() }
                     let measured = try TransferMeasure.measure(reader, cancelled: cancelled)
@@ -917,6 +926,14 @@ private final class ShareTransfer {
             return .item(Item(url: target, name: name, bytes: snapshot.bytes, digest: snapshot.digest,
                               generatedName: generated, isMedia: media))
         }
+    }
+
+    /// The size of a file already on this iPhone (not one still in iCloud).
+    private static func localSize(of url: URL) -> Int64? {
+        let keys: Set<URLResourceKey> = [.fileSizeKey, .isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey]
+        guard let values = try? url.resourceValues(forKeys: keys), let size = values.fileSize else { return nil }
+        if values.isUbiquitousItem == true, values.ubiquitousItemDownloadingStatus != .current { return nil }
+        return Int64(size)
     }
 
     /// Passes the photos and videos to Porthole and tells the person.
@@ -1070,8 +1087,10 @@ private final class ShareTransfer {
         let item = files[batch[cursor]]
         do { activeHandle = try FileHandle(forReadingFrom: item.url) }
         catch { fail("Unable to read \(item.name)."); return }
+        bodyHash = protocolVersion == 4 ? SHA256() : nil
         let header: String
         switch protocolVersion {
+        case 4: header = "ITEM \(item.ticket) FILE \(item.bytes) \(item.name)\n"
         case 3: header = "ITEM \(item.ticket) \(item.digest) \(item.bytes) \(item.name)\n"
         case 2: header = "ITEM \(item.ticket) FILE \(item.bytes) \(item.name)\n"
         default: header = "FILE \(item.bytes) \(item.name)\n"
@@ -1083,6 +1102,12 @@ private final class ShareTransfer {
                 if response == "SAVED" { self.accept(cursor, on: link); return }
                 guard response.hasPrefix("OFFSET "), let offset = Int64(response.dropFirst(7)),
                       (0...item.bytes).contains(offset) else { self.fail("The PC could not resume \(item.name)."); return }
+                if self.bodyHash != nil {
+                    // The checksum covers the whole file: read again what the
+                    // PC kept, without sending it.
+                    self.hashKept(at: cursor, left: offset, on: link)
+                    return
+                }
                 do { try self.activeHandle?.seek(toOffset: UInt64(offset)) }
                 catch { self.fail("Unable to read \(item.name)."); return }
                 self.pump(at: cursor, left: item.bytes - offset, on: link)
@@ -1090,9 +1115,34 @@ private final class ShareTransfer {
         }
     }
 
+    /// Reads what the PC already has into the checksum, a piece per turn.
+    private func hashKept(at cursor: Int, left: Int64, on link: NWConnection, read: Int64 = 0) {
+        guard connection === link else { return }
+        let item = files[batch[cursor]]
+        if left == 0 { pump(at: cursor, left: item.bytes - read, on: link); return }
+        armTimeout(link, seconds: 60)
+        do {
+            let chunk = try autoreleasepool { try activeHandle?.read(upToCount: Int(min(left, 8 << 20))) }
+            guard let chunk, !chunk.isEmpty else { fail("Unable to finish reading \(item.name)."); return }
+            bodyHash?.update(data: chunk)
+            queue.async {
+                self.hashKept(at: cursor, left: left - Int64(chunk.count), on: link, read: read + Int64(chunk.count))
+            }
+        } catch { fail("Unable to read \(item.name).") }
+    }
+
     private func pump(at cursor: Int, left: Int64, on link: NWConnection) {
         guard connection === link else { return }
         let item = files[batch[cursor]]
+        if left == 0, let hash = bodyHash {
+            // Version 4: the checksum follows the last byte.
+            bodyHash = nil
+            try? activeHandle?.close(); activeHandle = nil
+            awaitingReceipt = true
+            let hex = hash.finalize().map { String(format: "%02x", $0) }.joined()
+            write(Data("SUM \(hex)\n".utf8), on: link) { self.pump(at: cursor, left: 0, on: link) }
+            return
+        }
         if left == 0 {
             try? activeHandle?.close(); activeHandle = nil
             awaitingReceipt = true
@@ -1108,7 +1158,8 @@ private final class ShareTransfer {
             guard let chunk, !chunk.isEmpty else {
                 fail("Unable to finish reading \(item.name)."); return
             }
-            if Int64(chunk.count) == left { awaitingReceipt = true }
+            if Int64(chunk.count) == left, bodyHash == nil { awaitingReceipt = true }
+            bodyHash?.update(data: chunk)
             write(chunk, on: link) {
                 let remaining = left - Int64(chunk.count)
                 let now = DispatchTime.now()
@@ -1204,6 +1255,7 @@ private final class ShareTransfer {
         connection = nil
         link?.cancel()
         try? activeHandle?.close(); activeHandle = nil
+        bodyHash = nil
         buffer = Data()
     }
 
