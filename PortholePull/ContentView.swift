@@ -769,6 +769,8 @@ struct ContentView: View {
                         .font(.subheadline.weight(.semibold))
                 } else if receive.phase == .saving {
                     ProgressView("Saving file")
+                    Button("Cancel", role: .destructive) { client.cancelReceive() }
+                        .font(.subheadline.weight(.semibold))
                 } else {
                     Button("Dismiss") { client.dismissReceiveStatus() }
                 }

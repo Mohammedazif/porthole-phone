@@ -294,6 +294,9 @@ final class PullClient: ObservableObject {
     /// The person cancelled the file arriving now: its remaining bytes are
     /// let go until the PC confirms with ENDPUSH.
     private var pushStopping = false
+    /// Files cancelled while being saved, read on the saving queue.
+    private let cancelledSavesLock = NSLock()
+    private var cancelledSaves = Set<String>()
     private var activeObserver: NSObjectProtocol?
     private var lastReceiveProgressAt = DispatchTime(uptimeNanoseconds: 0)
     private var pushStage: IncomingTransferStore.Stage?
@@ -351,8 +354,15 @@ final class PullClient: ObservableObject {
     /// arrived is deleted once the PC confirms, and nothing continues it.
     func cancelReceive() {
         queue.async {
-            guard let transfer = self.pushTransfer, self.pushStage != nil, !self.pushStopping else { return }
+            guard let transfer = self.pushTransfer, self.incomingOperation != nil, !self.pushStopping else { return }
             self.pushStopping = true
+            if self.pushStage == nil {
+                // All of it arrived and it's being saved: it stops before it
+                // lands in the folder, and the PC hears NO then.
+                self.cancelledSavesLock.lock()
+                self.cancelledSaves.insert(transfer.id)
+                self.cancelledSavesLock.unlock()
+            }
             self.send("STOP \(transfer.id)\n")
             BackgroundSend.receiving.finish(success: false)
             DispatchQueue.main.async {
@@ -2340,6 +2350,13 @@ final class PullClient: ObservableObject {
         reportIncomingPending(transfer, operation: operation, peer: peer, deadline: .now() + .seconds(max(120, saving)))
         incomingQueue.async {
             let result = Result {
+                self.cancelledSavesLock.lock()
+                let cancelled = self.cancelledSaves.remove(transfer.id) != nil
+                self.cancelledSavesLock.unlock()
+                if cancelled {
+                    try? FileManager.default.removeItem(at: stage.data.deletingLastPathComponent())
+                    throw CancellationError()
+                }
                 let saved: ReceivedFileStorage.SavedFile
                 let receipt: IncomingTransferStore.Receipt
                 if let intent = self.incomingStore.intent(for: stage),
@@ -2371,6 +2388,10 @@ final class PullClient: ObservableObject {
                 let sameSession = self.transportPeer?.id == peer.id && self.incomingOperation == operation
                 switch result {
                 case .success(let saved):
+                    // A cancel that came after it was saved is too late: it's kept.
+                    self.cancelledSavesLock.lock()
+                    self.cancelledSaves.remove(transfer.id)
+                    self.cancelledSavesLock.unlock()
                     BackgroundSend.receiving.finish(success: true)
                     if sameSession {
                         self.send("SAVED \(transfer.id)\n")
@@ -2380,6 +2401,12 @@ final class PullClient: ObservableObject {
                         if self.receiveProgress?.transferID == transfer.id { self.setReceiveProgress(nil) }
                     }
                     self.announce(saved)
+                case .failure(let error) where error is CancellationError:
+                    // Cancelled while saving: nothing was kept.
+                    if sameSession {
+                        self.send("NO \(transfer.id)\n")
+                        self.abortPush()
+                    }
                 case .failure:
                     if sameSession { self.rejectPush(transfer, peer: peer) }
                 }
